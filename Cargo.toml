@@ -1,0 +1,19 @@
+[package]
+name = "vt1panel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.37", features = ["glow"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
