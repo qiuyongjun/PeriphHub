@@ -17,11 +17,6 @@ use crate::ui::widgets::{
 };
 use crate::ui::{chrome, config_page, home};
 
-/// Configuration pages stay narrower than the workbench: full-width cards on a
-/// 960px window push a label and its control so far apart that they stop
-/// reading as one row.
-const PAGE_W: f32 = 680.0;
-
 /// 配置页浮层提示的停留与淡出时长。展示节奏由这里管理，而不是跟随
 /// last_error 的出现/清空——设备侧一条成功消息就会把它清空，直接跟随
 /// 会让提示闪烁，也回不到"读得完"的体验。
@@ -622,40 +617,21 @@ impl Panel {
             ui.ctx().request_repaint();
         }
 
-        let width = ui.available_width().min(PAGE_W);
-        let pad = ((ui.available_width() - width) / 2.0).max(0.0);
         let mut cmds = Vec::new();
         let mut back = false;
         let mut rescan = false;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .id_salt(("config-page", id.0.as_ref()))
-            .show(ui, |ui| {
-                ui.add_space((1.0 - ease) * 10.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(pad);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(width, 0.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(width);
-                            match &entry {
-                                Some((info, state)) => {
-                                    cmds =
-                                        config_page::view(ui, p, info, state, baseline.as_deref())
-                                            .cmds;
-                                }
-                                None => {
-                                    let action = config_page::missing(ui, p);
-                                    back = action.back;
-                                    rescan = action.rescan;
-                                }
-                            }
-                        },
-                    );
-                });
-            });
+        ui.add_space((1.0 - ease) * 8.0);
+        match &entry {
+            Some((info, state)) => {
+                cmds = config_page::view(ui, p, info, state, baseline.as_deref(), id).cmds;
+            }
+            None => {
+                let action = config_page::missing(ui, p);
+                back = action.back;
+                rescan = action.rescan;
+            }
+        }
 
         // 断开/写入失败的浮层提示。以前是滚动内容顶部的一块文档流通知，
         // 跟着设备状态偶发地插入又消失，把视口下方的内容顶下又顶回——
@@ -734,7 +710,7 @@ impl Panel {
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
-            .anchor(Align2::RIGHT_TOP, [-20.0, 62.0])
+            .anchor(Align2::RIGHT_TOP, [-20.0, 58.0])
             .frame(
                 egui::Frame::new()
                     .fill(p.card_top)
@@ -846,12 +822,12 @@ impl Panel {
                     |ui| {
                         ui.label(
                             RichText::new(concat!("版本 ", env!("CARGO_PKG_VERSION")))
-                                .size(10.5)
+                                .size(11.0)
                                 .color(p.dim),
                         );
                     },
                     |ui| {
-                        ui.label(RichText::new("PeriphHub").size(10.5).strong().color(p.dim));
+                        ui.label(RichText::new("PeriphHub").size(11.0).strong().color(p.dim));
                     },
                 );
             });
@@ -888,7 +864,7 @@ impl Panel {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("忽略").size(10.0).color(p.dim))
+                                egui::Button::new(RichText::new("忽略").size(11.0).color(p.dim))
                                     .fill(Color32::TRANSPARENT)
                                     .stroke(Stroke::NONE),
                             )
@@ -1170,10 +1146,10 @@ impl Panel {
 
         egui::Frame::new()
             .inner_margin(Margin {
-                left: 32,
-                right: 32,
-                top: 28,
-                bottom: 22,
+                left: 28,
+                right: 28,
+                top: 24,
+                bottom: 20,
             })
             .show(&mut card_ui, |ui| {
                 self.error_strip(ui, p);
@@ -1204,7 +1180,7 @@ impl Panel {
                                     |ui| {
                                         ui.label(
                                             RichText::new("关闭窗口后收起为桌面浮窗")
-                                                .size(10.5)
+                                                .size(11.0)
                                                 .color(p.subtle),
                                         );
                                     },
@@ -1213,7 +1189,7 @@ impl Panel {
                                             RichText::new(
                                                 "PeriphHub · 2.4G / 蓝牙 / 有线外设统一管理",
                                             )
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(p.subtle),
                                         );
                                     },
@@ -1224,7 +1200,7 @@ impl Panel {
                 }
             });
 
-        chrome::resize_handles(ui, !maximized);
+        chrome::resize_handles(ui, card, !maximized);
         self.settings_window(&ctx);
     }
 }

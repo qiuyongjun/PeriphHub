@@ -35,7 +35,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
 
     let mut action = BarAction::default();
     let width = ui.available_width();
-    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::hover());
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
     // 标题栏铺满圆角卡片的整个宽度，顶部两角跟随卡片圆角，否则方角会从
     // 卡片圆弧里戳出去；最大化时卡片无圆角，标题栏也回到方角。
     let top = if cfg.maximized { 0 } else { CARD_RADIUS };
@@ -88,7 +88,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
                 crate::theme::brand_badge(ui, 28.0, p);
             }
             ui.add_space(7.0);
-            ui.add(egui::Label::new(heading(cfg.title, 14.5, p.text)).truncate());
+            ui.add(egui::Label::new(heading(cfg.title, 13.5, p.text)).truncate());
             if let Some(sub) = cfg.subtitle.filter(|_| ui.available_width() > 100.0) {
                 ui.add_space(8.0);
                 ui.label(RichText::new(sub).size(11.0).color(p.subtle));
@@ -166,20 +166,23 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
 }
 
 /// 无边框窗口沿用系统缩放行为，最大化时停用边缘手柄。
-pub fn resize_handles(ui: &Ui, enabled: bool) {
+///
+/// 手柄范围按可见卡片矩形算，而不是含透明阴影边距的窗口矩形：窗口四周
+/// 留了 22px 画投影，如果按窗口边缘判定，用户看到的边和能拖的边会差出
+/// 整整一圈。
+pub fn resize_handles(ui: &Ui, card: Rect, enabled: bool) {
     if !enabled {
         return;
     }
     let ctx = ui.ctx();
-    let view = ctx.content_rect();
     let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
         return;
     };
-    let edge = 7.0;
-    let left = pos.x <= view.left() + edge;
-    let right = pos.x >= view.right() - edge;
-    let top = pos.y <= view.top() + edge;
-    let bottom = pos.y >= view.bottom() - edge;
+    let edge = 8.0;
+    let left = pos.x <= card.left() + edge;
+    let right = pos.x >= card.right() - edge;
+    let top = pos.y <= card.top() + edge;
+    let bottom = pos.y >= card.bottom() - edge;
     let dir = match (left, right, top, bottom) {
         (true, _, true, _) => Some((
             egui::ResizeDirection::NorthWest,

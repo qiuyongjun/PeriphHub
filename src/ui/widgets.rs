@@ -12,8 +12,8 @@ use crate::theme::{alpha, card_shadow, heading, heading_font, Palette};
 /// Shortcut shown in rescan tooltips; must match the binding in `app.rs`.
 pub const RESCAN_HINT: &str = "F5 或 Ctrl+R";
 
-/// 窗口级圆角卡片的圆角半径，主界面与浮窗共用一个值以保持观感一致。
-pub const CARD_RADIUS: u8 = 18;
+/// 窗口级卡片的圆角半径，主界面与浮窗共用一个值以保持观感一致。
+pub const CARD_RADIUS: u8 = 12;
 
 /// 圆角卡片 + 手绘投影，画在窗口矩形内的透明边距里。
 ///
@@ -43,7 +43,7 @@ pub fn shadow_card(
 ) {
     // (sigma, 下移, 峰值不透明度)：紧阴影贴着边，环境阴影铺得远而淡。
     let lobes: [(f32, f32, f32); 2] = if dark {
-        [(2.4, 1.0, 0.22), (8.0, 3.0, 0.26)]
+        [(2.4, 1.0, 0.18), (8.0, 3.0, 0.22)]
     } else {
         [(2.4, 1.0, 0.09), (8.0, 3.0, 0.10)]
     };
@@ -85,44 +85,7 @@ fn paint_shadow_lobe(painter: &Painter, rect: Rect, radius: u8, sigma: f32, peak
     }
 }
 
-/// 原生网格实现圆角渐变，随窗口缩放保持清晰且无需纹理资源。
-pub fn material_shape(rect: Rect, radius: u8, top: Color32, bottom: Color32) -> egui::Shape {
-    let radius = (radius as f32)
-        .min(rect.width() * 0.5)
-        .min(rect.height() * 0.5);
-    let color_at = |pos: Pos2| {
-        mix(
-            top,
-            bottom,
-            ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0),
-        )
-    };
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(rect.center(), color_at(rect.center()));
-    let corners = [
-        (Pos2::new(rect.right() - radius, rect.top() + radius), -1.0),
-        (
-            Pos2::new(rect.right() - radius, rect.bottom() - radius),
-            0.0,
-        ),
-        (Pos2::new(rect.left() + radius, rect.bottom() - radius), 1.0),
-        (Pos2::new(rect.left() + radius, rect.top() + radius), 2.0),
-    ];
-    for (center, start) in corners {
-        for step in 0..=8 {
-            let angle = (start + step as f32 / 8.0) * std::f32::consts::FRAC_PI_2;
-            let pos = center + Vec2::angled(angle) * radius;
-            mesh.colored_vertex(pos, color_at(pos));
-        }
-    }
-    let count = mesh.vertices.len() as u32 - 1;
-    for i in 1..=count {
-        mesh.add_triangle(0, i, if i == count { 1 } else { i + 1 });
-    }
-    mesh.into()
-}
-
-/// 共用表面负责圆角、材质和边界；背景占位确保绘制始终位于内容后方。
+/// 共用表面负责圆角、边界与统一留白；平面材质，层次交给底色和 1px 描边。
 pub fn surface<R>(
     ui: &mut Ui,
     p: &Palette,
@@ -131,88 +94,100 @@ pub fn surface<R>(
 ) -> egui::InnerResponse<R> {
     let mut frame = egui::Frame::new()
         .fill(p.card)
-        .stroke(Stroke::new(1.0, alpha(p.border, 180)))
+        .stroke(Stroke::new(1.0, p.border))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(margin)
         .shadow(card_shadow(p))
         .begin(ui);
-    let background = frame.content_ui.painter().add(egui::Shape::Noop);
     frame
         .content_ui
         .set_width(frame.content_ui.available_width());
     frame.content_ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
     let inner = add(&mut frame.content_ui);
     let response = frame.end(ui);
-    ui.painter().set(
-        background,
-        material_shape(
-            response.rect.shrink(1.0),
-            CARD_RADIUS - 1,
-            p.card_top,
-            p.card,
-        ),
-    );
     egui::InnerResponse::new(inner, response)
 }
 
 /// 标准配置卡片沿用共用表面与统一留白。
 pub fn card<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
-    surface(ui, p, Margin::same(22), add).inner
+    surface(ui, p, Margin::same(18), add).inner
 }
 
 /// 档位选择采用浅色填充与清晰描边，保留主要按钮的视觉优先级。
 pub fn chip(ui: &mut Ui, p: &Palette, text: &str, selected: bool) -> Response {
     let (fill, fg, stroke) = if selected {
         (
-            mix(p.chip_bg, p.accent, if p.dark { 0.18 } else { 0.10 }),
+            mix(p.chip_bg, p.accent, if p.dark { 0.16 } else { 0.10 }),
             p.accent,
-            Stroke::new(1.0, alpha(p.accent, 180)),
+            Stroke::new(1.0, alpha(p.accent, 170)),
         )
     } else {
-        (p.inset, p.dim, Stroke::new(1.0, alpha(p.border, 150)))
+        (Color32::TRANSPARENT, p.dim, Stroke::new(1.0, p.border))
     };
-    ui.add(
-        egui::Button::new(RichText::new(text).size(13.0).color(fg))
+    let resp = ui.add(
+        egui::Button::new(RichText::new(text).size(12.5).color(fg))
             .fill(fill)
             .stroke(stroke)
-            .corner_radius(CornerRadius::same(9))
-            .min_size(Vec2::new(58.0, 36.0)),
-    )
+            .corner_radius(CornerRadius::same(8))
+            .min_size(Vec2::new(54.0, 32.0)),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if !selected {
+            ui.painter().rect_stroke(
+                resp.rect,
+                CornerRadius::same(8),
+                Stroke::new(1.0, alpha(p.accent, 130)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    resp
 }
 
 /// 行内的次要动作——比如卡头部"当前 1600"旁边一个"恢复初始值"——用比
 /// `chip` 小一号的尺寸：字号和高度都跟着头部小字对齐，不喧宾夺主。
 pub fn chip_small(ui: &mut Ui, p: &Palette, text: &str) -> Response {
-    ui.add(
+    let resp = ui.add(
         egui::Button::new(RichText::new(text).size(11.5).color(p.text))
-            .fill(p.chip_bg)
+            .fill(Color32::TRANSPARENT)
             .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(7))
-            .min_size(Vec2::new(0.0, 24.0)),
-    )
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 22.0)),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_stroke(
+            resp.rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, alpha(p.accent, 120)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp
 }
 
 /// DPI 按钮保持固定宽度，数值变化不引起重排；描边与色彩共同标识当前档。
 pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> Response {
     let (fill, fg, stroke) = if selected {
         (
-            mix(p.chip_bg, p.accent, if p.dark { 0.18 } else { 0.10 }),
+            mix(p.chip_bg, p.accent, if p.dark { 0.16 } else { 0.10 }),
             p.accent,
-            Stroke::new(1.0, alpha(p.accent, 210)),
+            Stroke::new(1.0, alpha(p.accent, 190)),
         )
     } else {
-        (p.inset, p.dim, Stroke::new(1.0, alpha(p.border, 150)))
+        (Color32::TRANSPARENT, p.dim, Stroke::new(1.0, p.border))
     };
     let galley = ui
         .painter()
-        .layout_no_wrap(value.to_string(), heading_font(14.0), fg);
-    let size = Vec2::new(72.0, 38.0);
+        .layout_no_wrap(value.to_string(), heading_font(13.0), fg);
+    let size = Vec2::new(62.0, 32.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(9), fill);
+    painter.rect_filled(rect, CornerRadius::same(8), fill);
     painter.rect_stroke(
         rect,
-        CornerRadius::same(9),
+        CornerRadius::same(8),
         stroke,
         egui::StrokeKind::Inside,
     );
@@ -222,7 +197,7 @@ pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> Respons
         if !selected {
             ui.painter().rect_stroke(
                 rect,
-                CornerRadius::same(9),
+                CornerRadius::same(8),
                 Stroke::new(1.0, alpha(p.accent, 150)),
                 egui::StrokeKind::Inside,
             );
@@ -237,12 +212,20 @@ pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> Respons
 /// so users do not have to click dozens of times to cross a wide range.
 pub fn step_button(ui: &mut Ui, p: &Palette, label: &str, tip: &str) -> bool {
     let resp = ui.add(
-        egui::Button::new(RichText::new(label).size(16.0).color(p.text))
-            .fill(p.inset)
-            .stroke(Stroke::new(1.0, alpha(p.border, 180)))
-            .corner_radius(CornerRadius::same(8))
-            .min_size(Vec2::new(32.0, 32.0)),
+        egui::Button::new(RichText::new(label).size(15.0).color(p.text))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(7))
+            .min_size(Vec2::new(28.0, 28.0)),
     );
+    if resp.hovered() {
+        ui.painter().rect_stroke(
+            resp.rect,
+            CornerRadius::same(7),
+            Stroke::new(1.0, alpha(p.accent, 130)),
+            egui::StrokeKind::Inside,
+        );
+    }
     let fired = hold_repeat(ui, resp.id, &resp);
     if fired {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -367,16 +350,11 @@ pub fn device_tile(
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter();
     let radius = (size * 0.26) as u8;
-    painter.add(material_shape(
-        rect,
-        radius,
-        mix(p.card_top, tint, if p.dark { 0.16 } else { 0.08 }),
-        p.chip_bg,
-    ));
+    painter.rect_filled(rect, CornerRadius::same(radius), p.chip_bg);
     painter.rect_stroke(
         rect,
         CornerRadius::same(radius),
-        Stroke::new(1.0, alpha(tint, if p.dark { 64 } else { 42 })),
+        Stroke::new(1.0, alpha(tint, if p.dark { 52 } else { 38 })),
         egui::StrokeKind::Inside,
     );
     if kind == DeviceType::Unknown {
@@ -496,6 +474,7 @@ pub fn metric_col(
     width: f32,
     label: &str,
     value: &str,
+    unit: &str,
     note: &str,
     value_color: Color32,
     tip: &str,
@@ -507,15 +486,31 @@ pub fn metric_col(
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add(egui::Label::new(RichText::new(label).size(11.0).color(p.dim)).truncate());
             ui.add_space(5.0);
-            let measured = ui
+            let val_w = ui
                 .painter()
-                .layout_no_wrap(value.to_owned(), heading_font(24.0), value_color)
+                .layout_no_wrap(value.to_owned(), heading_font(19.0), value_color)
                 .size()
                 .x;
-            let font_size = (24.0 * width / measured.max(1.0)).clamp(17.0, 24.0);
-            ui.add(egui::Label::new(heading(value, font_size, value_color)).truncate());
+            let gap = if unit.is_empty() { 0.0 } else { 3.0 };
+            let unit_w = if unit.is_empty() {
+                0.0
+            } else {
+                ui.painter()
+                    .layout_no_wrap(unit.to_owned(), FontId::proportional(11.0), p.dim)
+                    .size()
+                    .x
+            };
+            let font_size = (19.0 * width / (val_w + gap + unit_w).max(1.0)).clamp(15.0, 19.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add(egui::Label::new(heading(value, font_size, value_color)).truncate());
+                if !unit.is_empty() {
+                    ui.add_space(3.0);
+                    ui.label(RichText::new(unit).size(11.0).color(p.dim));
+                }
+            });
             ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(note).size(10.5).color(p.subtle)).truncate());
+            ui.add(egui::Label::new(RichText::new(note).size(11.0).color(p.subtle)).truncate());
         });
     if !tip.is_empty() {
         out.response.on_hover_text(tip);
@@ -552,37 +547,39 @@ pub fn vrule(ui: &mut Ui, p: &Palette, top: f32, height: f32) {
     ui.painter().rect_filled(line, 0, alpha(p.border, 200));
 }
 
-/// The one filled button in the app. Painted by hand so the hover state is a
-/// real colour change instead of the flat fill egui's `Button` keeps.
+/// The one filled button in the app. 深色下用近白填充，浅色下用强调色：
+/// 强调色保留给链接与选中态，主按钮靠明度对比脱颖而出。
 pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> Response {
+    let (fill, ink) = if p.dark {
+        (p.text, p.bg)
+    } else {
+        (p.accent, p.on_accent)
+    };
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), heading_font(13.0), p.on_accent);
-    let size = Vec2::new(galley.size().x + 50.0, 40.0);
+        .layout_no_wrap(text.to_owned(), heading_font(12.5), ink);
+    let size = Vec2::new(galley.size().x + 44.0, 36.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
     let painter = ui.painter();
-    let fill = mix(p.accent, p.accent_hover, t);
-    painter.rect_filled(
-        rect.translate(Vec2::new(0.0, 2.0)),
-        CornerRadius::same(10),
-        Color32::from_black_alpha(if p.dark { 35 } else { 15 }),
-    );
-    painter.add(material_shape(rect, 10, fill, mix(fill, p.on_accent, 0.05)));
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(10),
-        Stroke::new(1.0, alpha(Color32::WHITE, if p.dark { 35 } else { 20 })),
-        egui::StrokeKind::Inside,
-    );
-    let icon_c = egui::pos2(rect.left() + 19.0, rect.center().y);
-    paint_refresh(painter, icon_c, 5.6, p.on_accent);
+    let fill = mix(fill, p.accent, t * if p.dark { 0.16 } else { 0.10 });
+    painter.rect_filled(rect, CornerRadius::same(9), fill);
+    if p.dark {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(9),
+            Stroke::new(1.0, alpha(Color32::WHITE, 40)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let icon_c = egui::pos2(rect.left() + 18.0, rect.center().y);
+    paint_refresh(painter, icon_c, 5.4, ink);
     painter.galley(
-        egui::pos2(rect.left() + 32.0, rect.center().y - galley.size().y / 2.0),
+        egui::pos2(rect.left() + 31.0, rect.center().y - galley.size().y / 2.0),
         galley,
-        p.on_accent,
+        ink,
     );
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -612,8 +609,8 @@ pub fn action_link(ui: &mut Ui, p: &Palette, text: &str, warn: bool) -> Response
     let color = if warn { p.warn } else { p.accent };
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(12.0), color);
-    let size = Vec2::new(galley.size().x + 34.0, 30.0);
+        .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
+    let size = Vec2::new(galley.size().x + 34.0, 26.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let t = ui
         .ctx()
@@ -763,8 +760,7 @@ fn setting_hint(ui: &mut Ui, p: &Palette, desc: &str, rec: &str) {
 }
 
 /// "推荐 xxx" chip. Tinted with the info hue so it reads as advice rather
-/// than as the selected state of a control. Dark mode lifts the hue toward
-/// white first: a 10px run of mid-blue on a dark wash is barely legible.
+/// than as the selected state of a control.
 fn rec_tag(ui: &mut Ui, p: &Palette, rec: &str) {
     let color = if p.dark {
         mix(p.info, Color32::WHITE, 0.3)
@@ -774,7 +770,7 @@ fn rec_tag(ui: &mut Ui, p: &Palette, rec: &str) {
     let text = format!("推荐 {rec}");
     let galley = ui
         .painter()
-        .layout_no_wrap(text, FontId::proportional(10.5), color);
+        .layout_no_wrap(text, FontId::proportional(11.0), color);
     let size = galley.size() + Vec2::new(10.0, 5.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
@@ -799,13 +795,13 @@ pub fn toggle_row(
 ) {
     ui.horizontal(|ui| {
         let label_response = ui.add(
-            egui::Label::new(RichText::new(label).size(13.5).color(p.text)).sense(Sense::click()),
+            egui::Label::new(RichText::new(label).size(13.0).color(p.text)).sense(Sense::click()),
         );
         if label_response.clicked() {
             on_change(!value);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 24.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(38.0, 22.0), Sense::click());
             let t = ui.ctx().animate_bool(resp.id, value);
             let hover = ui.ctx().animate_value_with_time(
                 resp.id.with("hover"),
@@ -818,20 +814,20 @@ pub fn toggle_row(
                 mix(p.track, p.dim, hover * 0.12)
             };
             let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(12), track);
-            let cx = rect.left() + 12.0 + t * 18.0;
+            painter.rect_filled(rect, CornerRadius::same(11), track);
+            let cx = rect.left() + 11.0 + t * 16.0;
             let knob = Color32::WHITE;
             painter.circle_filled(
-                egui::pos2(cx, rect.center().y + 0.7),
-                8.6,
-                Color32::from_black_alpha(if p.dark { 70 } else { 22 }),
+                egui::pos2(cx, rect.center().y + 0.6),
+                7.6,
+                Color32::from_black_alpha(if p.dark { 60 } else { 20 }),
             );
-            painter.circle_filled(egui::pos2(cx, rect.center().y), 8.2, knob);
+            painter.circle_filled(egui::pos2(cx, rect.center().y), 7.2, knob);
             if !value {
                 painter.circle_stroke(
                     egui::pos2(cx, rect.center().y),
-                    8.2,
-                    Stroke::new(1.0, alpha(p.border, 190)),
+                    7.2,
+                    Stroke::new(1.0, p.border),
                 );
             }
             if resp.hovered() || label_response.hovered() {
@@ -886,16 +882,18 @@ pub fn stepper_row(
 
 /// 分组标题用字重与留白区分层级。
 pub fn section_heading(ui: &mut Ui, p: &Palette, title: &str, description: &str) {
-    ui.label(heading(title, 16.0, p.text));
-    ui.add_space(4.0);
-    ui.label(RichText::new(description).size(11.5).color(p.dim));
+    // 卡片小标题不再用展示字族：14px 半粗在深色底上会显得过黑、过重，
+    // 改成常规字重的正文色，让页面标题与设备名保持唯一的重心。
+    ui.label(RichText::new(title).size(13.5).color(p.text));
+    ui.add_space(3.0);
+    ui.label(RichText::new(description).size(11.0).color(p.dim));
 }
 
 /// 卡片内分隔线保持低对比，避免与外部边界竞争。
 pub fn divider(ui: &mut Ui, p: &Palette) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, alpha(p.border, 140));
+    ui.painter().rect_filled(rect, 0.0, p.border);
 }
 
 /// Battery bar that is honest about what it knows:
@@ -904,9 +902,9 @@ pub fn divider(ui: &mut Ui, p: &Palette) {
 /// - an unknown level shows only the track.
 pub fn battery_bar(ui: &mut Ui, p: &Palette, battery: Option<u8>, wired: bool, color: Color32) {
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 4.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 2.5, p.track);
+    painter.rect_filled(rect, 2.0, p.track);
     let fill = match battery {
         Some(percent) => {
             let mut filled = rect;
@@ -917,13 +915,13 @@ pub fn battery_bar(ui: &mut Ui, p: &Palette, battery: Option<u8>, wired: bool, c
                 None
             }
         }
-        None if wired => Some((rect, p.info.gamma_multiply(0.45))),
+        None if wired => Some((rect, color.gamma_multiply(0.45))),
         None => None,
     };
     if let Some((mut filled, color)) = fill {
         // Keep the fill's trailing edge rounded even at low percentages.
-        filled.set_width(filled.width().max(5.0));
-        painter.rect_filled(filled, 2.5, color);
+        filled.set_width(filled.width().max(4.0));
+        painter.rect_filled(filled, 2.0, color);
     }
 }
 
@@ -940,15 +938,6 @@ pub fn status_dot(ui: &mut Ui, color: Color32, pulse: bool) {
         (3.0, color)
     };
     ui.painter().circle_filled(rect.center(), radius, c);
-}
-
-/// 简洁指标用于设备配置摘要。
-pub fn stat(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 3.0;
-        ui.label(RichText::new(label).size(11.0).color(p.dim));
-        ui.label(heading(value, 24.0, p.text));
-    });
 }
 
 /// 在两种不透明表面色之间插值，供材质与悬停反馈共用。

@@ -16,8 +16,7 @@ use crate::theme::{
     alpha, battery_color, battery_label, battery_level, heading_font, paint_brand, Palette,
 };
 use crate::ui::widgets::{
-    connection_color, material_shape, mix, paint_device_glyph, shadow_card, short_model,
-    CARD_RADIUS,
+    connection_color, mix, paint_device_glyph, shadow_card, short_model, CARD_RADIUS,
 };
 
 /// Widget card width. The native window is this plus `SHADOW_PAD` on each side.
@@ -161,12 +160,8 @@ pub fn view(
 fn paint_card(ui: &Ui, p: &Palette, card: Rect) {
     let focused = ui.ctx().input(|i| i.focused);
     shadow_card(ui.painter(), card, p.card, CARD_RADIUS, p.dark, focused);
-    ui.painter().add(material_shape(
-        card.shrink(0.5),
-        CARD_RADIUS,
-        p.card_top,
-        p.card,
-    ));
+    ui.painter()
+        .rect_filled(card.shrink(0.5), CornerRadius::same(CARD_RADIUS), p.card);
 }
 
 /// 标题与在线摘要分成两行，避免状态文字覆盖右侧工具按钮。
@@ -264,7 +259,7 @@ fn header(
         Pos2::new(dot_c.x + 7.0, dot_c.y),
         Align2::LEFT_CENTER,
         summary,
-        FontId::proportional(10.0),
+        FontId::proportional(11.0),
         summary_color,
     );
     painter.line_segment(
@@ -272,7 +267,7 @@ fn header(
             Pos2::new(rect.left(), rect.bottom()),
             Pos2::new(rect.right(), rect.bottom()),
         ],
-        Stroke::new(1.0, alpha(p.border, 120)),
+        Stroke::new(1.0, p.border),
     );
 
     // Drag strip: everything left of the buttons. Registered after them so a
@@ -322,42 +317,53 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         Pos2::new(rect.left() + 2.0, rect.center().y - 16.0),
         Vec2::splat(32.0),
     );
-    painter.add(material_shape(
-        tile,
-        9,
-        mix(p.chip_bg, tint, if offline { 0.03 } else { 0.10 }),
-        p.chip_bg,
-    ));
+    painter.rect_filled(tile, CornerRadius::same(9), p.chip_bg);
     painter.rect_stroke(
         tile,
         CornerRadius::same(9),
-        Stroke::new(1.0, alpha(tint, 40)),
+        Stroke::new(1.0, alpha(tint, if offline { 24 } else { 52 })),
         StrokeKind::Inside,
     );
 
     let wired = entry.info.connection.is_wired();
     let level = battery_level(entry.state.battery, wired);
-    let (value, value_color) = match &entry.state.link {
-        Link::Offline(_) => ("离线".to_string(), p.danger),
-        Link::Connecting => ("连接中".to_string(), p.warn),
+    // 右侧这一列是电量读数；没有读数就留空。连接方式已经写在左侧注释里，
+    // 再放一个"有线/在线"会和百分比抢同一列，也重复了信息。
+    let (value, value_color, metric) = match &entry.state.link {
+        Link::Offline(_) => ("离线".to_string(), p.danger, false),
+        Link::Connecting => ("连接中".to_string(), p.warn, false),
         Link::Online => match entry.state.battery {
-            Some(b) => (format!("{}%", b.min(100)), battery_color(level, p)),
-            None if wired => ("有线".to_string(), p.info),
-            None => ("在线".to_string(), p.ok),
+            Some(b) => (format!("{}%", b.min(100)), battery_color(level, p), true),
+            None => (String::new(), p.dim, false),
         },
     };
-    let value_font = heading_font(13.5);
-    let value_w = painter
-        .layout_no_wrap(value.clone(), value_font.clone(), value_color)
-        .size()
-        .x;
-    painter.text(
-        Pos2::new(rect.right() - 10.0, rect.top() + 10.0),
-        Align2::RIGHT_TOP,
-        value,
-        value_font,
-        value_color,
-    );
+    let value_font = if metric {
+        heading_font(13.5)
+    } else {
+        FontId::proportional(11.5)
+    };
+    let value_top = if metric {
+        rect.top() + 10.0
+    } else {
+        rect.top() + 12.0
+    };
+    let value_w = if value.is_empty() {
+        0.0
+    } else {
+        painter
+            .layout_no_wrap(value.clone(), value_font.clone(), value_color)
+            .size()
+            .x
+    };
+    if !value.is_empty() {
+        painter.text(
+            Pos2::new(rect.right() - 10.0, value_top),
+            Align2::RIGHT_TOP,
+            value,
+            value_font,
+            value_color,
+        );
+    }
 
     // 形态图标独立成块，小尺寸下也能分辨键盘与鼠标。
     paint_device_glyph(painter, tile.center(), entry.info.kind, tint, 18.0);
@@ -401,14 +407,14 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     let note = ellipsize(
         painter,
         &note,
-        FontId::proportional(10.5),
+        FontId::proportional(11.0),
         rect.right() - text_left - if has_gauge { 56.0 } else { 10.0 },
     );
     painter.text(
-        Pos2::new(text_left, rect.top() + 31.0),
+        Pos2::new(text_left, rect.top() + 30.0),
         Align2::LEFT_TOP,
         note,
-        FontId::proportional(10.5),
+        FontId::proportional(11.0),
         note_color,
     );
     if has_gauge {
@@ -475,7 +481,7 @@ fn empty_row(
         Pos2::new(rect.center().x, rect.center().y + 10.0),
         Align2::CENTER_CENTER,
         note,
-        FontId::proportional(10.5),
+        FontId::proportional(11.0),
         p.dim,
     );
     if resp.hovered() {
