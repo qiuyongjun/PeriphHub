@@ -57,13 +57,14 @@ pub fn mouse_speed() -> u32 {
 /// letting the number silently snap back.
 pub fn set_mouse_speed(speed: u32) -> bool {
     let v = speed.clamp(MOUSE_SPEED_MIN, MOUSE_SPEED_MAX);
-    // SPI_SETMOUSESPEED 与滚轮行数相反：`uiParam` 必须为 0，速度放在
-    // `pvParam` 指向的整数里。传错位置时 Windows 不会改任何东西。
+    // SPI_SETMOUSESPEED 与滚轮行数相反：`uiParam` 必须为 0，速度整数本身
+    // 直接放在 `pvParam` 里（不是指向整数的指针）。传错时 Windows 不会改
+    // 任何东西。
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_SETMOUSESPEED,
             0,
-            &v as *const u32 as *mut c_void,
+            v as usize as *mut c_void,
             SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
         )
     };

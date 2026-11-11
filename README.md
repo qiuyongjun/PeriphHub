@@ -69,8 +69,8 @@ cargo build --release        # 产物：target\release\PeriphHub.exe
 ```powershell
 # 1. 修改 Cargo.toml 里的 version，提交改动
 # 2. 打 tag 并推送
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 推送 `v*` tag 后，GitHub Actions 会运行测试、构建 release、生成带校验和的 zip，并创建 GitHub Release。
@@ -81,7 +81,7 @@ pwsh scripts/package.ps1              # 产物在 dist\
 pwsh scripts/package.ps1 -SkipBuild  # 复用已有 release 构建
 ```
 
-> tag 必须与 `Cargo.toml` 的版本一致（`v0.1.0` ↔ `version = "0.1.0"`），否则工作流会失败。
+> tag 必须与 `Cargo.toml` 的版本一致（`v0.2.0` ↔ `version = "0.2.0"`），否则工作流会失败。
 
 ## 许可证
 

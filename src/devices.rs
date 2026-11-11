@@ -19,6 +19,9 @@ const SHUTDOWN_WAIT: Duration = Duration::from_millis(1500);
 /// 采集线程正在执行可能写 EEPROM 的调用时，退出多等一会儿；仍不是无限
 /// 等待，避免驱动卡死时“退出”点了没反应。
 const WRITE_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+/// 关通道后采样 busy 前的调度窗口：被唤醒的采集线程要取走队列里最后一批
+/// 命令并进入写序列，立刻采样会漏掉这段刚启动的写入。
+const SHUTDOWN_SETTLE: Duration = Duration::from_millis(20);
 /// 采集线程异常退出后的自动重建次数上限（60 秒窗口内）。设备返回一帧畸形
 /// 数据就会 panic，无限重建会变成打转，超过次数就把错误摊给用户。
 const MAX_RESTARTS: u8 = 3;
@@ -119,7 +122,9 @@ impl EditorState {
 pub struct DeviceState {
     pub link: Link,
     pub battery: Option<u8>,
-    pub snap: Option<Snapshot>,
+    /// 快照按帧共享：配置页每帧都会读它，整份深拷贝（含 DPI 表）没必要。
+    /// `Arc` 也让同一帧内所有控件看到的是同一份数据。
+    pub snap: Option<Arc<Snapshot>>,
     pub editor: EditorState,
     pub synced: Option<Instant>,
     pub last_error: Option<String>,
@@ -194,25 +199,58 @@ pub struct Entry {
 
 /// Take everything that is already queued, so a burst of edits is applied as
 /// one batch instead of being interleaved with read-backs of older state.
-fn drain_queue(rx: &Receiver<Cmd>, first: Option<Cmd>) -> Option<Vec<Cmd>> {
+///
+/// `Disconnected` 只表示队列已取空且发送端不在了；已经取出的命令仍要执行
+/// 完再退出，否则"调完参数立刻退出"会丢掉最后一批修改。退出由下一轮
+/// `recv_timeout` 返回 `Disconnected` 时完成。
+fn drain_queue(rx: &Receiver<Cmd>, first: Option<Cmd>) -> Vec<Cmd> {
     let mut cmds = Vec::new();
     if let Some(c) = first {
         cmds.push(c);
     }
-    loop {
-        match rx.try_recv() {
-            Ok(c) => cmds.push(c),
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => return None,
-        }
+    while let Ok(c) = rx.try_recv() {
+        cmds.push(c);
     }
-    Some(cmds)
+    cmds
 }
 
 /// 相当于"d 之前"的时刻；系统刚开机单调钟不足 d 时退化为现在，只会推迟
 /// 一个轮询周期，避免直接相减在理论上 panic。
 fn ago(d: Duration) -> Instant {
     Instant::now().checked_sub(d).unwrap_or_else(Instant::now)
+}
+
+/// 同一条后台错误只记一次日志。
+///
+/// 鼠标休眠时 `battery()` 返回 Err 是常态，而电量是 20 秒一轮的后台轮询：
+/// 照直记一晚就是几千条，1 MB 的滚动日志会被这些噪音冲掉，真正的现场反而
+/// 没了。返回值表示"这条内容和上次不同，需要写日志"。
+fn is_new_error(last: &mut Option<String>, msg: &str) -> bool {
+    if last.as_deref() == Some(msg) {
+        return false;
+    }
+    *last = Some(msg.to_string());
+    true
+}
+
+/// 采集线程"正在做可能写 EEPROM 的调用"的标志，作用域结束时自动复位。
+///
+/// 手工配对 `store(true)` / `store(false)` 在驱动 panic 时只执行前半段，
+/// `busy` 会永远留在 true 上，退出时 `shutdown` 白等满 6 秒。Drop 在
+/// unwind 时同样会跑，所以用它替换手工复位。
+struct BusyGuard(Arc<AtomicBool>);
+
+impl BusyGuard {
+    fn new(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 /// 起一个采集线程并返回它与主线程之间的两条通道（外加句柄，退出时好收尾）。
@@ -238,6 +276,23 @@ fn spawn_worker(
     (tx, msg_rx, handle, busy)
 }
 
+/// 给条目起一个新的采集线程，并把界面状态切回"连接中"。只读设备没有
+/// 驱动规格，直接跳过。
+fn start_worker(entry: &mut Entry, ctx: &egui::Context, read_mode: &Arc<AtomicU8>) {
+    let (Some(spec), Some(path)) = (entry.spec, entry.path.clone()) else {
+        return;
+    };
+    let (tx, rx, join, busy) = spawn_worker(spec, path, read_mode.clone(), ctx.clone());
+    entry.tx = Some(tx);
+    entry.rx = Some(rx);
+    entry.join = Some(join);
+    entry.busy = Some(busy);
+    entry.sent = 0;
+    entry.state.snap = None;
+    entry.state.editor = EditorState::default();
+    entry.state.link = Link::Connecting;
+}
+
 /// 采集线程崩溃后的自愈：先把状态摊给用户，再重建一个（有限次）。
 ///
 /// 之前这里只是 `break`，于是线程 panic 之后条目永远停在 `Connecting`：
@@ -245,9 +300,9 @@ fn spawn_worker(
 fn restart_worker(entry: &mut Entry, ctx: &egui::Context, read_mode: &Arc<AtomicU8>) {
     entry.tx = None;
     entry.rx = None;
-    let (Some(spec), Some(path)) = (entry.spec, entry.path.clone()) else {
+    if entry.spec.is_none() || entry.path.is_none() {
         return;
-    };
+    }
     // 同一帧坏数据会让新线程立刻再崩一次，所以按 60 秒窗口计数，别打转。
     let recent = entry
         .last_restart
@@ -271,15 +326,7 @@ fn restart_worker(entry: &mut Entry, ctx: &egui::Context, read_mode: &Arc<Atomic
         entry.state.snap = None;
         return;
     }
-    let (tx, rx, join, busy) = spawn_worker(spec, path, read_mode.clone(), ctx.clone());
-    entry.tx = Some(tx);
-    entry.rx = Some(rx);
-    entry.join = Some(join);
-    entry.busy = Some(busy);
-    entry.sent = 0;
-    entry.state.snap = None;
-    entry.state.editor = EditorState::default();
-    entry.state.link = Link::Connecting;
+    start_worker(entry, ctx, read_mode);
     ctx.request_repaint();
 }
 
@@ -298,6 +345,7 @@ fn real_worker(
     let mut last_full = ago(FULL_EVERY);
     let mut last_batt = ago(BATTERY_EVERY);
     let mut last_error: Option<String> = None;
+    let mut last_batt_error: Option<String> = None;
     let mut consumed: u64 = 0;
 
     loop {
@@ -312,9 +360,7 @@ fn real_worker(
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let Some(mut cmds) = drain_queue(&rx, first) else {
-            break;
-        };
+        let mut cmds = drain_queue(&rx, first);
         consumed += cmds.len() as u64;
         coalesce(&mut cmds);
         let force_full = cmds.iter().any(|c| matches!(c, Cmd::Refresh));
@@ -327,6 +373,8 @@ fn real_worker(
                     last_full = ago(FULL_EVERY);
                     last_batt = ago(BATTERY_EVERY);
                     last_error = None;
+                    // 换了新连接（或设备刚醒），同样错误要重新留痕。
+                    last_batt_error = None;
                 }
                 Err(e) => {
                     if last_error.as_deref() != Some(e.as_str()) {
@@ -357,7 +405,7 @@ fn real_worker(
         if !cmds.is_empty() {
             // The driver owns the "write then re-read just this field" step,
             // so one burst costs one read-back per block, not per command.
-            busy.store(true, Ordering::Relaxed);
+            let _busy = BusyGuard::new(&busy);
             let mut scratch = Snapshot::default();
             for cmd in &cmds {
                 if matches!(cmd, Cmd::Refresh) {
@@ -376,7 +424,6 @@ fn real_worker(
                     }
                 }
             }
-            busy.store(false, Ordering::Relaxed);
         }
 
         if force_full || rejected {
@@ -394,9 +441,8 @@ fn real_worker(
                 .full_every()
                 .is_some_and(|every| last_full.elapsed() >= every);
         if due_full {
-            busy.store(true, Ordering::Relaxed);
+            let _busy = BusyGuard::new(&busy);
             let full = d.snapshot();
-            busy.store(false, Ordering::Relaxed);
             match full {
                 Ok(s) => {
                     snap = Some(s);
@@ -422,18 +468,42 @@ fn real_worker(
 
         let mut battery = None;
         if last_batt.elapsed() >= BATTERY_EVERY {
-            busy.store(true, Ordering::Relaxed);
+            let _busy = BusyGuard::new(&busy);
             let batt = d.battery();
-            busy.store(false, Ordering::Relaxed);
             match batt {
                 Ok(b) => {
                     battery = b;
                     last_batt = Instant::now();
+                    last_batt_error = None;
                 }
                 Err(e) => {
+                    // 浮窗模式停掉了周期全量读，接收器被拔这类断连只能靠
+                    // 电量轮询发现。句柄还活着说明只是设备休眠，保留在线
+                    // 状态；句柄已失效就丢掉驱动，交给重连逻辑并更新浮窗。
+                    if !d.link_alive() {
+                        dev = None;
+                        snap = None;
+                        last_open = Instant::now();
+                        let _ = tx.send(DeviceMsg {
+                            snap: None,
+                            battery: None,
+                            link: Link::Offline(e),
+                            error: None,
+                            consumed,
+                        });
+                        ctx.request_repaint();
+                        continue;
+                    }
                     // 电量是后台轮询，无线鼠标休眠时失败很常见；它不是用户
                     // 刚做的操作，不能拿去触发“操作失败”提示。
-                    crate::log::line("WARN", &format!("读取电量失败：{e}"));
+                    //
+                    // 失败也要把计时器推到下一轮：否则 Full 模式下每个 200 ms
+                    // 周期都会重试一次，日志去重只是把洪水藏起来，设备照样被
+                    // 反复吵醒。相同错误只在内容变化时记一条。
+                    if is_new_error(&mut last_batt_error, &e) {
+                        crate::log::line("WARN", &format!("读取电量失败：{e}"));
+                    }
+                    last_batt = Instant::now();
                 }
             }
         }
@@ -472,9 +542,7 @@ fn demo_worker(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let Some(mut cmds) = drain_queue(&rx, first) else {
-            break;
-        };
+        let mut cmds = drain_queue(&rx, first);
         consumed += cmds.len() as u64;
         // Same batching rule as the real worker: one write per field per burst,
         // so the demo shell shows the same behaviour the device does.
@@ -504,6 +572,15 @@ pub struct DeviceManager {
     /// 当前页面需要多频繁的全量读取（见 `ReadMode`）。用原子量而不是
     /// 通道：这是单向的"状态广播"。
     read_mode: Arc<AtomicU8>,
+    /// 后台枚举线程的结果通道。
+    ///
+    /// `hid::enumerate` 会对系统里每个 HID 接口打开句柄、读产品串和
+    /// preparsed data；几十个接口时是几百毫秒的量级，蓝牙设备更慢。
+    /// 放在 UI 线程上，点一次"重新扫描"界面就僵一下，所以扫描整体挪到
+    /// 后台，结果回到 `poll` 里再合并进设备表。
+    scan_rx: Option<Receiver<Vec<hid::HidDevice>>>,
+    /// 扫描进行中又点了"重新扫描"：等这一轮结果应用完再补一轮。
+    rescan_queued: bool,
 }
 
 impl DeviceManager {
@@ -516,13 +593,20 @@ impl DeviceManager {
             demo,
             ctx: ctx.clone(),
             read_mode: Arc::new(AtomicU8::new(ReadMode::Full as u8)),
+            scan_rx: None,
+            rescan_queued: false,
         };
-        manager.scan();
+        manager.start_scan();
         manager
     }
 
     pub fn is_demo(&self) -> bool {
         self.demo
+    }
+
+    /// 枚举线程还在跑。界面据此显示"正在扫描"，而不是"没有发现设备"。
+    pub fn is_scanning(&self) -> bool {
+        self.scan_rx.is_some()
     }
 
     /// 页面切换时广播新的读取策略。
@@ -537,11 +621,8 @@ impl DeviceManager {
     /// 等待有总时长上限：真卡在超时轮询里的线程不该让"退出"点了没反应。
     pub fn shutdown(&mut self) {
         let (done_tx, done_rx) = mpsc::channel::<()>();
-        // 有线程正卡在写序列里时多等一会儿；没有就保持快速退出。
-        let busy = self
-            .entries
-            .iter()
-            .any(|e| e.busy.as_ref().is_some_and(|b| b.load(Ordering::Relaxed)));
+        let busy_flags: Vec<Arc<AtomicBool>> =
+            self.entries.iter().filter_map(|e| e.busy.clone()).collect();
         let mut pending = 0usize;
         for mut entry in self.entries.drain(..) {
             // 先丢发送端：`recv_timeout` 才会立刻返回 Disconnected 而不是等超时。
@@ -556,6 +637,10 @@ impl DeviceManager {
                 pending += 1;
             }
         }
+        // 通道关闭会唤醒采集线程，但它可能刚取走队列里最后一批写命令；
+        // 等它进入 `BusyGuard` 后再采样，才能拿到正确的宽限期。
+        std::thread::sleep(SHUTDOWN_SETTLE);
+        let busy = busy_flags.iter().any(|b| b.load(Ordering::Relaxed));
         let deadline = Instant::now()
             + if busy {
                 WRITE_SHUTDOWN_WAIT
@@ -582,39 +667,96 @@ impl DeviceManager {
     }
 
     pub fn rescan(&mut self) {
-        self.scan();
+        self.start_scan();
     }
 
-    fn scan(&mut self) {
+    /// 起一轮后台枚举。已有扫描在跑时不叠加：记一个标记，等结果回来再补
+    /// 一轮，按钮连点也不会同时开一堆线程。
+    fn start_scan(&mut self) {
         if self.demo {
-            if self.entries.is_empty() {
-                for d in demo::devices() {
-                    let (tx, rx) = mpsc::channel();
-                    let (msg_tx, msg_rx) = mpsc::channel();
-                    let ctx = self.ctx.clone();
-                    std::thread::Builder::new()
-                        .name(format!("demo-{}", d.info.id.0))
-                        .spawn(move || demo_worker(d.snap, d.battery, rx, msg_tx, ctx))
-                        .expect("启动演示线程");
-                    self.entries.push(Entry {
-                        info: d.info,
-                        state: DeviceState::default(),
-                        sent: 0,
-                        path: None,
-                        spec: None,
-                        restarts: 0,
-                        last_restart: None,
-                        busy: None,
-                        tx: Some(tx),
-                        rx: Some(msg_rx),
-                        join: None,
-                    });
-                }
-            }
+            self.seed_demo_devices();
             return;
         }
+        if self.scan_rx.is_some() {
+            self.rescan_queued = true;
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hid-scan".into())
+            .spawn(move || {
+                let _ = tx.send(hid::enumerate());
+                // 线程自己叫醒界面，否则结果要等下一次交互才被看到。
+                ctx.request_repaint();
+            });
+        if let Err(e) = spawned {
+            // 开不出线程就只能回到同步枚举：慢一点，但列表不能空着。
+            crate::log::line("WARN", &format!("启动设备枚举线程失败：{e}，改为同步扫描"));
+            let found = hid::enumerate();
+            self.reconcile(found);
+            return;
+        }
+        self.scan_rx = Some(rx);
+    }
 
-        let found = hid::enumerate();
+    /// 后台扫描的结果到了就并进设备表；返回 true 表示列表发生了变化。
+    fn apply_scan_result(&mut self) -> bool {
+        let result = self.scan_rx.as_ref().map(|rx| rx.try_recv());
+        match result {
+            Some(Ok(found)) => {
+                self.scan_rx = None;
+                self.reconcile(found);
+                if self.rescan_queued {
+                    self.rescan_queued = false;
+                    self.start_scan();
+                }
+                true
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                // 枚举线程没能把结果送回来（panic 或进程在退）；别让界面
+                // 永远停在"正在扫描"。
+                self.scan_rx = None;
+                if self.rescan_queued {
+                    self.rescan_queued = false;
+                    self.start_scan();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn seed_demo_devices(&mut self) {
+        if !self.entries.is_empty() {
+            return;
+        }
+        for d in demo::devices() {
+            let (tx, rx) = mpsc::channel();
+            let (msg_tx, msg_rx) = mpsc::channel();
+            let ctx = self.ctx.clone();
+            std::thread::Builder::new()
+                .name(format!("demo-{}", d.info.id.0))
+                .spawn(move || demo_worker(d.snap, d.battery, rx, msg_tx, ctx))
+                .expect("启动演示线程");
+            self.entries.push(Entry {
+                info: d.info,
+                state: DeviceState::default(),
+                sent: 0,
+                path: None,
+                spec: None,
+                restarts: 0,
+                last_restart: None,
+                busy: None,
+                tx: Some(tx),
+                rx: Some(msg_rx),
+                join: None,
+            });
+        }
+    }
+
+    /// 把一次枚举结果并进设备表。
+    fn reconcile(&mut self, found: Vec<hid::HidDevice>) {
         // 同 id（container id）但 path 变了 = 设备重插过，旧 worker 一直重试
         // 失效 path 会永远离线；丢弃条目让下面的循环重建 worker（旧 worker
         // 随 channel 关闭自然退出）。
@@ -624,10 +766,15 @@ impl DeviceManager {
                 None => false,
             },
         );
-        // 手动重扫是用户明确要求"再试一次"，把自愈计数清零。
+        // 手动重扫是用户明确要求"再试一次"，把自愈计数清零。自愈次数用尽
+        // 后 worker 已经被丢掉（tx/rx 为空），只清零不会恢复，必须真的
+        // 重建线程；否则同 id/path 的设备会一直停在离线状态。
         for e in &mut self.entries {
             e.restarts = 0;
             e.last_restart = None;
+            if e.tx.is_none() {
+                start_worker(e, &self.ctx, &self.read_mode);
+            }
         }
         for dev in found {
             if self.entries.iter().any(|e| e.info.id.0.as_ref() == dev.id) {
@@ -678,7 +825,7 @@ impl DeviceManager {
 
     /// Drain worker messages; returns true if any visible state changed.
     pub fn poll(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.apply_scan_result();
         for entry in &mut self.entries {
             let mut died = false;
             if let Some(rx) = &entry.rx {
@@ -706,7 +853,7 @@ impl DeviceManager {
                                         entry.info.model = s.model.clone();
                                     }
                                     entry.state.editor = EditorState::from_snapshot(&s);
-                                    entry.state.snap = Some(s);
+                                    entry.state.snap = Some(Arc::new(s));
                                     entry.state.synced = Some(Instant::now());
                                 }
                             }
@@ -736,6 +883,10 @@ impl DeviceManager {
             return;
         };
         if let Some(s) = entry.state.snap.as_mut() {
+            // 界面上可能还持有本帧开始时的 Arc（配置页会 clone 一份用来
+            // 渲染），所以这里必须 make_mut：有别的读者时复制一份再改，
+            // 不能把已经画出去的数据就地改掉。
+            let s = Arc::make_mut(s);
             match cmd {
                 Cmd::Polling(ms) => s.polling_ms = ms,
                 Cmd::Motion(v) => s.motion = v,
@@ -847,5 +998,66 @@ mod tests {
         assert_eq!(ReadMode::BatteryOnly.full_every(), None);
         assert_eq!(ReadMode::BatteryOnly.wait_ms(), 900);
         assert_eq!(ReadMode::Full.wait_ms(), 200);
+    }
+
+    /// 鼠标休眠时电量轮询会一遍遍返回同一个错误；日志只在内容变化时写一条，
+    /// 否则 1 MB 的滚动日志会被噪音冲掉。恢复正常后要能重新记录。
+    #[test]
+    fn repeated_background_errors_are_logged_once() {
+        let mut last = None;
+        assert!(is_new_error(&mut last, "设备无响应（超时）"));
+        assert!(!is_new_error(&mut last, "设备无响应（超时）"));
+        assert!(is_new_error(&mut last, "读取应答失败"));
+        assert!(!is_new_error(&mut last, "读取应答失败"));
+        // 成功一轮后清空，下一次失败仍然要留下痕迹。
+        last = None;
+        assert!(is_new_error(&mut last, "设备无响应（超时）"));
+    }
+
+    /// 驱动 panic 时也要复位：否则退出会白等满 6 秒的写等待。
+    #[test]
+    fn busy_guard_resets_the_flag_when_dropped() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = BusyGuard::new(&flag);
+            assert!(flag.load(Ordering::Relaxed));
+        }
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    /// 退出时发送端先被丢弃；已经排队的命令仍要取出来执行，不能因为通道
+    /// 断开就连同已取出的这一批一起丢掉。
+    #[test]
+    fn queued_commands_survive_a_closed_sender() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Cmd::Polling(2)).expect("queue polling");
+        tx.send(Cmd::Activate(1)).expect("queue activate");
+        let first = rx.recv().expect("first command");
+        drop(tx);
+        let cmds = drain_queue(&rx, Some(first));
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], Cmd::Polling(2)));
+        assert!(matches!(cmds[1], Cmd::Activate(1)));
+    }
+
+    /// 枚举结果走通道回到 UI 线程：结果没到之前保持"扫描中"，到了以后结束
+    /// 扫描并报告列表变化。异步枚举的关键就是这个状态机。
+    #[test]
+    fn scan_results_are_applied_when_they_arrive() {
+        let (tx, rx) = mpsc::channel();
+        let mut manager = DeviceManager {
+            entries: Vec::new(),
+            demo: false,
+            ctx: egui::Context::default(),
+            read_mode: Arc::new(AtomicU8::new(ReadMode::Summary as u8)),
+            scan_rx: Some(rx),
+            rescan_queued: false,
+        };
+        assert!(manager.is_scanning());
+        assert!(!manager.poll(), "结果还没到，不该报告列表变化");
+        tx.send(Vec::new()).expect("send scan result");
+        assert!(manager.poll());
+        assert!(!manager.is_scanning());
+        assert!(manager.list().is_empty());
     }
 }

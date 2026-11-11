@@ -10,7 +10,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HidD_GetInputReport, HidD_SetOutputReport,
+    HidD_GetAttributes, HidD_GetInputReport, HidD_SetOutputReport, HIDD_ATTRIBUTES,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
@@ -45,11 +45,111 @@ fn stages_from_raw(raw: u8) -> u8 {
     raw.saturating_add(1).min(MAX_STAGES)
 }
 
+/// `0xAA` 应答 `[2]` 是百分比；不是百分比的字节一律当成"这一轮没有读数"。
+///
+/// 开机后第一帧实测回 `0x7F`（127%）——接收器此时还没从鼠标那里拿到电量，
+/// 或者干脆是缓冲区里上一条应答被当成了电量。两种情况下把 127 画到界面上
+/// 都是假的，宁可暂时显示"电量未知"。
+fn battery_percent(raw: u8) -> Option<u8> {
+    (raw <= 100).then_some(raw)
+}
+
+/// 一条应答算不算有效的电量读数：`[1]` 必须是已知的连接 flag（2.4G = 1、
+/// 插线 = 2），`[2]` 必须是百分比。
+///
+/// 只校验 `[2]` 挡不住旧应答回放：提交应答 `01 7d 00…` 的 `[2]` 是 0，
+/// 被当电量就是 0%；`[2] ≤ 100` 的读应答回放同样会放行。flag 不是 1/2
+/// 的帧一律不算电量。
+fn battery_reply(resp: &[u8; 32]) -> Option<u8> {
+    if !matches!(resp[1], 1 | 2) {
+        return None;
+    }
+    battery_percent(resp[2])
+}
+
+/// 32 字节帧的公共头：`BA A5 操作码`。
+fn frame(op: u8) -> [u8; 32] {
+    let mut f = [0u8; 32];
+    f[0] = RID;
+    f[1] = 0xA5;
+    f[2] = op;
+    f
+}
+
+/// 读帧：`A5 A4 len addr(LE)`，数据由设备填在 `[4..32]`。
+fn read_frame(addr: u32, len: usize) -> Result<[u8; 32], String> {
+    // 数据区是 r[4..32]，越界的长度只会变成一次 panic。
+    if len > 28 {
+        return Err(format!("读取长度超出 32 字节帧（{len}）"));
+    }
+    let mut f = frame(0xA4);
+    f[3] = len as u8;
+    f[4..8].copy_from_slice(&addr.to_le_bytes());
+    Ok(f)
+}
+
+/// 写帧：`A5 A5 len addr(LE) data…`，数据区是 `[8..32]`。
+fn write_frame(addr: u32, data: &[u8]) -> Result<[u8; 32], String> {
+    if data.len() > 24 {
+        return Err(format!("写入长度超出 32 字节帧（{}）", data.len()));
+    }
+    let mut f = frame(0xA5);
+    f[3] = data.len() as u8;
+    f[4..8].copy_from_slice(&addr.to_le_bytes());
+    f[8..8 + data.len()].copy_from_slice(data);
+    Ok(f)
+}
+
+fn commit_frame() -> [u8; 32] {
+    frame(0xA3)
+}
+
+fn battery_frame() -> [u8; 32] {
+    frame(0xAA)
+}
+
+/// 判断一条读应答是否算新应答：内容与上一条不同，或请求本身是上一次
+/// 同一地址、同一长度的读取。后者是必要的：寄存器没变时合法应答与
+/// 过期回放逐字节相同，只能靠请求区分（见 docs/protocol.md §3.2）。
+///
+/// 因此同一地址的读取长度必须固定：应答不保证回显长度，`0x08C0` 的 4 字节读
+/// 紧跟 8 字节读时，多出的 4 字节若全零，两帧就逐字节相同，合法应答会被
+/// 误判成过期。
+fn is_fresh(read: bool, resp: &[u8; 32], prev: &[u8; 32], repeated_read: bool) -> bool {
+    !read || resp[1..] != prev[1..] || repeated_read
+}
+
+/// 把一次任意起点、任意长度的写入切成 4 字节对齐块：返回
+/// `(块地址, 块内偏移, 本次写入长度)`。
+///
+/// 驱动的读-改-写边界完全由它决定，所以单独抽出来离线钉死：非对齐起点、
+/// 跨块、末尾不足一块这三种情况在真机上才会踩到，真机又不常在手边。
+fn aligned_blocks(addr: u32, len: usize) -> impl Iterator<Item = (u32, usize, usize)> {
+    let mut addr = addr;
+    let mut left = len;
+    std::iter::from_fn(move || {
+        if left == 0 {
+            return None;
+        }
+        let block = addr & !3;
+        let off = (addr - block) as usize;
+        let n = (4 - off).min(left);
+        addr += n as u32;
+        left -= n;
+        Some((block, off, n))
+    })
+}
+
 pub struct Rapoo {
     handle: HANDLE,
     /// Last response the device handed us; its repeat is what a stale read
     /// returns after a command the device swallowed.
     last: Cell<[u8; 32]>,
+    /// 上一次被接受的是哪条读命令（地址、长度）。同一地址的重复读取在内
+    /// 容不变时与过期回放逐字节相同，只有这个信息能把两种情况分开。
+    last_read: Cell<Option<(u32, usize)>>,
+    /// 上一次记进日志的异常电量字节，用来把重复的 WARN 压成一条。
+    bad_battery: Cell<Option<u8>>,
     limits: Limits,
 }
 
@@ -78,6 +178,8 @@ impl Rapoo {
             Ok(Rapoo {
                 handle: h,
                 last: Cell::new([0u8; 32]),
+                last_read: Cell::new(None),
+                bad_battery: Cell::new(None),
                 limits,
             })
         }
@@ -85,6 +187,8 @@ impl Rapoo {
 
     fn xfer(&self, frame: &[u8; 32]) -> Result<[u8; 32], String> {
         let read = frame[2] == 0xA4;
+        let addr = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+        let len = frame[3] as usize;
         // The dongle occasionally drops a command, so unanswered commands are
         // resent once.
         let budget = if read { 400 } else { 200 };
@@ -95,6 +199,9 @@ impl Rapoo {
                 }
             }
             let prev = self.last.get();
+            // 上一次成功应答也是同地址同长度的读：此时"内容没变"是正常
+            // 结果，不是过期回放。
+            let repeated_read = self.last_read.get() == Some((addr, len));
             let start = Instant::now();
             loop {
                 let elapsed = start.elapsed();
@@ -110,15 +217,13 @@ impl Rapoo {
                         1 => {
                             let settled = elapsed >= Duration::from_millis(40);
                             // A stale answer repeats the previous response byte
-                            // for byte. 判据的前提——连续两次读应答的 [1..]
-                            // 必然不同——写在 docs/protocol.md §3.2：若某次读
-                            // 返回与上次逐字节相同的数据（寄存器没变且应答里
-                            // 无变化字段），会被误判成过期应答，重发两次后
-                            // 报"设备无响应"。新增读命令前先确认应答带变化
-                            // 字段，否则要换判据（如应答序号）。
-                            let fresh = !read || resp[1..] != prev[1..];
+                            // for byte. 主判据仍是"与上次不同"；同一地址的
+                            // 重复读取允许内容不变，见 `is_fresh`。
+                            let fresh = is_fresh(read, &resp, &prev, repeated_read);
                             if settled && fresh {
                                 self.last.set(resp);
+                                // 写应答也会进 last，它不能作为读的基线。
+                                self.last_read.set(read.then_some((addr, len)));
                                 sleep(Duration::from_millis(15));
                                 return Ok(resp);
                             }
@@ -134,62 +239,35 @@ impl Rapoo {
     }
 
     fn read(&self, addr: u32, len: usize) -> Result<Vec<u8>, String> {
-        // 数据区是 r[4..32]，越界的长度只会变成一次 panic。
-        if len > 28 {
-            return Err(format!("读取长度超出 32 字节帧（{len}）"));
-        }
-        let mut f = [0u8; 32];
-        f[0] = RID;
-        f[1] = 0xA5;
-        f[2] = 0xA4;
-        f[3] = len as u8;
-        f[4..8].copy_from_slice(&addr.to_le_bytes());
+        let f = read_frame(addr, len)?;
         let r = self.xfer(&f)?;
         Ok(r[4..4 + len].to_vec())
     }
 
     fn write_raw(&self, addr: u32, data: &[u8]) -> Result<(), String> {
-        // 数据区是 f[8..32]。
-        if data.len() > 24 {
-            return Err(format!("写入长度超出 32 字节帧（{}）", data.len()));
-        }
-        let mut f = [0u8; 32];
-        f[0] = RID;
-        f[1] = 0xA5;
-        f[2] = 0xA5;
-        f[3] = data.len() as u8;
-        f[4..8].copy_from_slice(&addr.to_le_bytes());
-        f[8..8 + data.len()].copy_from_slice(data);
-        self.xfer(&f)?;
+        self.xfer(&write_frame(addr, data)?)?;
         Ok(())
     }
 
     fn commit(&self) -> Result<(), String> {
-        let mut f = [0u8; 32];
-        f[0] = RID;
-        f[1] = 0xA5;
-        f[2] = 0xA3;
-        self.xfer(&f)?;
+        self.xfer(&commit_frame())?;
         Ok(())
     }
 
     /// Read-modify-write an arbitrary byte range using aligned 4-byte blocks.
-    fn write_field(&self, mut addr: u32, mut data: &[u8]) -> Result<(), String> {
-        while !data.is_empty() {
-            let block = addr & !3;
-            let off = (addr - block) as usize;
-            let n = (4 - off).min(data.len());
+    fn write_field(&self, addr: u32, data: &[u8]) -> Result<(), String> {
+        let mut done = 0usize;
+        for (block, off, n) in aligned_blocks(addr, data.len()) {
             let mut arr = [0u8; 4];
             if off == 0 && n == 4 {
-                arr.copy_from_slice(&data[..4]);
+                arr.copy_from_slice(&data[done..done + 4]);
             } else {
                 let cur = self.read(block, 4)?;
                 arr.copy_from_slice(&cur[..4]);
-                arr[off..off + n].copy_from_slice(&data[..n]);
+                arr[off..off + n].copy_from_slice(&data[done..done + n]);
             }
             self.write_raw(block, &arr)?;
-            addr += n as u32;
-            data = &data[n..];
+            done += n;
         }
         Ok(())
     }
@@ -199,13 +277,43 @@ impl Rapoo {
         self.commit()
     }
 
-    fn battery_level(&self) -> Result<u8, String> {
-        let mut f = [0u8; 32];
-        f[0] = RID;
-        f[1] = 0xA5;
-        f[2] = 0xAA;
-        let r = self.xfer(&f)?;
-        Ok(r[2])
+    /// 电量查询。返回 `None` 表示这一轮拿到的不是有效百分比，调用方保留上
+    /// 一次的值即可。
+    ///
+    /// 与读命令不同，`0xAA` 的应答里没有能判定新旧的字段，`xfer` 在 40 ms
+    /// 就可能把缓冲区里**上一条**应答交出来（开机后第一条命令尤其如此：
+    /// §3.6 说空闲后第一条要 150–250 ms 才回，40 ms 时缓冲区里还是上一轮
+    /// 快照的读应答）。所以这里不能只靠 `xfer` 的接受条件，还要对内容做一
+    /// 次校验（`battery_reply`）：连接 flag 或百分比不对就不算数，等接收器
+    /// 把真正的应答放进来再问一次。
+    fn battery_level(&self) -> Result<Option<u8>, String> {
+        let f = battery_frame();
+        let mut r = self.xfer(&f)?;
+        if battery_reply(&r).is_none() {
+            sleep(Duration::from_millis(200));
+            r = self.xfer(&f)?;
+        }
+        match battery_reply(&r) {
+            Some(p) => {
+                self.bad_battery.set(None);
+                Ok(Some(p))
+            }
+            None => {
+                // 只在异常值变化时记一条：否则每 20 秒一条，把日志刷满。
+                if self.bad_battery.replace(Some(r[2])) != Some(r[2]) {
+                    crate::log::line(
+                        "WARN",
+                        &format!(
+                            "电量应答异常：[1]=0x{:02x} [2]=0x{:02x}，帧头 {:02x?}",
+                            r[1],
+                            r[2],
+                            &r[..8]
+                        ),
+                    );
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn set_flag(&self, bit: u8, disabled: bool) -> Result<(), String> {
@@ -232,7 +340,9 @@ impl Rapoo {
                 s.motion = b[1] != 0;
             }
             Change::Deb => {
-                let b = self.read(A_DEB_PRESS, 8)?;
+                // 与 snapshot 一样读 4 字节：同一地址的读取长度必须固定，
+                // 否则内容不变的合法应答会被判成过期（见 `is_fresh`）。
+                let b = self.read(A_DEB_PRESS, 4)?;
                 s.debounce_press = b[0];
                 s.debounce_release = b[1];
                 s.sleep_min = b[2];
@@ -244,9 +354,14 @@ impl Rapoo {
                 s.stage_active = b[0].min(s.stage_count.saturating_sub(1));
             }
             Change::Dpi(i) => {
-                let b = self.read(A_DPI_X + i as u32 * 2, 2)?;
+                // 读整块而不是 2 字节：`write_field` 的读-改-写也读这个块，
+                // 同址同长（4）重复读取才能被 `is_fresh` 当成合法应答。
+                let addr = A_DPI_X + i as u32 * 2;
+                let block = addr & !3;
+                let off = (addr - block) as usize;
+                let b = self.read(block, 4)?;
                 if let Some(d) = s.dpi.get_mut(i as usize) {
-                    *d = u16::from_le_bytes([b[0], b[1]]);
+                    *d = u16::from_le_bytes([b[off], b[off + 1]]);
                 }
             }
         }
@@ -280,7 +395,7 @@ impl Driver for Rapoo {
     fn snapshot(&mut self) -> Result<Snapshot, String> {
         let p = self.read(A_POLL, 4)?;
         let lm = self.read(A_LOD, 4)?;
-        let d = self.read(A_DEB_PRESS, 8)?;
+        let d = self.read(A_DEB_PRESS, 4)?;
         let x = self.read(A_DPI_X, 24)?;
         let y = self.read(A_DPI_Y, 24)?;
 
@@ -319,7 +434,7 @@ impl Driver for Rapoo {
     }
 
     fn battery(&mut self) -> Result<Option<u8>, String> {
-        self.battery_level().map(Some)
+        self.battery_level()
     }
 
     fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<(), String> {
@@ -395,6 +510,14 @@ impl Driver for Rapoo {
         };
         self.patch(change, snap)
     }
+
+    fn link_alive(&self) -> bool {
+        unsafe {
+            let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
+            attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
+            HidD_GetAttributes(self.handle, &mut attr) != 0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +533,103 @@ mod tests {
         assert_eq!(stages_from_raw(7), 7);
         // 坏帧：debug 下也不能 panic。
         assert_eq!(stages_from_raw(0xFF), 7);
+    }
+
+    /// 开机后第一帧 0xAA 应答的 `[2]` 是 0x7F，界面曾经显示成 127%。
+    #[test]
+    fn battery_byte_out_of_range_is_not_a_percentage() {
+        assert_eq!(battery_percent(0), Some(0));
+        assert_eq!(battery_percent(93), Some(93));
+        assert_eq!(battery_percent(100), Some(100));
+        assert_eq!(battery_percent(101), None);
+        assert_eq!(battery_percent(0x7F), None);
+        assert_eq!(battery_percent(0xFF), None);
+    }
+
+    /// 旧应答回放不只会给出 `> 100` 的值：提交应答 `01 7d 00…` 或读应答的
+    /// `[2]` 可能是 0，`[1]` 没有连接 flag，这种帧不能当成电量。
+    #[test]
+    fn battery_reply_needs_a_known_link_flag() {
+        let mut r = [0u8; 32];
+        r[0] = 1;
+        r[1] = 2;
+        r[2] = 71;
+        assert_eq!(battery_reply(&r), Some(71));
+        r[1] = 1;
+        r[2] = 0;
+        assert_eq!(battery_reply(&r), Some(0));
+        // 提交应答 01 7d 00… 被回放。
+        r[1] = 0x7d;
+        r[2] = 0;
+        assert_eq!(battery_reply(&r), None);
+        // flag 对但百分比超范围。
+        r[1] = 2;
+        r[2] = 0x7F;
+        assert_eq!(battery_reply(&r), None);
+    }
+
+    /// 帧头是协议契约：`BA A5 op`，地址小端写在 `[4..8]`，长度写在 `[3]`。
+    /// 这些字节以前散在 `read`/`write_raw`/`commit` 里，只有真机能验。
+    #[test]
+    fn frames_encode_the_wire_format() {
+        let f = read_frame(0x0880, 4).expect("4 bytes fit");
+        assert_eq!(&f[..4], &[RID, 0xA5, 0xA4, 4]);
+        assert_eq!(&f[4..8], &0x0880u32.to_le_bytes());
+        assert!(read_frame(0x0880, 29).is_err());
+
+        let f = write_frame(0x08C3, &[1, 2, 3]).expect("3 bytes fit");
+        assert_eq!(&f[..4], &[RID, 0xA5, 0xA5, 3]);
+        assert_eq!(&f[4..8], &0x08C3u32.to_le_bytes());
+        assert_eq!(&f[8..11], &[1, 2, 3]);
+        assert!(f[11..].iter().all(|&b| b == 0));
+        assert!(write_frame(0, &[0u8; 25]).is_err());
+
+        assert_eq!(&commit_frame()[..3], &[RID, 0xA5, 0xA3]);
+        assert_eq!(&battery_frame()[..3], &[RID, 0xA5, 0xAA]);
+    }
+
+    /// 连续两次读同一寄存器且值没变时，应答与上一条逐字节相同；这必须
+    /// 当成合法应答，否则第二次修改（或写后回读）会被判成"设备无响应"。
+    #[test]
+    fn identical_reply_is_only_stale_for_a_different_read() {
+        let prev = [0x11u8; 32];
+        let same = prev;
+        assert!(is_fresh(false, &same, &prev, false));
+        assert!(!is_fresh(true, &same, &prev, false));
+        assert!(is_fresh(true, &same, &prev, true));
+
+        let mut changed = prev;
+        changed[4] = 0x22;
+        assert!(is_fresh(true, &changed, &prev, false));
+    }
+
+    /// 4 字节对齐切分：起点不在块首时先补齐，末尾不足一块按实际长度切。
+    /// `write_field` 的每一次读-改-写都由它决定，偏移算错会写到相邻字段。
+    #[test]
+    fn aligned_blocks_covers_any_range_without_gaps() {
+        assert_eq!(aligned_blocks(0x0888, 0).collect::<Vec<_>>(), vec![]);
+        assert_eq!(
+            aligned_blocks(0x0888, 2).collect::<Vec<_>>(),
+            vec![(0x0888, 0, 2)]
+        );
+        assert_eq!(
+            aligned_blocks(0x0881, 7).collect::<Vec<_>>(),
+            vec![(0x0880, 1, 3), (0x0884, 0, 4)]
+        );
+        assert_eq!(
+            aligned_blocks(0x0896, 1).collect::<Vec<_>>(),
+            vec![(0x0894, 2, 1)]
+        );
+
+        // 任意起点/长度：每个块都从块首 + off 开始，拼起来正好覆盖整段。
+        let (addr, len) = (0x087F, 11);
+        let mut at = addr;
+        for (block, off, n) in aligned_blocks(addr, len) {
+            assert_eq!(block + off as u32, at);
+            assert_eq!(block % 4, 0);
+            assert!(off + n <= 4);
+            at += n as u32;
+        }
+        assert_eq!(at, addr + len as u32);
     }
 }

@@ -18,7 +18,9 @@
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Devices::HumanInterfaceDevice::HidD_SetOutputReport;
+use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+    HidD_GetAttributes, HidD_SetOutputReport, HIDD_ATTRIBUTES,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -36,11 +38,11 @@ extern "system" {
     fn GetOverlappedResult(h: HANDLE, ov: *mut Overlapped, transferred: *mut u32, wait: i32)
         -> i32;
     fn CancelIo(h: HANDLE) -> i32;
-    fn ResetEvent(h: HANDLE) -> i32;
     fn GetLastError() -> u32;
 }
 
 const ERROR_IO_PENDING: u32 = 997;
+const ERROR_IO_INCOMPLETE: u32 = 996;
 const ERROR_OPERATION_ABORTED: u32 = 995;
 const REPORT_LEN: usize = 20;
 const SW_ID: u8 = 0x0A;
@@ -70,6 +72,9 @@ const GENERIC_DPI_MAX: u16 = 26000;
 /// the tail has to be read at 239 and shifted.
 const SECTOR_LEN: usize = 255;
 const CRC_AT: usize = SECTOR_LEN - 2;
+/// 尾部那次读取的起点。设备拒绝从 240 起读，所以从 239 开始、丢掉重复的
+/// 第一个字节（见 `sector_read_offsets`）。
+const TAIL_READ_AT: usize = 239;
 /// Profile sector offsets (little endian), verified against the live sector.
 const P_REPORT_RATE: usize = 0;
 const P_DEFAULT_INDEX: usize = 1;
@@ -85,16 +90,26 @@ struct Overlapped {
     h_event: HANDLE,
 }
 
-/// 一次 overlapped 读取需要的两个缓冲区。放在堆上，超时取消后即使内核
+/// 一次 overlapped 读取需要的缓冲区和事件。放在堆上，超时取消后即使内核
 /// 稍后才完成，也不会写到已经退栈的内存；最坏情况下故意泄漏这一块。
+///
+/// 事件必须每次读取独占：共用一个事件时，上一次被放弃的读取稍后完成会把
+/// 事件置位，新读取的等待被提前唤醒，`GetOverlappedResult` 却报
+/// `ERROR_IO_INCOMPLETE`，此时释放缓冲就是释放后使用。
 struct PendingRead {
     ov: Overlapped,
     buf: [u8; REPORT_LEN],
+    event: HANDLE,
+}
+
+impl Drop for PendingRead {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.event) };
+    }
 }
 
 pub struct Hidpp {
     handle: HANDLE,
-    event: HANDLE,
     dev_idx: u8,
     name: String,
     /// Feature indexes, resolved once. `None` = the device does not have it.
@@ -117,10 +132,25 @@ pub struct Hidpp {
     /// 周期读取时做一次（见 `flush_default_stage`）。
     pending_default: Option<u8>,
     polling_ms: u8,
+    /// 取消超时后仍未完成的读取。
+    ///
+    /// `ReadFile` 的缓冲区必须活到内核真正写完为止；以前这里用
+    /// `mem::forget`，超时一次就永久漏一帧。挂在驱动上以后，泄漏的上限变成
+    /// "本驱动实例"——驱动重建（设备重插、线程自愈）时一起释放。Drop 里会
+    /// 再等一次取消完成，等不到才真的放弃。
+    ///
+    /// Box 不能换成 `Vec<PendingRead>`：内核持有 `ov` / `buf` 的地址，
+    /// Vec 扩容搬移元素会让这些指针失效。
+    #[allow(clippy::vec_box)]
+    abandoned: Vec<Box<PendingRead>>,
 }
 
 impl Hidpp {
-    pub fn open(path: &[u16], layout: HidppLayout, limits: Limits) -> Result<Hidpp, String> {
+    pub fn open(
+        path: &[u16],
+        layout: Option<HidppLayout>,
+        limits: Limits,
+    ) -> Result<Hidpp, String> {
         let mut p = path.to_vec();
         if p.last() != Some(&0) {
             p.push(0);
@@ -141,10 +171,8 @@ impl Hidpp {
                     std::io::Error::last_os_error()
                 ));
             }
-            let event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
             let mut dev = Hidpp {
                 handle,
-                event,
                 dev_idx: 0,
                 name: String::new(),
                 f_name: None,
@@ -158,6 +186,7 @@ impl Hidpp {
                 default_index: 0,
                 pending_default: None,
                 polling_ms: 1,
+                abandoned: Vec::new(),
             };
             dev.dev_idx = dev
                 .find_device()
@@ -170,13 +199,13 @@ impl Hidpp {
                 dev.name = dev.read_name(fi);
             }
             // 只有 profile 声明已验证、型号和扇区大小都对得上才允许写板载
-            // 配置。Generic 布局仍可改当前 DPI，但不碰扇区。
+            // 配置。`None`（未验证布局）仍可改当前 DPI，但不碰扇区。
             dev.profile_ok = match layout {
-                HidppLayout::G304 => {
+                Some(HidppLayout::G304) => {
                     profile_layout_supported(&dev.name)
                         && dev.onboard_sector_size() == Some(SECTOR_LEN as u16)
                 }
-                HidppLayout::Generic => false,
+                None => false,
             };
             dev.profile_sector = dev.find_profile_sector();
             if dev.profile_ok {
@@ -207,20 +236,25 @@ impl Hidpp {
     ///
     /// 超时这一路不能"取消完就返回"：`CancelIo` 只是请求取消，内核仍可能
     /// 稍后才完成这次读。读取缓冲在堆上（`PendingRead`），取消后用有界
-    /// 等待确认结束；等不到就故意泄漏那块内存，驱动随后会被判离线并重建，
-    /// 这样既不会 use-after-free，也不会让采集线程永久卡住。
-    fn read_frame(&self, ms: u32) -> Result<Option<Vec<u8>>, String> {
+    /// 等待确认结束；等不到就把这块缓冲挂到 `self.abandoned`，由 `Drop`
+    /// 再确认一次——既不会 use-after-free，也不会让采集线程永久卡住。
+    /// 每次读取用自己的事件，旧请求迟到的完成不会唤醒新请求的等待。
+    fn read_frame(&mut self, ms: u32) -> Result<Option<Vec<u8>>, String> {
         unsafe {
-            ResetEvent(self.event);
+            let event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
+            if event.is_null() {
+                return Err("创建读取事件失败".into());
+            }
             let mut pending = Box::new(PendingRead {
                 ov: Overlapped {
                     internal: 0,
                     internal_high: 0,
                     offset: 0,
                     offset_high: 0,
-                    h_event: self.event,
+                    h_event: event,
                 },
                 buf: [0u8; REPORT_LEN],
+                event,
             });
             let mut read = 0u32;
             let ok = ReadFile(
@@ -238,7 +272,7 @@ impl Hidpp {
             if GetLastError() != ERROR_IO_PENDING {
                 return Err("读取应答失败".into());
             }
-            if WaitForSingleObject(self.event, ms) == 0 {
+            if WaitForSingleObject(event, ms) == 0 {
                 if GetOverlappedResult(self.handle, &mut pending.ov, &mut read, 0) == 0 {
                     return Err("读取应答失败".into());
                 }
@@ -246,8 +280,8 @@ impl Hidpp {
             }
             // 超时：请求取消，但只等有限时间。等不到就放弃这块缓冲。
             CancelIo(self.handle);
-            if WaitForSingleObject(self.event, CANCEL_WAIT_MS) != 0 {
-                std::mem::forget(pending);
+            if WaitForSingleObject(event, CANCEL_WAIT_MS) != 0 {
+                self.abandoned.push(pending);
                 return Err("取消读取请求超时".into());
             }
             if GetOverlappedResult(self.handle, &mut pending.ov, &mut read, 0) != 0 {
@@ -292,10 +326,15 @@ impl Hidpp {
             // Errors carry feature index 0xFF; everything else echoes the
             // feature and function we asked for. 同一 feature 下不同功能的
             // 迟到应答（例如上一次读扇区）不能被当成当前请求的结果。
+            //
+            // SW_ID 是请求方自己的编号：接收器上可能同时有别家软件在说话，
+            // 用它再把别人的应答挡掉一层（错误帧不比对：它只用来报错，
+            // 宁可多接一条也不要漏掉真正的失败）。
             if buf.len() >= 4 && buf[1] == frame[1] {
                 let is_error = buf[2] == 0xFF;
                 let same_func = (buf[3] & 0xF0) == (frame[3] & 0xF0);
-                if is_error || (buf[2] == want_feature && same_func) {
+                let same_sw = (buf[3] & 0x0F) == (frame[3] & 0x0F);
+                if is_error || (buf[2] == want_feature && same_func && same_sw) {
                     return Ok(Some(buf));
                 }
             }
@@ -310,15 +349,7 @@ impl Hidpp {
         params: &[u8],
         ms: u32,
     ) -> Result<Option<Vec<u8>>, String> {
-        let mut f = [0u8; REPORT_LEN];
-        f[0] = 0x11;
-        f[1] = self.dev_idx;
-        f[2] = feature;
-        f[3] = (func << 4) | SW_ID;
-        // 超长参数截断而不是越界 panic：长帧只有 16 字节载荷。
-        for (i, b) in params.iter().take(REPORT_LEN - 4).enumerate() {
-            f[4 + i] = *b;
-        }
+        let f = build_frame(self.dev_idx, feature, func, params);
         let r = self.xfer(&f, feature, ms)?;
         match r {
             Some(r) if r.get(2) == Some(&0xFF) => Err(format!(
@@ -426,26 +457,32 @@ impl Hidpp {
         None
     }
 
-    /// One 255-byte sector. 16-byte reads up to 239, then a read at 239 whose
+    /// One 255-byte sector: 16-byte reads up to 239, then a read at 239 whose
     /// first byte repeats 239 — the device refuses to start a read at 240.
     fn read_sector(&mut self, fi: u8, sector: u16) -> Result<Vec<u8>, String> {
         let mut out = Vec::with_capacity(SECTOR_LEN);
-        let mut off = 0usize;
-        while off < 240 {
+        for off in sector_read_offsets() {
+            let timeout = if off == TAIL_READ_AT {
+                "读取配置扇区尾部超时"
+            } else {
+                "读取配置扇区超时"
+            };
             let r = self
                 .call(
                     fi,
                     5,
                     &[hi(sector), lo(sector), hi(off as u16), lo(off as u16)],
                 )?
-                .ok_or_else(|| "读取配置扇区超时".to_string())?;
-            out.extend_from_slice(r.get(4..REPORT_LEN).ok_or("配置扇区应答过短")?);
-            off += 16;
+                .ok_or_else(|| timeout.to_string())?;
+            // 尾读从 239 开始，它的第一个字节已经在上一块里了。
+            let from = if off == TAIL_READ_AT { 5 } else { 4 };
+            let short = if off == TAIL_READ_AT {
+                "配置扇区尾部应答过短"
+            } else {
+                "配置扇区应答过短"
+            };
+            out.extend_from_slice(r.get(from..REPORT_LEN).ok_or(short)?);
         }
-        let r = self
-            .call(fi, 5, &[hi(sector), lo(sector), 0, 239])?
-            .ok_or_else(|| "读取配置扇区尾部超时".to_string())?;
-        out.extend_from_slice(r.get(5..REPORT_LEN).ok_or("配置扇区尾部应答过短")?);
         Ok(out)
     }
 
@@ -459,16 +496,12 @@ impl Hidpp {
         let start = [hi(sector), lo(sector), 0, 0, hi(n as u16), lo(n as u16)];
         self.call(fi, 6, &start)?
             .ok_or_else(|| "开始写扇区失败".to_string())?;
-        let mut o = 0usize;
-        // 末块可以短于 16 字节（255 = 15×16 + 15，实测被设备接受），所以按
-        // `min(o + 16, n)` 截尾。循环条件必须是 `o < n` 而不是 `o < n - 1`：
-        // 后者在 n % 16 == 1 时会把最后一个字节整个漏掉（此前调用方固定传
-        // 255 才没踩到，约束本身没有任何东西保护）。
-        while o < n {
-            let end = (o + 16).min(n);
-            self.call(fi, 7, &data[o..end])?
+        // 末块可以短于 16 字节（255 = 15×16 + 15，实测被设备接受）。切块
+        // 规则在 `block_ranges` 里单独钉死：以前的循环条件写成 `o < n - 1`，
+        // 在 n % 16 == 1 时会把最后一个字节整个漏掉。
+        for chunk in block_ranges(n) {
+            self.call(fi, 7, &data[chunk])?
                 .ok_or_else(|| "写入配置块失败".to_string())?;
-            o += 16;
         }
         self.call(fi, 8, &[])?
             .ok_or_else(|| "提交配置扇区失败".to_string())?;
@@ -481,18 +514,10 @@ impl Hidpp {
             _ => return Err("设备没有板载配置".into()),
         };
         let data = self.read_sector(fi, sector)?;
-        let mut stages = Vec::with_capacity(STAGES);
-        for i in 0..STAGES {
-            let v = u16::from_le_bytes([data[P_DPI + i * 2], data[P_DPI + i * 2 + 1]]);
-            stages.push(v);
-        }
-        // A trailing 0 means "that stage is not configured".
-        while stages.len() > 1 && stages.last() == Some(&0) {
-            stages.pop();
-        }
-        self.default_index = data[P_DEFAULT_INDEX];
-        self.polling_ms = data[P_REPORT_RATE].max(1);
-        self.stages = stages;
+        let profile = parse_profile(&data);
+        self.default_index = profile.default_index;
+        self.polling_ms = profile.polling_ms;
+        self.stages = profile.stages;
         Ok(())
     }
 
@@ -513,14 +538,24 @@ impl Hidpp {
         if !sector_crc_valid(&data) {
             return Err("配置扇区 CRC 校验失败，已拒绝写入".into());
         }
-        if !edit(&mut data) {
+        let mut changed = edit(&mut data);
+        // 提交整扇区会让固件按扇区里的默认档位重新加载传感器；用户刚切到、
+        // 还没落盘的档位必须一起写进去，否则这次提交（例如改回报率）会把
+        // 实时 DPI 顶回旧档位，界面却还显示新档位。
+        let carried = carry_pending_stage(&mut data, self.pending_default);
+        if carried.is_some() {
+            changed = true;
+        }
+        if !changed {
             return Ok(());
         }
-        let crc = crc16(&data[..CRC_AT]);
-        data[CRC_AT..SECTOR_LEN].copy_from_slice(&crc.to_be_bytes());
-        self.write_sector(fi, sector, &data)
-        // Callers patch the cached fields themselves; re-reading the sector
-        // here would add ~200 ms to every click.
+        stamp_crc(&mut data);
+        self.write_sector(fi, sector, &data)?;
+        if let Some(idx) = carried {
+            self.default_index = idx;
+            self.pending_default = None;
+        }
+        Ok(())
     }
 
     /// 把用户最后选中的档位写回设备扇区。
@@ -585,6 +620,81 @@ fn profile_layout_supported(name: &str) -> bool {
     name.to_ascii_lowercase().contains("g304")
 }
 
+/// 一帧长报文：`11 devIdx feature (func<<4|swid) params…`。
+///
+/// 参数超过 16 字节时截断，而不是越界 panic：长帧只有这么多载荷。
+fn build_frame(dev_idx: u8, feature: u8, func: u8, params: &[u8]) -> [u8; REPORT_LEN] {
+    let mut f = [0u8; REPORT_LEN];
+    f[0] = 0x11;
+    f[1] = dev_idx;
+    f[2] = feature;
+    f[3] = (func << 4) | SW_ID;
+    for (i, b) in params.iter().take(REPORT_LEN - 4).enumerate() {
+        f[4 + i] = *b;
+    }
+    f
+}
+
+/// 扇区读取的起始偏移：0..240 每 16 字节一次，再补一次 239。设备拒绝从
+/// 240 起读，尾部 15 字节靠与上一块重叠一个字节取回。
+fn sector_read_offsets() -> impl Iterator<Item = usize> {
+    (0..240).step_by(16).chain(std::iter::once(TAIL_READ_AT))
+}
+
+/// 写扇区时的 16 字节分块（末块可短）。
+///
+/// 单独抽出来是因为边界条件曾经写错过：`o < n - 1` 在 `n % 16 == 1` 时会
+/// 漏掉最后一个字节。现在有测试直接钉住 1 / 16 / 17 / 255 这几种长度。
+fn block_ranges(n: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..n).step_by(16).map(move |o| o..(o + 16).min(n))
+}
+
+/// 重算并写入扇区尾部的 CRC16（大端）。
+fn stamp_crc(data: &mut [u8]) {
+    let crc = crc16(&data[..CRC_AT]);
+    data[CRC_AT..SECTOR_LEN].copy_from_slice(&crc.to_be_bytes());
+}
+
+/// 整扇区提交会让固件按扇区里的默认档位重载传感器。把待落盘的档位并进
+/// 这次要提交的数据，避免无关修改（如回报率）把它顶回旧档位。
+/// 返回实际并入扇区的档位；扇区里已经是该档位时返回 `None`。
+fn carry_pending_stage(data: &mut [u8], pending: Option<u8>) -> Option<u8> {
+    let idx = pending?;
+    if data[P_DEFAULT_INDEX] == idx {
+        return None;
+    }
+    data[P_DEFAULT_INDEX] = idx;
+    Some(idx)
+}
+
+/// 从 255 字节的 profile 扇区里解出可编辑字段。
+struct Profile {
+    stages: Vec<u16>,
+    default_index: u8,
+    polling_ms: u8,
+}
+
+fn parse_profile(data: &[u8]) -> Profile {
+    debug_assert_eq!(data.len(), SECTOR_LEN);
+    let mut stages = Vec::with_capacity(STAGES);
+    for i in 0..STAGES {
+        stages.push(u16::from_le_bytes([
+            data[P_DPI + i * 2],
+            data[P_DPI + i * 2 + 1],
+        ]));
+    }
+    // A trailing 0 means "that stage is not configured".
+    while stages.len() > 1 && stages.last() == Some(&0) {
+        stages.pop();
+    }
+    Profile {
+        stages,
+        default_index: data[P_DEFAULT_INDEX],
+        // 0 会让 snapshot 里 `1000 / polling_ms` 除零。
+        polling_ms: data[P_REPORT_RATE].max(1),
+    }
+}
+
 fn hi(v: u16) -> u8 {
     (v >> 8) as u8
 }
@@ -622,7 +732,36 @@ unsafe impl Send for Hidpp {}
 impl Drop for Hidpp {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.event);
+            if !self.abandoned.is_empty() {
+                // 这些读取已经取消过但没等到完成；关句柄前再确认一次，
+                // 免得内核在缓冲释放之后才写回。CancelIo 只取消本线程的
+                // 挂起 I/O，而驱动一直活在自己的采集线程上。
+                CancelIo(self.handle);
+                // 每次读取有独立事件，但仍要逐个 OVERLAPPED 查是否真的
+                // 结束：事件没等到只说明期限内没完成，不能据此释放缓冲。
+                // 总等待时长有上限，退出的响应时间不能被它拖住。
+                let deadline = Instant::now() + Duration::from_millis(CANCEL_WAIT_MS as u64);
+                let mut stalled = Vec::new();
+                for mut p in self.abandoned.drain(..) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if !left.is_zero() {
+                        WaitForSingleObject(p.event, left.as_millis().max(1) as u32);
+                    }
+                    let mut n = 0u32;
+                    if GetOverlappedResult(self.handle, &mut p.ov, &mut n, 0) == 0
+                        && GetLastError() == ERROR_IO_INCOMPLETE
+                    {
+                        stalled.push(p);
+                    }
+                    // 已完成（含被取消）的缓冲随 p 一起释放，事件由
+                    // `PendingRead::drop` 关闭。
+                }
+                if !stalled.is_empty() {
+                    // 极端情况：宁可漏掉这块堆内存和它的事件，也不能让
+                    // 内核写到已释放的地址上。
+                    std::mem::forget(stalled);
+                }
+            }
             CloseHandle(self.handle);
         }
     }
@@ -780,6 +919,14 @@ impl Driver for Hidpp {
             _ => Err("该设备不支持这个设置".into()),
         }
     }
+
+    fn link_alive(&self) -> bool {
+        unsafe {
+            let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
+            attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
+            HidD_GetAttributes(self.handle, &mut attr) != 0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -842,5 +989,90 @@ mod tests {
         assert!(profile_layout_supported("g304 lightspeed"));
         assert!(!profile_layout_supported("G502 HERO"));
         assert!(!profile_layout_supported(""));
+    }
+
+    /// 报文头：`11 devIdx feature (func<<4 | swid)`，参数写在 `[4..20]`，
+    /// 超长截断而不是越界。
+    #[test]
+    fn build_frame_encodes_header_and_truncates_params() {
+        let f = build_frame(2, 0x21, 3, &[0xAA, 0xBB]);
+        assert_eq!(&f[..4], &[0x11, 2, 0x21, (3 << 4) | SW_ID]);
+        assert_eq!(&f[4..6], &[0xAA, 0xBB]);
+        assert!(f[6..].iter().all(|&b| b == 0));
+
+        let f = build_frame(1, 0x81, 7, &[0x7F; 20]);
+        assert_eq!(f.len(), REPORT_LEN);
+        assert!(f[4..].iter().all(|&b| b == 0x7F));
+    }
+
+    /// 255 = 15×16 + 15，末块短一点；1 字节的扇区也必须写出去——历史 bug
+    /// 的循环条件会在 n % 16 == 1 时漏掉最后一个字节。
+    #[test]
+    fn block_ranges_never_drop_the_tail() {
+        let lens = |n: usize| block_ranges(n).map(|r| r.len()).collect::<Vec<_>>();
+        assert_eq!(lens(0), Vec::<usize>::new());
+        assert_eq!(lens(1), vec![1]);
+        assert_eq!(lens(16), vec![16]);
+        assert_eq!(lens(17), vec![16, 1]);
+        let mut full = vec![16; 15];
+        full.push(15);
+        assert_eq!(lens(255), full);
+        assert_eq!(block_ranges(255).map(|r| r.end).max(), Some(SECTOR_LEN));
+    }
+
+    /// 扇区读取必须完整覆盖 255 字节：0..240 每 16 字节一次，再在 239 补
+    /// 一次尾读（设备拒绝从 240 起读）。
+    #[test]
+    fn sector_reads_cover_the_whole_sector() {
+        let head: Vec<usize> = (0..240).step_by(16).collect();
+        let offsets: Vec<usize> = sector_read_offsets().collect();
+        assert_eq!(offsets.len(), head.len() + 1);
+        assert_eq!(&offsets[..head.len()], head.as_slice());
+        assert_eq!(offsets[head.len()], TAIL_READ_AT);
+        // 前 15 次各 16 字节，尾读从 239 起 15 字节（239 与上一块重复）。
+        assert_eq!(head.len() * 16 + (REPORT_LEN - 5), SECTOR_LEN);
+    }
+
+    /// profile 扇区的字段偏移：回报率、默认档位、五个小端 DPI 槽。
+    #[test]
+    fn parses_profile_fields_from_the_sector() {
+        let mut sector = vec![0u8; SECTOR_LEN];
+        sector[P_REPORT_RATE] = 4;
+        sector[P_DEFAULT_INDEX] = 2;
+        for (i, v) in [400u16, 800, 1600, 0, 0].into_iter().enumerate() {
+            let at = P_DPI + i * 2;
+            sector[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        let p = parse_profile(&sector);
+        assert_eq!(p.stages, vec![400, 800, 1600]);
+        assert_eq!(p.default_index, 2);
+        assert_eq!(p.polling_ms, 4);
+
+        // 回报率为 0 时退化到 1 ms，UI 才不会除零。
+        sector[P_REPORT_RATE] = 0;
+        assert_eq!(parse_profile(&sector).polling_ms, 1);
+    }
+
+    /// 写完 CRC 之后，改过的扇区必须重新通过校验。
+    #[test]
+    fn stamping_the_crc_makes_a_modified_sector_valid() {
+        let mut sector = shipped_sector();
+        sector[P_DPI] ^= 0x11;
+        assert!(!sector_crc_valid(&sector));
+        stamp_crc(&mut sector);
+        assert!(sector_crc_valid(&sector));
+    }
+
+    /// 改回报率会整扇区提交并让固件重载当前档位；待落盘的档位必须一起
+    /// 写进去，否则刚切到的 DPI 会被顶回旧档位。
+    #[test]
+    fn pending_stage_travels_with_any_sector_write() {
+        let mut sector = shipped_sector();
+        assert_eq!(sector[P_DEFAULT_INDEX], 1);
+        assert_eq!(carry_pending_stage(&mut sector, Some(2)), Some(2));
+        assert_eq!(sector[P_DEFAULT_INDEX], 2);
+        // 扇区里已经是这一档：不算改动，也不重复记账。
+        assert_eq!(carry_pending_stage(&mut sector, Some(2)), None);
+        assert_eq!(carry_pending_stage(&mut sector, None), None);
     }
 }

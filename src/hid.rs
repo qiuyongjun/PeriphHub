@@ -100,8 +100,14 @@ pub fn classify_connection(instance: &str, vid: u16, pid: u16) -> ConnectionType
     let lower = instance.to_ascii_lowercase();
     if lower.starts_with("bth") {
         ConnectionType::Bluetooth
-    } else if driver::profile(vid, pid).is_some() {
-        ConnectionType::Wireless24G
+    } else if let Some(p) = driver::profile(vid, pid) {
+        // 接收器也是长在 USB 上的，实例路径分不出来，型号表说了算：
+        // 同一个鼠标插线（0x4414）和走接收器（0x1214）是两个不同的 PID。
+        if p.wired {
+            ConnectionType::Wired
+        } else {
+            ConnectionType::Wireless24G
+        }
     } else if lower.starts_with("usb") {
         ConnectionType::Wired
     } else {
@@ -121,6 +127,24 @@ fn group_key(instance: &str) -> String {
         Some(i) => lower[..i].to_string(),
         None => lower,
     }
+}
+
+/// 从设备实例 ID 里解析 `VID_xxxx&PID_yyyy`，只用于"值不值得打开句柄"的
+/// 预判。
+///
+/// 枚举时对系统里每一个 HID 接口 `CreateFile` + 读产品串是主要开销，而支持
+/// 表里只有几个 VID/PID，绝大多数接口（键盘的系统集合、触摸板、游戏手柄）
+/// 根本不需要打开。两个都解析不出来时返回 `None`，调用方保守地照旧打开：
+/// 蓝牙的实例 ID 只有 `VID&0001xxxx`（没有 PID），不能凭它下结论。
+fn instance_vid_pid(instance: &str) -> Option<(u16, u16)> {
+    let lower = instance.to_ascii_lowercase();
+    let field = |tag: &str| -> Option<u16> {
+        let start = lower.find(tag)? + tag.len();
+        u16::from_str_radix(lower.get(start..start + 4)?, 16).ok()
+    };
+    let vid = field("vid_")?;
+    let pid = field("pid_")?;
+    Some((vid, pid))
 }
 
 /// 把 `SPDRP_BASE_CONTAINERID` 返回的 REG_SZ 宽字符 GUID 转成稳定的分组键。
@@ -322,11 +346,18 @@ fn collect_interfaces() -> Vec<Interface> {
             let path_off = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
             let path_max = (needed as usize).saturating_sub(path_off) / 2;
             let path = wide_path(base.add(path_off) as *const u16, path_max);
+            let instance = instance_id(set, &info);
+            // 支持表之外的接口不打开句柄：枚举的开销几乎全在这里。解析不出
+            // VID/PID 的实例路径（蓝牙等）保持旧行为，交给下面的 open 判断。
+            if instance_vid_pid(&instance)
+                .is_some_and(|(vid, pid)| driver::profile(vid, pid).is_none())
+            {
+                continue;
+            }
             let Some((vid, pid, product, manufacturer, usage_page, usage)) = read_interface(&path)
             else {
                 continue;
             };
-            let instance = instance_id(set, &info);
             // 分组优先级：ContainerId（Windows 帮我们算好的物理设备归属）
             // → 父设备实例（复合设备的几个接口父节点相同）→ 实例路径截断。
             let group = container_id(set, &info)
@@ -460,6 +491,28 @@ mod tests {
         );
     }
 
+    /// 同一个鼠标插线后是另一个 PID，连接方式必须跟着型号表走，不能因为
+    /// "在型号表里"就一律当成 2.4G——那样有线时电量会按无线那套显示。
+    #[test]
+    fn classifies_wired_variants_of_known_models() {
+        assert_eq!(
+            classify_connection(
+                "USB\\VID_24AE&PID_4414&MI_00\\6&26AC346C&0&0000",
+                0x24AE,
+                0x4414
+            ),
+            ConnectionType::Wired
+        );
+        assert_eq!(
+            classify_connection(
+                "USB\\VID_258A&PID_010C&MI_00\\6&32356D05&0&0000",
+                0x258A,
+                0x010C
+            ),
+            ConnectionType::Wired
+        );
+    }
+
     #[test]
     fn identifies_keyboard_receiver() {
         let (brand, model) = identity(0x3554, 0xFA09, "2.4G Wireless Receiver", "Compx");
@@ -533,6 +586,30 @@ mod tests {
             group_key("USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1&Col02"),
             "usb\\vid_24ae&pid_1214\\5&2a1b3c4d&0&1"
         );
+    }
+
+    /// 预筛必须只在 VID/PID 都明确时下结论：蓝牙的实例路径只有厂商号，
+    /// 解析不出来就要照旧打开，否则蓝牙连接的鼠标会整个消失。
+    #[test]
+    fn parses_vid_pid_only_when_both_are_present() {
+        assert_eq!(
+            instance_vid_pid("USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1"),
+            Some((0x24AE, 0x1214))
+        );
+        assert_eq!(
+            instance_vid_pid("USB\\VID_046D&PID_C53F&MI_02\\7&1A2B3C&0&0000"),
+            Some((0x046D, 0xC53F))
+        );
+        assert_eq!(
+            instance_vid_pid("HID\\VID_258A&PID_010C&MI_00\\7&3A75499D&0&0000"),
+            Some((0x258A, 0x010C))
+        );
+        assert_eq!(
+            instance_vid_pid("BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c"),
+            None
+        );
+        assert_eq!(instance_vid_pid("USB\\VID_24AE"), None);
+        assert_eq!(instance_vid_pid(""), None);
     }
 
     /// 复合设备的几个接口（MI_00 键盘、MI_01 厂商通道）实例路径不同，但都

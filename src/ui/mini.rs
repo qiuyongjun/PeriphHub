@@ -12,13 +12,16 @@ use eframe::egui::{
 };
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
-use crate::theme::{alpha, battery_color, battery_label, battery_level, Palette};
+use crate::theme::{
+    alpha, battery_color, battery_label, battery_level, heading_font, paint_brand, Palette,
+};
 use crate::ui::widgets::{
-    connection_color, mix, paint_device_glyph, shadow_card, short_model, CARD_RADIUS,
+    connection_color, material_shape, mix, paint_device_glyph, shadow_card, short_model,
+    CARD_RADIUS,
 };
 
 /// Widget card width. The native window is this plus `SHADOW_PAD` on each side.
-pub const WIDTH: f32 = 296.0;
+pub const WIDTH: f32 = 320.0;
 /// 卡片四周的透明边距：egui 只能在窗口矩形内作画，系统级阴影在 Win10 上
 /// 又拿不到（DWM 缝线无法隐藏），所以投影由自己在卡片后面画，这段边距
 /// 就是阴影的落脚处。可见衰减约 14px（σ=8 + 3px 下移），留到 22 是为了
@@ -30,10 +33,10 @@ pub fn window_size(content_w: f32, content_h: f32) -> Vec2 {
     Vec2::new(content_w + 2.0 * SHADOW_PAD, content_h + 2.0 * SHADOW_PAD)
 }
 
-const HEAD_H: f32 = 36.0;
-const LIST_GAP: f32 = 6.0;
-const ROW_H: f32 = 42.0;
-const FOOT_H: f32 = 30.0;
+const HEAD_H: f32 = 54.0;
+const LIST_GAP: f32 = 8.0;
+const ROW_H: f32 = 54.0;
+const FOOT_H: f32 = 34.0;
 /// Past this many devices the widget stops growing and scrolls instead, so it
 /// never eats more desktop than it is worth.
 const MAX_ROWS: usize = 5;
@@ -57,9 +60,10 @@ pub fn height(devices: usize, attention: usize) -> f32 {
     } else {
         0.0
     };
-    HEAD_H + LIST_GAP + rows * ROW_H + foot + 8.0
+    HEAD_H + LIST_GAP + rows * ROW_H + foot + 10.0
 }
 
+/// 与工作台共用离线和低电量的关注规则。
 fn needs_attention(entry: &Entry) -> bool {
     matches!(entry.state.link, Link::Offline(_))
         || matches!(
@@ -68,10 +72,12 @@ fn needs_attention(entry: &Entry) -> bool {
         )
 }
 
+/// 关注数量参与浮窗尺寸计算。
 pub fn attention_count(manager: &DeviceManager) -> usize {
     manager.list().iter().filter(|e| needs_attention(e)).count()
 }
 
+/// 紧凑浮窗用双行身份和设备图标保持可读性，沿用原有动作。
 pub fn view(
     ui: &mut Ui,
     p: &Palette,
@@ -92,8 +98,8 @@ pub fn view(
     paint_card(ui, p, card);
 
     let inner = Rect::from_min_max(
-        Pos2::new(card.left() + 10.0, card.top()),
-        Pos2::new(card.right() - 10.0, card.bottom() - 8.0),
+        Pos2::new(card.left() + 14.0, card.top()),
+        Pos2::new(card.right() - 14.0, card.bottom() - 10.0),
     );
     let mut body = ui.new_child(
         UiBuilder::new()
@@ -116,7 +122,14 @@ pub fn view(
 
     let list_h = entries.len().clamp(1, MAX_ROWS) as f32 * ROW_H;
     if entries.is_empty() {
-        empty_row(&mut body, p, &mut action, recently_scanned, list_h);
+        empty_row(
+            &mut body,
+            p,
+            &mut action,
+            recently_scanned,
+            manager.is_scanning(),
+            list_h,
+        );
     } else if entries.len() > MAX_ROWS {
         egui::ScrollArea::vertical()
             .max_height(list_h)
@@ -148,8 +161,15 @@ pub fn view(
 fn paint_card(ui: &Ui, p: &Palette, card: Rect) {
     let focused = ui.ctx().input(|i| i.focused);
     shadow_card(ui.painter(), card, p.card, CARD_RADIUS, p.dark, focused);
+    ui.painter().add(material_shape(
+        card.shrink(0.5),
+        CARD_RADIUS,
+        p.card_top,
+        p.card,
+    ));
 }
 
+/// 标题与在线摘要分成两行，避免状态文字覆盖右侧工具按钮。
 fn header(
     body: &mut Ui,
     p: &Palette,
@@ -169,7 +189,7 @@ fn header(
     let mut x = rect.right();
     let mut slots = [Rect::ZERO; 4];
     for slot in slots.iter_mut() {
-        let r = Rect::from_min_size(Pos2::new(x - 22.0, rect.top() + 7.0), Vec2::splat(22.0));
+        let r = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 15.0), Vec2::splat(24.0));
         *slot = r;
         x = r.left() - 2.0;
     }
@@ -218,46 +238,41 @@ fn header(
 
     // Monogram, name, and the one number that matters.
     let badge = Rect::from_min_size(
-        Pos2::new(rect.left() + 2.0, rect.center().y - 9.0),
-        Vec2::splat(18.0),
+        Pos2::new(rect.left() + 2.0, rect.center().y - 13.0),
+        Vec2::splat(26.0),
     );
-    painter.rect_filled(badge, CornerRadius::same(5), p.accent);
-    painter.text(
-        badge.center(),
-        Align2::CENTER_CENTER,
-        "P",
-        FontId::proportional(11.5),
-        p.on_accent,
-    );
+    paint_brand(&painter, badge, p);
 
-    let title_pos = Pos2::new(badge.right() + 7.0, rect.center().y);
+    let title_pos = Pos2::new(badge.right() + 8.0, rect.top() + 12.0);
     painter.text(
         title_pos,
-        Align2::LEFT_CENTER,
+        Align2::LEFT_TOP,
         "PeriphHub",
-        FontId::proportional(11.5),
+        heading_font(13.0),
         p.text,
     );
-    let title_w = painter
-        .layout_no_wrap("PeriphHub".into(), FontId::proportional(11.5), p.text)
-        .size()
-        .x;
-
     let (dot_color, summary, summary_color) = if total == 0 {
         (p.dim, "无设备".to_string(), p.dim)
     } else if attention > 0 {
         (p.warn, format!("{attention} 项需关注"), p.warn)
     } else {
-        (p.ok, format!("{online}/{total} 在线"), p.dim)
+        (p.ok, format!("{online}/{total} 在线"), p.subtle)
     };
-    let dot_c = Pos2::new(title_pos.x + title_w + 12.0, rect.center().y);
+    let dot_c = Pos2::new(title_pos.x + 2.6, rect.top() + 37.0);
     painter.circle_filled(dot_c, 2.6, dot_color);
     painter.text(
-        Pos2::new(dot_c.x + 7.0, rect.center().y),
+        Pos2::new(dot_c.x + 7.0, dot_c.y),
         Align2::LEFT_CENTER,
         summary,
-        FontId::proportional(10.5),
+        FontId::proportional(10.0),
         summary_color,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), rect.bottom()),
+            Pos2::new(rect.right(), rect.bottom()),
+        ],
+        Stroke::new(1.0, alpha(p.border, 120)),
     );
 
     // Drag strip: everything left of the buttons. Registered after them so a
@@ -280,6 +295,7 @@ fn header(
     }
 }
 
+/// 稳定的图标和双行文本，电量用数值与短条共同呈现。
 fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
@@ -287,32 +303,36 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         ui.ctx()
             .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
     let offline = matches!(entry.state.link, Link::Offline(_));
-    let connecting = matches!(entry.state.link, Link::Connecting);
     let painter = ui.painter();
 
     if hover > 0.001 {
         painter.rect_filled(
             rect,
-            CornerRadius::same(9),
+            CornerRadius::same(11),
             alpha(p.chip_bg, (hover * 215.0) as u8),
         );
     }
 
-    // A colour bar instead of a dot: it survives being read at a glance and
-    // keeps the row's left edge steady whatever the state is.
     let tint = if offline {
         p.dim
     } else {
         connection_color(p, entry.info.connection)
     };
-    let bar = Rect::from_min_size(
-        Pos2::new(rect.left() + 2.0, rect.center().y - 9.0),
-        Vec2::new(3.0, 18.0),
+    let tile = Rect::from_min_size(
+        Pos2::new(rect.left() + 2.0, rect.center().y - 16.0),
+        Vec2::splat(32.0),
     );
-    painter.rect_filled(
-        bar,
-        CornerRadius::same(2),
-        tint.gamma_multiply(if connecting { 0.45 } else { 0.95 }),
+    painter.add(material_shape(
+        tile,
+        9,
+        mix(p.chip_bg, tint, if offline { 0.03 } else { 0.10 }),
+        p.chip_bg,
+    ));
+    painter.rect_stroke(
+        tile,
+        CornerRadius::same(9),
+        Stroke::new(1.0, alpha(tint, 40)),
+        StrokeKind::Inside,
     );
 
     let wired = entry.info.connection.is_wired();
@@ -321,46 +341,40 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         Link::Offline(_) => ("离线".to_string(), p.danger),
         Link::Connecting => ("连接中".to_string(), p.warn),
         Link::Online => match entry.state.battery {
-            Some(b) => (format!("{b}%"), battery_color(level, p)),
+            Some(b) => (format!("{}%", b.min(100)), battery_color(level, p)),
             None if wired => ("有线".to_string(), p.info),
             None => ("在线".to_string(), p.ok),
         },
     };
-    let value_font = FontId::proportional(12.5);
+    let value_font = heading_font(13.5);
     let value_w = painter
         .layout_no_wrap(value.clone(), value_font.clone(), value_color)
         .size()
         .x;
     painter.text(
-        Pos2::new(rect.right() - 9.0, rect.top() + 8.0),
+        Pos2::new(rect.right() - 10.0, rect.top() + 10.0),
         Align2::RIGHT_TOP,
         value,
         value_font,
         value_color,
     );
 
-    // 形态图标放在色条与文字之间：一眼分出键盘和鼠标，不必先读型号。
-    paint_device_glyph(
-        painter,
-        Pos2::new(rect.left() + 16.0, rect.center().y),
-        entry.info.kind,
-        tint,
-        14.0,
-    );
-    let text_left = rect.left() + 28.0;
+    // 形态图标独立成块，小尺寸下也能分辨键盘与鼠标。
+    paint_device_glyph(painter, tile.center(), entry.info.kind, tint, 18.0);
+    let text_left = rect.left() + 44.0;
     let title_col = if offline { p.dim } else { p.text };
-    let title_w = (rect.right() - 9.0 - value_w - 8.0) - text_left;
+    let title_w = (rect.right() - 12.0 - value_w - 8.0) - text_left;
     let model = ellipsize(
         painter,
         short_model(&entry.info.model),
-        FontId::proportional(12.5),
+        FontId::proportional(13.0),
         title_w,
     );
     painter.text(
-        Pos2::new(text_left, rect.top() + 8.0),
+        Pos2::new(text_left, rect.top() + 10.0),
         Align2::LEFT_TOP,
         model,
-        FontId::proportional(12.5),
+        FontId::proportional(13.0),
         title_col,
     );
 
@@ -383,19 +397,34 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
             ),
         },
     };
+    let has_gauge = matches!(entry.state.link, Link::Online) && entry.state.battery.is_some();
     let note = ellipsize(
         painter,
         &note,
-        FontId::proportional(9.5),
-        rect.width() - 37.0,
+        FontId::proportional(10.5),
+        rect.right() - text_left - if has_gauge { 56.0 } else { 10.0 },
     );
     painter.text(
-        Pos2::new(text_left, rect.top() + 25.0),
+        Pos2::new(text_left, rect.top() + 31.0),
         Align2::LEFT_TOP,
         note,
-        FontId::proportional(9.5),
+        FontId::proportional(10.5),
         note_color,
     );
+    if has_gauge {
+        if let Some(battery) = entry.state.battery {
+            let gauge = Rect::from_min_size(
+                Pos2::new(rect.right() - 44.0, rect.top() + 36.0),
+                Vec2::new(34.0, 3.0),
+            );
+            painter.rect_filled(gauge, CornerRadius::same(2), p.track);
+            if battery > 0 {
+                let mut fill = gauge;
+                fill.set_width(gauge.width() * battery.min(100) as f32 / 100.0);
+                painter.rect_filled(fill, CornerRadius::same(2), value_color);
+            }
+        }
+    }
 
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -405,11 +434,13 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     }
 }
 
+/// 空态保留扫描入口，并区分后台扫描过程与扫描结论。
 fn empty_row(
     body: &mut Ui,
     p: &Palette,
     action: &mut MiniAction,
     recently_scanned: bool,
+    scanning: bool,
     height: f32,
 ) {
     let width = body.available_width();
@@ -421,11 +452,14 @@ fn empty_row(
     if hover > 0.001 {
         painter.rect_filled(
             rect,
-            CornerRadius::same(9),
+            CornerRadius::same(11),
             alpha(p.chip_bg, (hover * 215.0) as u8),
         );
     }
-    let (title, note) = if recently_scanned {
+    // 后台首轮扫描期间不能报"未发现设备"：那是结论，不是过程。
+    let (title, note) = if scanning {
+        ("正在扫描…", "正在检测已连接的外设")
+    } else if recently_scanned {
         ("仍未发现设备", "检查接收器或数据线后重新扫描")
     } else {
         ("未发现设备", "点击扫描已连接的外设")
@@ -434,14 +468,14 @@ fn empty_row(
         Pos2::new(rect.center().x, rect.center().y - 8.0),
         Align2::CENTER_CENTER,
         title,
-        FontId::proportional(12.0),
+        FontId::proportional(12.5),
         p.text,
     );
     painter.text(
-        Pos2::new(rect.center().x, rect.center().y + 9.0),
+        Pos2::new(rect.center().x, rect.center().y + 10.0),
         Align2::CENTER_CENTER,
         note,
-        FontId::proportional(9.5),
+        FontId::proportional(10.5),
         p.dim,
     );
     if resp.hovered() {
@@ -452,6 +486,7 @@ fn empty_row(
     }
 }
 
+/// 关注提示只在需要时出现，不改变正常浮窗的高度。
 fn footer(body: &mut Ui, p: &Palette, action: &mut MiniAction, attention: usize) {
     let width = body.available_width();
     let (rect, resp) = body.allocate_exact_size(Vec2::new(width, FOOT_H), Sense::click());
@@ -470,27 +505,27 @@ fn footer(body: &mut Ui, p: &Palette, action: &mut MiniAction, attention: usize)
                 Pos2::new(rect.left(), rect.top() + 1.0),
                 rect.right_bottom(),
             ),
-            CornerRadius::same(8),
+            CornerRadius::same(10),
             alpha(p.chip_bg, (hover * 215.0) as u8),
         );
     }
     painter.circle_filled(
-        Pos2::new(rect.left() + 5.0, rect.center().y + 0.5),
+        Pos2::new(rect.left() + 6.0, rect.center().y + 0.5),
         2.8,
         p.warn,
     );
     painter.text(
-        Pos2::new(rect.left() + 13.0, rect.center().y),
+        Pos2::new(rect.left() + 15.0, rect.center().y),
         Align2::LEFT_CENTER,
         format!("{attention} 台设备需要关注"),
-        FontId::proportional(10.5),
+        FontId::proportional(11.0),
         mix(p.dim, p.text, hover * 0.7),
     );
     painter.text(
-        Pos2::new(rect.right() - 9.0, rect.center().y),
+        Pos2::new(rect.right() - 12.0, rect.center().y),
         Align2::RIGHT_CENTER,
         "查看",
-        FontId::proportional(10.5),
+        FontId::proportional(11.0),
         mix(p.dim, p.text, hover),
     );
     if resp.hovered() {
@@ -501,6 +536,7 @@ fn footer(body: &mut Ui, p: &Palette, action: &mut MiniAction, attention: usize)
     }
 }
 
+/// 置顶状态用轻微色彩标识，所有工具保持一致的触达面积。
 fn icon_button(
     ui: &mut Ui,
     rect: Rect,
@@ -513,14 +549,18 @@ fn icon_button(
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.07);
-    if t > 0.001 {
+    if t > 0.001 || accent {
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(6),
-            alpha(p.chip_bg, (t * 255.0) as u8),
+            if accent {
+                alpha(p.accent, (18.0 + t * 15.0) as u8)
+            } else {
+                alpha(p.chip_bg, (t * 255.0) as u8)
+            },
         );
     }
-    let base = if accent { p.text } else { p.dim };
+    let base = if accent { p.accent } else { p.dim };
     paint(ui.painter(), rect.center(), mix(base, p.text, t * 0.6));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

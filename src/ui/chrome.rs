@@ -1,9 +1,9 @@
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Rect, Response, RichText, Sense,
-    Stroke, StrokeKind, Ui, UiBuilder, Vec2,
+    self, Align, Color32, CornerRadius, Layout, Rect, Response, RichText, Sense, Stroke,
+    StrokeKind, Ui, UiBuilder, Vec2,
 };
 
-use crate::theme::Palette;
+use crate::theme::{alpha, heading, Palette};
 use crate::ui::widgets::mix;
 
 pub struct Bar<'a> {
@@ -29,12 +29,13 @@ pub struct BarAction {
     pub mini: bool,
 }
 
+/// 为标题和工具动作预留独立空间，并保留原生拖动手势。
 pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
     use crate::ui::widgets::CARD_RADIUS;
 
     let mut action = BarAction::default();
     let width = ui.available_width();
-    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 46.0), Sense::hover());
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::hover());
     // 标题栏铺满圆角卡片的整个宽度，顶部两角跟随卡片圆角，否则方角会从
     // 卡片圆弧里戳出去；最大化时卡片无圆角，标题栏也回到方角。
     let top = if cfg.maximized { 0 } else { CARD_RADIUS };
@@ -52,16 +53,28 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
         egui::pos2(bar.left(), bar.bottom() - 1.0),
         bar.right_bottom(),
     );
-    ui.painter().rect_filled(border, 0.0, p.border);
+    ui.painter().rect_filled(border, 0.0, alpha(p.border, 130));
 
-    let inner = bar.shrink2(Vec2::new(14.0, 0.0));
+    let inner = bar.shrink2(Vec2::new(20.0, 0.0));
+    // 右侧两组的预留宽度（含组内间距与分隔线，实际约 143 / 106），后面再
+    // 统一留 18 px 余量。改 `window_button` / `icon_button` 的尺寸时同步这里，
+    // 否则标题会悄悄压到按钮上。
+    let controls_w =
+        if cfg.window_buttons { 134.0 } else { 0.0 } + if cfg.show_actions { 108.0 } else { 0.0 };
+    let title_rect = Rect::from_min_max(
+        inner.min,
+        egui::pos2(
+            (inner.right() - controls_w - 18.0).max(inner.left()),
+            inner.bottom(),
+        ),
+    );
     // Where the drag strip may start. The back button is clickable, and the
     // drag interaction is registered after it, so the strip has to begin past
     // it — otherwise dragging wins the click and the button never fires.
     let mut drag_left = bar.left();
     ui.scope_builder(
         UiBuilder::new()
-            .max_rect(inner)
+            .max_rect(title_rect)
             .layout(Layout::left_to_right(Align::Center)),
         |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -72,21 +85,13 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
                 }
                 drag_left = back.rect.right() + 4.0;
             } else {
-                let (badge, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(badge, CornerRadius::same(7), p.accent);
-                ui.painter().text(
-                    badge.center(),
-                    Align2::CENTER_CENTER,
-                    "P",
-                    FontId::proportional(15.0),
-                    p.on_accent,
-                );
+                crate::theme::brand_badge(ui, 28.0, p);
             }
-            ui.add_space(4.0);
-            ui.label(RichText::new(cfg.title).size(15.0).strong().color(p.text));
-            if let Some(sub) = cfg.subtitle {
-                ui.label(RichText::new(sub).size(11.0).color(p.dim));
+            ui.add_space(7.0);
+            ui.add(egui::Label::new(heading(cfg.title, 14.5, p.text)).truncate());
+            if let Some(sub) = cfg.subtitle.filter(|_| ui.available_width() > 100.0) {
+                ui.add_space(8.0);
+                ui.label(RichText::new(sub).size(11.0).color(p.subtle));
             }
         },
     );
@@ -108,7 +113,10 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
                 if window_button(ui, p, WinBtn::Minimize).clicked() {
                     action.minimize = true;
                 }
-                ui.add_space(6.0);
+                ui.add_space(10.0);
+                let (rule, _) = ui.allocate_exact_size(Vec2::new(1.0, 18.0), Sense::hover());
+                ui.painter().rect_filled(rule, 0.0, alpha(p.border, 170));
+                ui.add_space(10.0);
             }
             if cfg.window_buttons || cfg.show_actions {
                 if cfg.show_actions {
@@ -157,6 +165,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
     action
 }
 
+/// 无边框窗口沿用系统缩放行为，最大化时停用边缘手柄。
 pub fn resize_handles(ui: &Ui, enabled: bool) {
     if !enabled {
         return;
@@ -208,6 +217,7 @@ enum WinBtn {
     Close,
 }
 
+/// 窗口控制提供轻量悬停反馈，关闭按钮保留明确的危险色。
 fn window_button(ui: &mut Ui, p: &Palette, kind: WinBtn) -> Response {
     let close = matches!(kind, WinBtn::Close);
     let width = if close { 40.0 } else { 36.0 };
@@ -297,7 +307,7 @@ fn window_button(ui: &mut Ui, p: &Palette, kind: WinBtn) -> Response {
 /// Back arrow, sized exactly like the app monogram it replaces so the title
 /// does not jump sideways when a page opens.
 fn back_button(ui: &mut Ui, p: &Palette) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.07);
@@ -326,13 +336,14 @@ fn back_button(ui: &mut Ui, p: &Palette) -> Response {
     resp.on_hover_text("返回设备列表（Esc）")
 }
 
+/// 工具图标使用一致的点击面积与过渡。
 fn icon_button(
     ui: &mut Ui,
     p: &Palette,
     tip: &str,
     paint: impl FnOnce(&egui::Painter, Rect, Color32),
 ) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 32.0), Sense::click());
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.07);
@@ -343,7 +354,7 @@ fn icon_button(
             p.chip_bg.b(),
             (t * 255.0) as u8,
         );
-        ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+        ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
     }
     // Icons brighten slightly as the hover fades in.
     paint(ui.painter(), rect, mix(p.dim, p.text, t * 0.7));
@@ -394,6 +405,7 @@ fn paint_mini(painter: &egui::Painter, rect: Rect, color: Color32) {
     );
 }
 
+/// 滑杆形态使设置入口与主题按钮一眼可区分。
 fn paint_gear(painter: &egui::Painter, rect: Rect, color: Color32) {
     // Three sliders read as "settings" instantly; the old radial ticks beside
     // the sun/moon toggle looked like a second theme button.

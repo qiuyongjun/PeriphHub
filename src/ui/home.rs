@@ -7,21 +7,25 @@ use eframe::egui::{
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::driver::{self, DeviceProfile};
-use crate::theme::{alpha, battery_color, battery_label, battery_level, brand_badge, Palette};
+use crate::theme::{
+    alpha, battery_color, battery_label, battery_level, battery_text, brand_badge, card_shadow,
+    heading, Palette,
+};
 use crate::ui::widgets::{
-    action_link, connection_chip_colored, connection_color, device_tile, hairline, metric_col, mix,
-    pill, primary_button, short_model, skeleton, split_row, status_dot, vrule, RESCAN_HINT,
+    action_link, connection_chip_colored, connection_color, device_tile, hairline, material_shape,
+    metric_col, mix, pill, primary_button, short_model, skeleton, split_row, status_dot, surface,
+    vrule, CARD_RADIUS, RESCAN_HINT,
 };
 
 /// Height of a device card's body block; every variant pads to it so cards in
 /// the same row keep their feet on one line.
-const BODY_H: f32 = 60.0;
+const BODY_H: f32 = 90.0;
 /// Inner content height of every device card: header + body + rule + footer.
-const CARD_H: f32 = 166.0;
+const CARD_H: f32 = 214.0;
 /// Side of the letter tile in card headers. The title block must reserve the
 /// same height, or egui centers a zero-height rect on the row's midline and
 /// the two text lines hang below the tile (they did: ~14px too low).
-const TILE: f32 = 40.0;
+const TILE: f32 = 50.0;
 
 #[derive(Default)]
 pub struct HomeAction {
@@ -29,6 +33,7 @@ pub struct HomeAction {
     pub rescan: bool,
 }
 
+/// 工作台概览与自适应设备网格，保留现有状态排序和页面入口。
 pub fn view(
     ui: &mut Ui,
     p: &Palette,
@@ -36,6 +41,7 @@ pub fn view(
     recently_scanned: bool,
     last_scan: Option<Instant>,
 ) -> HomeAction {
+    ui.spacing_mut().item_spacing.y = 0.0;
     let mut action = HomeAction::default();
     let entries = manager.list();
     let total = entries.len();
@@ -54,34 +60,45 @@ pub fn view(
         })
         .count();
 
-    header(ui, p, &mut action, recently_scanned);
-    ui.add_space(20.0);
-    overview(ui, p, total, online, attention);
-    ui.add_space(24.0);
+    surface(ui, p, Margin::symmetric(24, 20), |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        header(ui, p, &mut action, recently_scanned);
+        ui.add_space(20.0);
+        hairline(ui, p, 140);
+        ui.add_space(16.0);
+        overview(ui, p, total, online, attention);
+    });
+    ui.add_space(26.0);
 
     split_row(
         ui,
         |ui| {
-            ui.label(RichText::new(sync_text(last_scan)).size(10.5).color(p.dim));
+            status_dot(ui, p.ok, false);
+            ui.label(
+                RichText::new(sync_text(last_scan))
+                    .size(11.0)
+                    .color(p.subtle),
+            );
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new("我的设备").size(14.5).strong().color(p.text));
+            ui.label(heading("我的设备", 17.0, p.text));
             pill(ui, p, &format!("{total} 台"), p.dim);
             if manager.is_demo() {
                 pill(ui, p, "演示数据", p.info);
             }
         },
     );
-    ui.add_space(12.0);
+    ui.add_space(14.0);
 
     if entries.is_empty() {
-        empty_state(ui, p, &mut action);
+        empty_state(ui, p, &mut action, manager.is_scanning());
         return action;
     }
 
-    let gap = 14.0;
-    let min_w = 300.0;
+    let gap = 18.0;
+    // 三列只在宽窗口启用，确保长型号和回报率在常用尺寸下完整可读。
+    let min_w = 340.0;
     let avail = ui.available_width();
     let cols = (((avail + gap) / (min_w + gap)).floor() as usize).clamp(1, 3);
     let card_w = (avail - gap * (cols.saturating_sub(1)) as f32) / cols as f32;
@@ -92,6 +109,7 @@ pub fn view(
 
     for row in order.chunks(cols) {
         ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             for (i, entry) in row.iter().enumerate() {
                 if i > 0 {
                     ui.add_space(gap);
@@ -113,6 +131,7 @@ pub fn view(
     action
 }
 
+/// 页首强调工作台身份，扫描动作保持唯一的实色主按钮。
 fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: bool) {
     split_row(
         ui,
@@ -137,14 +156,16 @@ fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: b
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(
-                    RichText::new("设备工作台")
-                        .size(23.0)
-                        .strong()
-                        .color(p.text),
+                    RichText::new("PERIPHHUB  /  WORKSPACE")
+                        .size(10.0)
+                        .extra_letter_spacing(1.4)
+                        .color(p.subtle),
                 );
-                ui.add_space(3.0);
+                ui.add_space(7.0);
+                ui.label(heading("设备工作台", 30.0, p.text));
+                ui.add_space(5.0);
                 ui.label(
-                    RichText::new("查看连接状态，快速调整你的外设")
+                    RichText::new("连接、状态与性能，一处掌控")
                         .size(12.5)
                         .color(p.dim),
                 );
@@ -153,60 +174,41 @@ fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: b
     );
 }
 
+/// 概览共享一块表面，均分宽度避免状态数字挤在左侧。
 fn overview(ui: &mut Ui, p: &Palette, total: usize, online: usize, attention: usize) {
-    egui::Frame::new()
-        .fill(p.card)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::symmetric(20, 14))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 0.0;
-            // Two rules plus four gaps sit between the three cells; the rest of
-            // the width is shared evenly. Without the explicit set_width below
-            // the cells would shrink back to their text and leave a dead right
-            // half of the strip.
-            let gap = 18.0;
-            let cell_w = (ui.available_width() - 2.0 - gap * 4.0) / 3.0;
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                stat_cell(
-                    ui,
-                    p,
-                    cell_w,
-                    &total.to_string(),
-                    "台",
-                    "已发现",
-                    if total == 0 { p.dim } else { p.text },
-                );
-                ui.add_space(gap);
-                vrule(ui, p, 4.0, 30.0);
-                ui.add_space(gap);
-                stat_cell(
-                    ui,
-                    p,
-                    cell_w,
-                    &online.to_string(),
-                    "台",
-                    "在线中",
-                    if online == 0 { p.dim } else { p.ok },
-                );
-                ui.add_space(gap);
-                vrule(ui, p, 4.0, 30.0);
-                ui.add_space(gap);
-                stat_cell(
-                    ui,
-                    p,
-                    cell_w,
-                    &attention.to_string(),
-                    "项",
-                    "需要关注",
-                    if attention == 0 { p.dim } else { p.warn },
-                );
-            });
-        });
+    let gap = 20.0;
+    let cell_w = (ui.available_width() - 2.0 - gap * 4.0) / 3.0;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        stat_cell(ui, p, cell_w, &total.to_string(), "台", "设备总数", p.text);
+        ui.add_space(gap);
+        vrule(ui, p, 4.0, 42.0);
+        ui.add_space(gap);
+        stat_cell(
+            ui,
+            p,
+            cell_w,
+            &online.to_string(),
+            "台",
+            "当前在线",
+            if online == 0 { p.dim } else { p.ok },
+        );
+        ui.add_space(gap);
+        vrule(ui, p, 4.0, 42.0);
+        ui.add_space(gap);
+        stat_cell(
+            ui,
+            p,
+            cell_w,
+            &attention.to_string(),
+            "项",
+            "需要关注",
+            if attention == 0 { p.dim } else { p.warn },
+        );
+    });
 }
 
+/// 数字与单位分级排版，单位不占用指标的主要视觉权重。
 fn stat_cell(
     ui: &mut Ui,
     p: &Palette,
@@ -219,48 +221,46 @@ fn stat_cell(
     ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(RichText::new(label).size(11.0).color(p.dim));
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(RichText::new(value).size(21.0).strong().color(color));
-            ui.add_space(3.0);
+            ui.label(heading(value, 28.0, color));
+            ui.add_space(2.0);
             ui.label(RichText::new(unit).size(11.0).color(p.dim));
         });
-        ui.add_space(2.0);
-        ui.label(RichText::new(label).size(11.0).color(p.dim));
     });
 }
 
-fn empty_state(ui: &mut Ui, p: &Palette, action: &mut HomeAction) {
-    egui::Frame::new()
-        .fill(p.card)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                ui.add_space(26.0);
-                brand_badge(ui, 44.0, p);
-                ui.add_space(14.0);
-                ui.label(
-                    RichText::new("还没有检测到设备")
-                        .size(17.0)
-                        .strong()
-                        .color(p.text),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("请连接设备、接收器或 USB 数据线，然后重新扫描")
-                        .size(12.0)
-                        .color(p.dim),
-                );
+/// 空态区分扫描中与扫描结束，并保留真实支持范围。
+fn empty_state(ui: &mut Ui, p: &Palette, action: &mut HomeAction, scanning: bool) {
+    surface(ui, p, Margin::same(24), |ui| {
+        ui.set_width(ui.available_width());
+        ui.vertical_centered(|ui| {
+            ui.add_space(32.0);
+            brand_badge(ui, 48.0, p);
+            ui.add_space(16.0);
+            // 首次扫描在后台跑：这期间说"还没有检测到设备"是错的，
+            // 用户会以为设备没被认出来。
+            let (title, note) = if scanning {
+                ("正在扫描设备…", "正在检测 USB 与蓝牙上的外设，请稍候")
+            } else {
+                (
+                    "还没有检测到设备",
+                    "请连接设备、接收器或 USB 数据线，然后重新扫描",
+                )
+            };
+            ui.label(heading(title, 18.0, p.text));
+            ui.add_space(7.0);
+            ui.label(RichText::new(note).size(12.5).color(p.dim));
+            if !scanning {
                 ui.add_space(4.0);
                 // 诚实说明支持范围：未知 VID/PID 的设备在 enumerate 里被整个
                 // 过滤掉了，用户手里的鼠标不在支持列表时，看到"未发现设备"
                 // 最容易得出的结论是程序坏了，而不是型号不支持。文案从设备
                 // 总表生成（见 supported_summary），新增型号不会漏改这里。
-                ui.label(RichText::new(supported_summary()).size(11.0).color(p.dim));
-                ui.add_space(18.0);
+                ui.label(RichText::new(supported_summary()).size(11.5).color(p.dim));
+                ui.add_space(20.0);
                 if primary_button(
                     ui,
                     p,
@@ -271,11 +271,13 @@ fn empty_state(ui: &mut Ui, p: &Palette, action: &mut HomeAction) {
                 {
                     action.rescan = true;
                 }
-                ui.add_space(28.0);
-            });
+            }
+            ui.add_space(28.0);
         });
+    });
 }
 
+/// 统一身份、指标与动作区；离线表面降低明度，悬停只增强边界。
 fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
     let offline = matches!(entry.state.link, Link::Offline(_));
     let connecting = matches!(entry.state.link, Link::Connecting);
@@ -290,26 +292,34 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
     };
     let text_col = if offline { p.dim } else { p.text };
     let border = if offline {
-        alpha(p.border, 160)
+        alpha(p.border, 120)
     } else {
-        p.border
+        alpha(p.border, 180)
     };
 
     let card_id = ui
         .scope_id()
         .with(("device-card", entry.info.id.0.as_ref()));
     let mut clicked_button = false;
+    let mut material = None;
     let frame = egui::Frame::new()
         .fill(card_fill)
         .stroke(Stroke::new(1.0, border))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(Margin::same(16))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .inner_margin(Margin::same(20))
+        .shadow(if offline {
+            egui::Shadow::NONE
+        } else {
+            card_shadow(p)
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
+            material = Some(ui.painter().add(egui::Shape::Noop));
             let card_top = ui.cursor().top();
 
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 let letter = entry
                     .info
                     .brand
@@ -318,11 +328,21 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     .map(|c| c.to_uppercase().to_string())
                     .unwrap_or_else(|| "P".into());
                 device_tile(ui, p, entry.info.kind, &letter, tint, TILE);
-                ui.add_space(5.0);
+                ui.add_space(10.0);
                 // The link chip is laid out after this block, so its width has
                 // to be reserved up front: otherwise a long product name eats
                 // the row and the chip slides out of the card.
-                let title_w = (ui.available_width() - 62.0).max(60.0);
+                let chip_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        entry.info.connection.label().to_owned(),
+                        egui::FontId::proportional(11.5),
+                        tint,
+                    )
+                    .size()
+                    .x
+                    + 18.0;
+                let title_w = (ui.available_width() - chip_w - 10.0).max(60.0);
                 ui.allocate_ui_with_layout(
                     // Height must match the tile: with 0 egui centers an empty
                     // rect on the row's midline and the text hangs below it.
@@ -334,20 +354,16 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(entry.info.brand.to_uppercase())
-                                    .size(10.0)
+                                    .size(10.5)
                                     .strong()
-                                    .color(p.dim),
+                                    .color(p.subtle),
                             )
                             .truncate(),
                         );
                         let full = entry.info.model.as_str();
                         let title = short_model(full);
-                        let label = ui.add(
-                            egui::Label::new(
-                                RichText::new(title).size(16.5).strong().color(text_col),
-                            )
-                            .truncate(),
-                        );
+                        let label =
+                            ui.add(egui::Label::new(heading(title, 20.0, text_col)).truncate());
                         // The shortened title is a convenience; the device's
                         // own name stays one hover away.
                         if title != full {
@@ -360,7 +376,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     connection_chip_colored(ui, p, entry.info.connection, chip_color);
                 });
             });
-            ui.add_space(16.0);
+            ui.add_space(14.0);
 
             let body_top = ui.cursor().top();
             ui.allocate_ui_with_layout(
@@ -370,7 +386,18 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     if !entry.info.has_config {
                         read_only_body(ui, p, entry.info.reason);
                     } else if entry.state.snap.is_some() {
-                        metrics(ui, p, entry);
+                        egui::Frame::new()
+                            .fill(if offline {
+                                alpha(p.inset, 130)
+                            } else {
+                                p.inset
+                            })
+                            .corner_radius(CornerRadius::same(11))
+                            .inner_margin(Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                metrics(ui, p, entry);
+                            });
                     } else {
                         loading_body(ui, p, connecting);
                     }
@@ -383,9 +410,9 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                 ui.add_space(BODY_H - used);
             }
 
-            ui.add_space(12.0);
-            hairline(ui, p, 170);
-            ui.add_space(9.0);
+            ui.add_space(14.0);
+            hairline(ui, p, 150);
+            ui.add_space(10.0);
 
             split_row(
                 ui,
@@ -415,7 +442,15 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     };
                     status_dot(ui, status_color, connecting);
                     ui.add_space(2.0);
-                    ui.label(RichText::new(text).size(11.0).color(status_color));
+                    ui.label(
+                        RichText::new(text)
+                            .size(11.5)
+                            .color(if offline || connecting {
+                                status_color
+                            } else {
+                                p.dim
+                            }),
+                    );
                 },
             );
             // Pad to a fixed content height so every card in a row ends on the
@@ -432,19 +467,23 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
     let t =
         ui.ctx()
             .animate_value_with_time(card_id, if response.hovered() { 1.0 } else { 0.0 }, 0.10);
+    if let Some(material) = material {
+        let top = if offline {
+            card_fill
+        } else {
+            mix(p.card_top, p.card_hover, t * 0.5)
+        };
+        ui.painter().set(
+            material,
+            material_shape(rect.shrink(1.0), CARD_RADIUS - 1, top, card_fill),
+        );
+    }
     if t > 0.001 {
-        if !offline {
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::same(14),
-                alpha(p.accent, (t * 6.0) as u8),
-            );
-        }
-        let col = mix(border, p.accent, t * 0.75);
+        let col = mix(p.border, p.accent, t * 0.55);
         ui.painter().rect_stroke(
             rect,
-            CornerRadius::same(14),
-            Stroke::new(1.0 + t * 0.6, col),
+            CornerRadius::same(CARD_RADIUS),
+            Stroke::new(1.0, col),
             StrokeKind::Inside,
         );
     }
@@ -454,6 +493,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
     response.clicked() || clicked_button
 }
 
+/// 只展示设备真实开放的指标，未知值继续使用占位而非推测。
 fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
     let Some(snap) = entry.state.snap.as_ref() else {
         return;
@@ -466,11 +506,7 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
     let offline = matches!(entry.state.link, Link::Offline(_));
     let value_col = if offline { p.dim } else { p.text };
 
-    let battery_text = match entry.state.battery {
-        Some(b) => format!("{b}%"),
-        None if wired => "有线".to_string(),
-        None => "--".to_string(),
-    };
+    let battery_text = battery_text(entry.state.battery, wired);
     let dpi_text = current
         .map(|v| v.to_string())
         .unwrap_or_else(|| "--".into());
@@ -502,10 +538,13 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
             value: battery_text,
             note: battery_label(level).to_string(),
             color: if offline { p.dim } else { color },
-            tip: if wired {
-                "设备由数据线供电，不显示电量"
-            } else {
-                "剩余电量，低于 20% 建议充电"
+            // 插线时设备照样报电量（而且多半在充电），所以提示只能看这一轮
+            // 到底有没有读数，不能只看连接方式——否则会出现"71%"配一句
+            // "不显示电量"。
+            tip: match entry.state.battery {
+                Some(_) => "剩余电量，低于 20% 建议充电",
+                None if wired => "设备由数据线供电，这一轮没有读到电量",
+                None => "还没读到电量，无线鼠标休眠时常见",
             },
         }),
         snap.caps.dpi.then(|| Col {
@@ -567,6 +606,7 @@ fn read_only_body(ui: &mut Ui, p: &Palette, reason: Option<&str>) {
         });
 }
 
+/// 骨架占据与真实指标相同的位置，读取完成时卡片保持稳定。
 fn loading_body(ui: &mut Ui, p: &Palette, connecting: bool) {
     let total = ui.available_width();
     let gap = 12.0;
@@ -595,6 +635,7 @@ fn loading_body(ui: &mut Ui, p: &Palette, connecting: bool) {
     }
 }
 
+/// 显示最近扫描的实际时间。
 fn sync_text(last: Option<Instant>) -> String {
     match last {
         Some(t) => {
@@ -614,11 +655,18 @@ fn sync_text(last: Option<Instant>) -> String {
 /// 空列表页那句"支持范围"文案，从设备总表生成。
 fn supported_summary() -> String {
     let names = |writable: bool| -> Vec<String> {
-        driver::PROFILES
+        let mut out: Vec<String> = Vec::new();
+        for d in driver::PROFILES
             .iter()
             .filter(|d| d.driver.is_some() == writable)
-            .map(display_name)
-            .collect()
+        {
+            let name = display_name(d);
+            // 同一型号的"接收器 / 插线"是两条 profile，但只该念一次。
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
     };
     let mut text = format!("可配置 {}", names(true).join("、"));
     let read_only = names(false);
@@ -654,6 +702,6 @@ mod tests {
         // "RK98" 里已含品牌缩写，不能再叠出 "RK RK98"。
         assert!(!text.contains("RK RK98"));
         assert!(text.contains("可配置 Rapoo VT1 Pro、Logitech Lightspeed 接收器"));
-        assert!(text.contains("AULA F87、RK98 仅识别"));
+        assert!(text.contains("AULA F87、RK98、BY Tech Gaming Keyboard 仅识别"));
     }
 }

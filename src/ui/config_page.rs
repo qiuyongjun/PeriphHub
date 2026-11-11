@@ -2,16 +2,16 @@
 //! separate viewport, so the titlebar keeps its back affordance and the user
 //! never loses the device list.
 
-use eframe::egui::{self, Align, Layout, RichText, Stroke, Ui};
+use eframe::egui::{self, Align, Layout, Margin, RichText, Stroke, Ui, Vec2};
 
 use crate::devices::{Cmd, DeviceInfo, DeviceState, EditorState, Link, Snapshot};
 use crate::driver::Limits;
 use crate::sysinput;
-use crate::theme::{battery_color, battery_label, battery_level, Palette};
+use crate::theme::{battery_color, battery_label, battery_level, battery_text, heading, Palette};
 use crate::ui::widgets::{
     battery_bar, card, chip, chip_small, connection_chip, connection_color, device_tile, divider,
-    dpi_chip, link_action, paint_refresh, primary_button, section_heading, shadow_card, stat,
-    step_button, stepper_row, toggle_row,
+    dpi_chip, link_action, paint_refresh, primary_button, section_heading, shadow_card, split_row,
+    stat, step_button, stepper_row, toggle_row,
 };
 
 #[derive(Default)]
@@ -19,6 +19,7 @@ pub struct ViewAction {
     pub cmds: Vec<Cmd>,
 }
 
+/// 设备摘要和参数分组沿用同一材质，写入行为由原有能力位控制。
 pub fn view(
     ui: &mut Ui,
     p: &Palette,
@@ -32,95 +33,113 @@ pub fn view(
     let writable = info.has_config && !matches!(state.link, Link::Offline(_)) && snap.is_some();
 
     card(ui, p, |ui| {
-        ui.horizontal(|ui| {
-            let letter = info
-                .brand
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "P".into());
-            device_tile(
-                ui,
-                p,
-                info.kind,
-                &letter,
-                connection_color(p, info.connection),
-                40.0,
-            );
-            ui.add_space(2.0);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(info.brand.to_uppercase())
-                        .size(10.0)
-                        .color(p.dim),
-                );
-                ui.label(RichText::new(&info.model).size(17.0).strong().color(p.text));
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        split_row(
+            ui,
+            |ui| {
                 connection_chip(ui, p, info.connection);
                 if info.has_config {
-                    // A quiet text action, not a bordered chip: the header is
-                    // already carrying a tinted connection badge, and a second
-                    // boxed control next to it read as the primary button of
-                    // the page even though it only re-reads the device.
-                    ui.add_space(2.0);
+                    ui.add_space(4.0);
                     if link_action(ui, p, "刷新配置", "重新读取设备上的当前配置", paint_refresh)
                         .clicked()
                     {
                         action.cmds.push(Cmd::Refresh);
                     }
                 }
-            });
-        });
-        ui.add_space(12.0);
+            },
+            |ui| {
+                let letter = info
+                    .brand
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "P".into());
+                device_tile(
+                    ui,
+                    p,
+                    info.kind,
+                    &letter,
+                    connection_color(p, info.connection),
+                    56.0,
+                );
+                ui.add_space(10.0);
+                let title_w = ui.available_width().max(60.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(title_w, 56.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(title_w);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(
+                            RichText::new(info.brand.to_uppercase())
+                                .size(10.5)
+                                .strong()
+                                .color(p.subtle),
+                        );
+                        ui.add(egui::Label::new(heading(&info.model, 22.0, p.text)).truncate())
+                            .on_hover_text(&info.model);
+                    },
+                );
+            },
+        );
+        ui.add_space(16.0);
+        divider(ui, p);
+        ui.add_space(16.0);
         let level = battery_level(state.battery, info.connection.is_wired());
         let color = battery_color(level, p);
-        let battery_text = match state.battery {
-            Some(b) => format!("{b}%"),
-            None if info.connection.is_wired() => "有线".to_string(),
-            None => "--".to_string(),
-        };
-        ui.horizontal(|ui| {
-            stat(ui, p, "电量", &battery_text);
-            if snap.as_ref().is_some_and(|s| s.caps.polling) {
-                ui.add_space(18.0);
-                stat(
-                    ui,
-                    p,
-                    "回报率",
-                    &snap
-                        .as_ref()
-                        .map(|s| format!("{} Hz", 1000 / s.polling_ms.max(1) as u32))
-                        .unwrap_or_else(|| "--".into()),
-                );
-            }
-            if snap.as_ref().is_some_and(|s| s.caps.dpi) {
-                ui.add_space(18.0);
-                stat(
-                    ui,
-                    p,
-                    "当前 DPI",
-                    &snap
-                        .as_ref()
-                        .and_then(|s| s.dpi.get(s.stage_active as usize).copied())
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "--".into()),
-                );
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(battery_label(level)).size(10.5).color(color));
+        let battery_text = battery_text(state.battery, info.connection.is_wired());
+        let has_polling = snap.as_ref().is_some_and(|s| s.caps.polling);
+        let has_dpi = snap.as_ref().is_some_and(|s| s.caps.dpi);
+        egui::Frame::new()
+            .fill(p.inset)
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.columns(1 + has_polling as usize + has_dpi as usize, |cols| {
+                    stat(&mut cols[0], p, "电量", &battery_text);
+                    if has_polling {
+                        stat(
+                            &mut cols[1],
+                            p,
+                            "回报率",
+                            &snap
+                                .as_ref()
+                                .map(|s| format!("{} Hz", 1000 / s.polling_ms.max(1) as u32))
+                                .unwrap_or_else(|| "--".into()),
+                        );
+                    }
+                    if has_dpi {
+                        stat(
+                            &mut cols[1 + has_polling as usize],
+                            p,
+                            "当前 DPI",
+                            &snap
+                                .as_ref()
+                                .and_then(|s| s.dpi.get(s.stage_active as usize).copied())
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "--".into()),
+                        );
+                    }
+                });
+                ui.add_space(12.0);
+                battery_bar(ui, p, state.battery, info.connection.is_wired(), color);
             });
-        });
-        ui.add_space(8.0);
-        battery_bar(ui, p, state.battery, info.connection.is_wired(), color);
-        if info.has_config {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("配置更改会立即写入设备，无需手动保存")
-                    .size(10.0)
-                    .color(p.dim),
-            );
-        }
+        ui.add_space(12.0);
+        split_row(
+            ui,
+            |ui| {
+                ui.label(RichText::new(battery_label(level)).size(11.0).color(color));
+            },
+            |ui| {
+                if info.has_config {
+                    ui.label(
+                        RichText::new("配置更改即时生效 · 无需手动保存")
+                            .size(11.0)
+                            .color(p.dim),
+                    );
+                }
+            },
+        );
     });
 
     // 断开与写入失败不再以文档流通知出现：它们跟着设备状态偶发地插入又
@@ -129,7 +148,7 @@ pub fn view(
     // show_config_page 的浮层提示（toast_overlay），固定悬在页首、不占布局。
     // 只读设备是设备静态属性，恒在或恒不在，留在文档流里是安全的。
     if !info.has_config {
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         notice(
             ui,
             p,
@@ -144,35 +163,36 @@ pub fn view(
         // A read-only device already got the "只读设备" notice above; a second
         // card saying it has no configuration would just repeat it.
         if info.has_config && !matches!(state.link, Link::Offline(_)) {
-            ui.add_space(10.0);
+            ui.add_space(14.0);
             card(ui, p, |ui| {
-                ui.label(RichText::new("正在读取设备配置…").size(13.0).color(p.dim));
+                ui.label(RichText::new("正在读取设备配置…").size(13.5).color(p.dim));
             });
         }
         return action;
     };
 
     if snap.caps.dpi {
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         dpi_card(ui, p, &snap, writable, dpi_baseline, &mut action);
     }
     if snap.caps.polling {
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         polling_card(ui, p, &snap, writable, info.limits.polling, &mut action);
     }
     if snap.caps.sensor {
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         settings_card(ui, p, state, ed, info.limits, writable, &mut action);
     }
     if !snap.caps.polling && !snap.caps.sensor {
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         limited_card(ui, p, &snap);
     }
-    ui.add_space(10.0);
+    ui.add_space(14.0);
     system_card(ui, p);
     action
 }
 
+/// 档位与当前值分层展示，恢复入口仍仅在偏离设备基线时出现。
 fn dpi_card(
     ui: &mut Ui,
     p: &Palette,
@@ -198,30 +218,14 @@ fn dpi_card(
         })
         .unwrap_or_default();
     card(ui, p, |ui| {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                section_heading(
-                    ui,
-                    p,
-                    if stages { "DPI 档位" } else { "DPI" },
-                    if stages {
-                        "点击数值切换档位，使用加减按钮微调当前档位"
-                    } else {
-                        "直接设定鼠标当前灵敏度，写入后立即生效"
-                    },
-                );
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("当前 {current}"))
-                        .size(11.5)
-                        .strong()
-                        .color(p.accent),
-                );
+        split_row(
+            ui,
+            |ui| {
+                ui.label(heading(format!("当前 {current}"), 12.0, p.accent));
                 // 设备离线/只读时这个按钮点了也只会把命令丢进死队列，索性不出现。
                 if !diffs.is_empty() && enabled {
                     ui.add_space(8.0);
-                    if chip_small(ui, p, "恢复初始值", false)
+                    if chip_small(ui, p, "恢复初始值")
                         .on_hover_text("把偏离首次读取值的档位改回原值")
                         .clicked()
                     {
@@ -230,12 +234,28 @@ fn dpi_card(
                         }
                     }
                 }
-            });
-        });
+            },
+            |ui| {
+                ui.vertical(|ui| {
+                    section_heading(
+                        ui,
+                        p,
+                        if stages { "DPI 档位" } else { "DPI" },
+                        if stages {
+                            "点击数值切换档位，使用加减按钮微调当前档位"
+                        } else {
+                            "直接设定鼠标当前灵敏度，写入后立即生效"
+                        },
+                    );
+                });
+            },
+        );
         ui.add_space(12.0);
         ui.add_enabled_ui(enabled, |ui| {
             if stages {
                 ui.horizontal_wrapped(|ui| {
+                    // 折行时两行档位之间要有间距（surface 已把垂直间距清零）。
+                    ui.spacing_mut().item_spacing.y = 8.0;
                     for (i, v) in snap.dpi.iter().enumerate() {
                         let selected = i == active;
                         if dpi_chip(ui, p, *v, selected).clicked() && !selected {
@@ -350,11 +370,12 @@ fn dpi_input(ui: &mut Ui, p: &Palette, stage: u8, current: u16, min: u16, max: u
     let response = ui.add(
         egui::TextEdit::singleline(&mut draft.text)
             .id(id)
-            .desired_width(58.0)
+            .desired_width(76.0)
             .char_limit(5)
+            .font(egui::FontId::proportional(18.0))
             .align(egui::Align2::RIGHT_CENTER)
             .text_color(p.text)
-            .margin(egui::Margin::symmetric(6, 4))
+            .margin(egui::Margin::symmetric(8, 6))
             .hint_text("DPI"),
     );
     if response.changed() {
@@ -384,6 +405,7 @@ fn dpi_input(ui: &mut Ui, p: &Palette, stage: u8, current: u16, min: u16, max: u
     commit
 }
 
+/// 回报率沿用设备提供的有效档位，并用统一选择控件展示。
 fn polling_card(
     ui: &mut Ui,
     p: &Palette,
@@ -431,7 +453,7 @@ fn limited_card(ui: &mut Ui, p: &Palette, snap: &Snapshot) {
             "固件只开放了下面几项，其余参数要改请用官方驱动",
         );
         ui.add_space(10.0);
-        let mut row = |label: &str, yes: bool, note: &str| {
+        let row = |ui: &mut Ui, label: &str, yes: bool, note: &str| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(if yes { "✓" } else { "—" })
@@ -447,13 +469,18 @@ fn limited_card(ui: &mut Ui, p: &Palette, snap: &Snapshot) {
             });
         };
         row(
+            ui,
             "DPI",
             snap.caps.dpi,
             &format!("{}–{}", snap.dpi_min, snap.dpi_max),
         );
-        row("电量", true, "每 20 秒读一次");
-        row("回报率", snap.caps.polling, "固件固定，不可调");
-        row("静默高度 / 防抖 / 休眠", snap.caps.sensor, "未开放");
+        // `surface` 把垂直间距清零了，能力行之间要显式留白。
+        ui.add_space(6.0);
+        row(ui, "电量", true, "每 20 秒读一次");
+        ui.add_space(6.0);
+        row(ui, "回报率", snap.caps.polling, "固件固定，不可调");
+        ui.add_space(6.0);
+        row(ui, "静默高度 / 防抖 / 休眠", snap.caps.sensor, "未开放");
         ui.add_space(6.0);
         setting_note(
             ui,
@@ -619,7 +646,7 @@ fn settings_card(
 /// Small explanatory footnote, used where a whole row of settings shares one
 /// piece of advice.
 fn setting_note(ui: &mut Ui, p: &Palette, text: &str) {
-    ui.label(RichText::new(text).size(10.5).color(p.dim));
+    ui.label(RichText::new(text).size(11.0).color(p.dim));
 }
 
 /// 最近一次写入的系统值及其有效期。系统设置没有 `EditorState` 那样的乐观
@@ -820,12 +847,13 @@ fn notice(ui: &mut Ui, p: &Palette, title: &str, body: &str, color: egui::Color3
     egui::Frame::new()
         .fill(bg)
         .stroke(Stroke::new(1.0, color.gamma_multiply(0.4)))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).size(12.0).strong().color(color));
-            ui.label(RichText::new(body).size(11.0).color(p.dim));
+            ui.label(RichText::new(title).size(12.5).strong().color(color));
+            ui.add_space(2.0);
+            ui.label(RichText::new(body).size(11.5).color(p.dim));
         });
 }
 

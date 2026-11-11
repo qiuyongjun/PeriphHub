@@ -126,6 +126,10 @@ pub trait Driver: Send {
     /// Writes one field and patches `snap` with the value the device reports
     /// back, so the caller never has to re-read the whole configuration.
     fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<(), String>;
+
+    /// 后台轮询失败后，判断 HID 句柄本身是否还有效（设备被拔掉时会失效）。
+    /// 只查句柄，不向设备发命令，用来区分休眠超时与真正断连。
+    fn link_alive(&self) -> bool;
 }
 
 /// Which protocol family a device speaks. Matched on VID/PID because the
@@ -138,17 +142,21 @@ pub enum Kind {
 
 /// HID++ 的板载配置布局。只有经过真机验证的型号才能写扇区；其他型号
 /// 仍可通过 feature discovery 改当前 DPI、读电量，但不碰板载配置。
+///
+/// 只列真正验证过的布局。`DriverSpec::layout` 为 `None` 时驱动按"未验证"
+/// 处理——这不是一条死路径：同一个接收器配对其他鼠标时，运行时也会因为
+/// 型号对不上而降级到同一状态（见 `hidpp::profile_layout_supported`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HidppLayout {
     G304,
-    Generic,
 }
 
 /// 一个协议适配器需要的全部型号差异。
 #[derive(Clone, Copy, Debug)]
 pub struct DriverSpec {
     pub kind: Kind,
-    pub layout: HidppLayout,
+    /// 板载扇区布局；只有 `Kind::Hidpp` 会用到，Rapoo 留 `None`。
+    pub layout: Option<HidppLayout>,
     pub limits: Limits,
 }
 
@@ -229,6 +237,10 @@ pub struct DeviceProfile {
     pub model: &'static str,
     /// 物理形态：首页卡片与配置页头部的图标都取自这里。
     pub kind: DeviceType,
+    /// 这条 profile 是否只在插线时出现。接收器和鼠标都枚举成 USB 设备，
+    /// 光看实例路径分不出"无线接收器"和"有线直连"，所以由型号表声明：
+    /// 同一个鼠标插线和走接收器是两个不同的 PID。
+    pub wired: bool,
     /// `None` = 只读设备：没有可写的厂商通道，只识别不配置。
     pub driver: Option<DriverSpec>,
     /// 只读设备在配置页显示的原因（写给用户看的，不是给日志看的）。
@@ -242,9 +254,27 @@ pub const PROFILES: &[DeviceProfile] = &[
         brand: "Rapoo",
         model: "VT1 Pro",
         kind: DeviceType::Mouse,
+        wired: false,
         driver: Some(DriverSpec {
             kind: Kind::Rapoo,
-            layout: HidppLayout::Generic,
+            layout: None,
+            limits: RAPOO_LIMITS,
+        }),
+        reason: None,
+    },
+    // 同一个鼠标插线后的身份：PID 换成 0x4414，命令通道仍是 0xFF00/0x0E，
+    // 帧格式与接收器完全一致（读 0x0880/0x0884/0x08C0/DPI 表、写块 + 0xA3
+    // 提交都在有线模式下实测通过）。不认这个 PID，插着线时设备会整个消失。
+    DeviceProfile {
+        vid: 0x24AE,
+        pid: 0x4414,
+        brand: "Rapoo",
+        model: "VT1 Pro",
+        kind: DeviceType::Mouse,
+        wired: true,
+        driver: Some(DriverSpec {
+            kind: Kind::Rapoo,
+            layout: None,
             limits: RAPOO_LIMITS,
         }),
         reason: None,
@@ -257,10 +287,11 @@ pub const PROFILES: &[DeviceProfile] = &[
         // 刚插上时只知道是接收器；配对后设备会报出自己的名字，图标随之换成
         // 真实形态（见 `devices::poll`）。
         kind: DeviceType::Receiver,
+        wired: false,
         // 接收器是通用的，布局按 G304 验证；驱动会用设备名再做一次门禁。
         driver: Some(DriverSpec {
             kind: Kind::Hidpp,
-            layout: HidppLayout::G304,
+            layout: Some(HidppLayout::G304),
             limits: G304_LIMITS,
         }),
         reason: None,
@@ -271,22 +302,41 @@ pub const PROFILES: &[DeviceProfile] = &[
         brand: "AULA",
         model: "F87",
         kind: DeviceType::Keyboard,
+        wired: false,
         // Speaks for the keyboard itself, in the user's terms: the old text
         // compared it to another vendor's protocol, which told nobody anything
         // about the device in their hand.
         driver: None,
         reason: Some("能识别到这把键盘，但灯效、按键映射要按厂商私有帧读写，本版本还没接入。"),
     },
+    // 键盘插线后的身份：接收器是 3554:FA09，线连走的是键盘自己的控制器
+    // （258A:010C，BY Tech）。厂商集合是 0xFF00 的 feature 报表，与接收器那套
+    // 20 字节帧不同，所以仍然只读；登记它至少能让有线状态下的键盘出现在列表里。
+    // 排在具体型号之后：首页"支持范围"是按表顺序念的。
     DeviceProfile {
         vid: 0x25A7,
         pid: 0xFA70,
         brand: "RK",
         model: "RK98",
         kind: DeviceType::Keyboard,
+        wired: false,
         driver: None,
         reason: Some(
             "这个 2.4G 接收器只暴露一个可写的命令字节，没有任何应答通道，也没有输出端点，\
              因此只能识别设备，读不到也无法修改键盘参数。",
+        ),
+    },
+    DeviceProfile {
+        vid: 0x258A,
+        pid: 0x010C,
+        brand: "BY Tech",
+        model: "Gaming Keyboard",
+        kind: DeviceType::Keyboard,
+        wired: true,
+        driver: None,
+        reason: Some(
+            "有线模式下键盘换成 BY Tech 自己的控制器，只有 feature 报表、没有可用的应答\
+             通道，协议还没破解。想改灯效或按键，把接收器插上、键盘切到 2.4G 即可。",
         ),
     },
 ];
@@ -344,7 +394,7 @@ mod tests {
         let logitech = profile(0x046D, 0xC53F).expect("Lightspeed profile");
         let spec = logitech.driver.expect("writable");
         assert_eq!(spec.kind, Kind::Hidpp);
-        assert_eq!(spec.layout, HidppLayout::G304);
+        assert_eq!(spec.layout, Some(HidppLayout::G304));
         assert_eq!(spec.limits.dpi, (200, 12000));
 
         assert!(profile(0x25A7, 0xFA70).is_some_and(|p| p.driver.is_none()));
@@ -358,15 +408,32 @@ mod tests {
             Some(DeviceType::Mouse)
         );
         assert_eq!(
+            profile(0x24AE, 0x4414).map(|p| p.kind),
+            Some(DeviceType::Mouse)
+        );
+        assert_eq!(
             profile(0x046D, 0xC53F).map(|p| p.kind),
             Some(DeviceType::Receiver)
         );
-        for (vid, pid) in [(0x3554u16, 0xFA09u16), (0x25A7, 0xFA70)] {
+        for (vid, pid) in [(0x3554u16, 0xFA09u16), (0x25A7, 0xFA70), (0x258A, 0x010C)] {
             assert_eq!(
                 profile(vid, pid).map(|p| p.kind),
                 Some(DeviceType::Keyboard)
             );
         }
+    }
+
+    /// 插线是另一个 PID：不登记它，用户拔掉接收器改用线连时设备会整个从
+    /// 列表里消失（`hid::enumerate` 只保留表里的设备）。
+    #[test]
+    fn wired_variants_are_registered_next_to_the_receiver() {
+        let wireless = profile(0x24AE, 0x1214).expect("2.4G profile");
+        let wired = profile(0x24AE, 0x4414).expect("wired profile");
+        assert!(!wireless.wired);
+        assert!(wired.wired);
+        assert_eq!((wireless.brand, wireless.model), (wired.brand, wired.model));
+        assert!(wired.driver.is_some_and(|s| s.kind == Kind::Rapoo));
+        assert_eq!(wired.driver.map(|s| s.limits), Some(RAPOO_LIMITS));
     }
 
     /// 只有在名字里明确写了形态时才改判，接收器自己报的名字保持原样。

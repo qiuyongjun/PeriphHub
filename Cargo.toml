@@ -1,6 +1,6 @@
 [package]
 name = "periphhub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Windows 桌面外设配置面板：直接通过 USB HID 厂商协议读写鼠标/键盘参数"
 authors = ["qiuyongjun"]

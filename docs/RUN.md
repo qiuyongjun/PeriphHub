@@ -107,7 +107,7 @@ pwsh scripts/package.ps1 -SkipBuild  # 复用已有的 release 构建
 `dist\` 下会生成 `PeriphHub-v<版本>-win-x64.zip`（exe、README、LICENSE、本文件）和
 `SHA256SUMS.txt`。推送 `v*` tag 后，`.github/workflows/release.yml` 会在 Windows runner 上
 运行 `cargo test`、执行同一个打包脚本，并自动创建 GitHub Release 附加 zip 和校验和。
-**tag 必须与 `Cargo.toml` 的 `version` 一致**（如 `v0.1.0` ↔ `0.1.0`），否则工作流直接失败。
+**tag 必须与 `Cargo.toml` 的 `version` 一致**（如 `v0.2.0` ↔ `0.2.0`），否则工作流直接失败。
 
 当前未做代码签名，用户首次运行会看到 SmartScreen“未知发布者”提示；如果以后接入证书，
 在打包脚本之后、创建 Release 之前加一步 `signtool sign /fd SHA256 /tr <时间戳服务> ...` 即可。
@@ -116,7 +116,7 @@ pwsh scripts/package.ps1 -SkipBuild  # 复用已有的 release 构建
 
 ```powershell
 cargo test
-# 24 passed; 1 ignored（hid::dump::dump_devices 是手动导出枚举结果用的）
+# 51 passed; 1 ignored（hid::dump::dump_devices 是手动导出枚举结果用的）
 ```
 
 ---
@@ -198,10 +198,17 @@ cargo test
 
 | 设备 | VID:PID | 能力 |
 | --- | --- | --- |
-| 雷柏 VT1 Pro | `24AE:1214` | 完整读写：DPI 各档位、回报率、静默高度、移动同步、按下/抬起防抖、休眠时间、直线/波纹修正、当前档位、电量 |
+| 雷柏 VT1 Pro（2.4G 接收器） | `24AE:1214` | 完整读写：DPI 各档位、回报率、静默高度、移动同步、按下/抬起防抖、休眠时间、直线/波纹修正、当前档位、电量 |
+| 雷柏 VT1 Pro（插线） | `24AE:4414` | 与接收器完全相同的能力；同一个鼠标插线后换成这个 PID，配置读的是鼠标本体 |
 | 罗技 G304（Lightspeed 接收器） | `046D:C53F` | 5 档 DPI（200–12000，可改可切，写入板载配置）、回报率 125–1000 Hz、电量、设备名 |
 | 狼蛛 F87（含 2.4G 接收器） | `3554:FA09` | 只读：能在列表里看到设备与连接方式，但没有可读写参数 |
 | RK98（含 2.4G 接收器） | `25A7:FA70` | 只读：能识别设备，但连电量都读不到 |
+| 键盘插线时的控制器 | `258A:010C` | 只读：F87/RK98 用线连接后都以 BY Tech 这个控制器出现，只有 feature 报表、没有应答通道，协议未破解（见 `docs/aula-f87.md` §9） |
+
+插线不是"同一个设备换条线"这么简单：鼠标在有线模式下换成另一个 PID（`0x4414`），
+键盘换成 BY Tech 的通用控制器（`258A:010C`）。设备表里用 `DeviceProfile::wired` 区分这两种形态，
+`hid::classify_connection` 按表判定连接方式——只看实例路径的话，接收器和插线设备都是 `USB\` 开头，
+分不出来。
 
 三套协议分别放在 `src/driver/` 下：`rapoo.rs`（32 字节 `0xBA` 帧，EEPROM 读写）、
 `hidpp.rs`（罗技 HID++ 2.0，20 字节 `0x11` 帧）。只读设备没有驱动，只在 `driver::SUPPORTED` 总表里登记（`driver` 字段为 `None`）。
@@ -289,6 +296,22 @@ cargo run --example f87_battery -- --send "13 44 01 00"  # 发任意帧（自动
 
 三个工具的完整输出说明见各自文件头部注释。`probe` 会监听所有 `0xFFxx` 且有输入报表的集合，
 F87 的 20 字节通道和 RK98 的 8 字节通道都能一并看到。
+
+### 7.4 rapoo_selftest —— 雷柏鼠标读写自检
+
+```powershell
+cargo run --example rapoo_selftest
+```
+
+按驱动完全相同的帧序列跑一遍：只读快照（回报率 / LOD / 移动同步 / 档位 / DPI 表 /
+防抖 / 休眠 / 修正位 / 电量）、每个字段"原值写回 + 0xA3 提交 + 回读"、以及一次
+DPI `+100 → 还原` 往返。正常不会留下持久改动；还原失败会明确告警，按提示改回即可。
+
+**跑之前先退出 PeriphHub**：两个程序共享应答缓冲，会互相读到对方的应答。
+
+自检的应答判据与驱动一致：同一地址、同一长度的重复读取允许内容不变，不同地址仍要求
+与上一条不同（`docs/protocol.md` §3.2）。写新工具时别只按"内容必须不同"判断新应答，
+否则写后回读或相同值连读会被自己判成过期而超时。
 
 ---
 

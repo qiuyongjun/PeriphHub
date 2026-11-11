@@ -20,7 +20,7 @@ use crate::ui::{chrome, config_page, home};
 /// Configuration pages stay narrower than the workbench: full-width cards on a
 /// 960px window push a label and its control so far apart that they stop
 /// reading as one row.
-const PAGE_W: f32 = 620.0;
+const PAGE_W: f32 = 680.0;
 
 /// 配置页浮层提示的停留与淡出时长。展示节奏由这里管理，而不是跟随
 /// last_error 的出现/清空——设备侧一条成功消息就会把它清空，直接跟随
@@ -34,8 +34,8 @@ struct ErrToast {
     at: Instant,
 }
 
-const MAIN_SIZE: Vec2 = Vec2::new(960.0, 680.0);
-const MAIN_MIN: Vec2 = Vec2::new(540.0, 480.0);
+const MAIN_SIZE: Vec2 = Vec2::new(1024.0, 720.0);
+const MAIN_MIN: Vec2 = Vec2::new(600.0, 520.0);
 /// Stands in for "no upper bound": winit rejects infinity here.
 const MAIN_MAX: f32 = 16384.0;
 
@@ -76,14 +76,22 @@ pub struct Panel {
     mini_h: f32,
     /// Whether the widget has been placed once this run.
     mini_placed: bool,
+    /// 下一次 `logic` 需要检查浮窗是否长出了屏幕（高度刚变过）。
+    mini_clamp: bool,
     /// 当前外壳的任务栏图标是否已隐藏；`None` 表示还没同步过。
     taskbar_hidden: Option<bool>,
+    /// 窗口当前所在显示器的矩形（点，虚拟桌面绝对坐标）。
+    ///
+    /// egui 只给 `monitor_size`，没有原点；拿尺寸算居中等于假设主屏原点
+    /// 是 (0,0)。浮窗停在副屏时，主窗口会跳到主屏中央而不是留在副屏。
+    monitor_rect: Option<egui::Rect>,
 }
 
 impl Panel {
+    /// 初始化字体、窗口外壳与设备状态，保留既有启动行为。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
-        setup_fonts(ctx);
+        theme::install_fonts(ctx);
         let hwnd = window_shell(cc);
         let mut cfg = config::load();
         // 与 main.rs 的视口创建保持一致：启动即浮窗，不读取上次保存的模式。
@@ -132,6 +140,9 @@ impl Panel {
 
         ctx.request_repaint();
         let applied_theme = Some(cfg.theme);
+        let monitor_rect = cc
+            .winit_window()
+            .and_then(|w| monitor_rect_of(w, ctx.pixels_per_point()));
         let mut panel = Self {
             manager,
             cfg,
@@ -149,7 +160,9 @@ impl Panel {
             hwnd,
             mini_h: 0.0,
             mini_placed: false,
+            mini_clamp: false,
             taskbar_hidden: None,
+            monitor_rect,
         };
         // The viewport builder only knows the mode it was created with; this
         // puts the window into the shell the config actually asks for.
@@ -300,11 +313,11 @@ impl Panel {
     }
 
     /// Where the main window should sit: last time's spot if it is still on
-    /// screen, otherwise centred. Coming back from the widget the window is
-    /// still parked in the corner the widget was in, and growing it there
-    /// would push most of it off the desktop.
+    /// screen, otherwise centred on the monitor the widget currently lives on.
+    /// Coming back from the widget the window is still parked in the corner
+    /// the widget was in, and growing it there would push most of it off the
+    /// desktop.
     fn main_position(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
-        let monitor = ctx.input(|i| i.viewport().monitor_size)?;
         let size = self
             .cfg
             .main_size
@@ -313,7 +326,19 @@ impl Panel {
         // 窗口坐标是跨显示器的绝对坐标，不能拿"当前显示器尺寸"去夹：一块
         // 1920 宽的副屏上的窗口在 x=2000，夹回 [0, 1800] 会把它拽回主屏。
         // 只有整个窗口都跑出虚拟桌面（原来那块屏被拔掉了）才回到中央。
-        let centered = egui::pos2((monitor.x - size.x) / 2.0, (monitor.y - size.y) / 2.0);
+        //
+        // 居中必须带上显示器原点：副屏的原点可能是 (1920, 0) 甚至负数，
+        // 只按尺寸算会把窗口放到主屏中央。拿不到显示器矩形时退回旧算法。
+        let centered = match self.monitor_rect {
+            Some(r) => egui::pos2(
+                r.left() + (r.width() - size.x) / 2.0,
+                r.top() + (r.height() - size.y) / 2.0,
+            ),
+            None => {
+                let monitor = ctx.input(|i| i.viewport().monitor_size)?;
+                egui::pos2((monitor.x - size.x) / 2.0, (monitor.y - size.y) / 2.0)
+            }
+        };
         let Some([x, y]) = self.cfg.main_pos else {
             return Some(centered);
         };
@@ -365,6 +390,9 @@ impl Panel {
                 ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(size));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
                 self.mini_h = h;
+                // 位置是上一次留下的：设备数量可能变过，下一帧按真实窗口
+                // 矩形再校正一次，避免卡片长出屏幕。
+                self.mini_clamp = true;
                 if let Some([x, y]) = self.cfg.mini_pos {
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
                 }
@@ -440,6 +468,36 @@ impl Panel {
         self.taskbar_hidden = Some(hide);
     }
 
+    /// 记住窗口当前在哪块显示器上。`main_position` / `place_mini` 的居中与
+    /// 贴边都要用到显示器原点，而 egui 的 viewport 只给尺寸。
+    fn track_monitor(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        let Some(window) = frame.winit_window() else {
+            return;
+        };
+        if let Some(rect) = monitor_rect_of(window, ctx.pixels_per_point()) {
+            self.monitor_rect = Some(rect);
+        }
+    }
+
+    /// 浮窗按内容长高后，如果底边越过当前显示器就整体上移。
+    ///
+    /// 首次启动时设备列表由后台扫描补齐，卡片会在窗口已经摆好之后才长高；
+    /// 不夹一下，绑定在右下角的浮窗就会往屏幕外长出一截。
+    fn keep_mini_on_screen(&self, ctx: &egui::Context, h: f32) {
+        let Some(area) = self.monitor_rect else {
+            return;
+        };
+        let Some(r) = ctx.input(|i| i.viewport().outer_rect) else {
+            return;
+        };
+        let size = mini::window_size(mini::WIDTH, h);
+        let overflow = (r.top() + size.y) - (area.bottom() - 8.0);
+        if overflow > 0.0 {
+            let y = (r.top() - overflow).max(area.top() + 8.0);
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(r.left(), y)));
+        }
+    }
+
     fn set_pinned(&mut self, ctx: &egui::Context, pinned: bool) {
         self.cfg.mini_pinned = pinned;
         self.save();
@@ -458,13 +516,19 @@ impl Panel {
             self.mini_placed = true;
             return;
         }
-        let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) else {
+        // 和主窗口一样，锚点要带显示器原点：只在主屏右下角摆浮窗，在
+        // 多屏机器上会把它放到离用户当前屏幕很远的地方。
+        let area = self.monitor_rect.or_else(|| {
+            ctx.input(|i| i.viewport().monitor_size)
+                .map(|m| egui::Rect::from_min_size(egui::Pos2::ZERO, m))
+        });
+        let Some(area) = area else {
             return;
         };
         let h = mini::window_size(mini::WIDTH, self.mini_height());
         let pos = egui::pos2(
-            (monitor.x - h.x - MINI_MARGIN).max(MINI_MARGIN),
-            (monitor.y - h.y - MINI_MARGIN * 3.0).max(MINI_MARGIN),
+            (area.right() - h.x - MINI_MARGIN).max(area.left() + MINI_MARGIN),
+            (area.bottom() - h.y - MINI_MARGIN * 3.0).max(area.top() + MINI_MARGIN),
         );
         self.cfg.mini_pos = Some([pos.x, pos.y]);
         self.mini_placed = true;
@@ -642,6 +706,10 @@ impl Panel {
             config_page::toast_overlay(ui, p, title, &body, alpha);
         }
 
+        // 这份状态是帧初的副本；先放掉它，`send` 里的 `Arc::make_mut` 才能
+        // 原地改快照，而不是为了一个字段再复制整份（含 DPI 表）。
+        drop(entry);
+
         if rescan {
             self.do_rescan(ui.ctx());
         }
@@ -653,6 +721,7 @@ impl Panel {
         }
     }
 
+    /// 设置弹层沿用共用色板与字重，应用行为保持原有处理入口。
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -665,13 +734,13 @@ impl Panel {
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
-            .anchor(Align2::RIGHT_TOP, [-16.0, 56.0])
+            .anchor(Align2::RIGHT_TOP, [-20.0, 62.0])
             .frame(
                 egui::Frame::new()
-                    .fill(p.card)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::same(16))
+                    .fill(p.card_top)
+                    .stroke(Stroke::new(1.0, theme::alpha(p.border, 170)))
+                    .corner_radius(CornerRadius::same(CARD_RADIUS))
+                    .inner_margin(Margin::same(22))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 6],
                         blur: 20,
@@ -680,7 +749,7 @@ impl Panel {
                     }),
             )
             .show(ctx, |ui| {
-                ui.set_width(300.0);
+                ui.set_width(320.0);
                 split_row(
                     ui,
                     |ui| {
@@ -689,12 +758,12 @@ impl Panel {
                         }
                     },
                     |ui| {
-                        ui.label(RichText::new("设置").size(14.5).strong().color(p.text));
+                        ui.label(theme::heading("设置", 17.0, p.text));
                     },
                 );
-                ui.add_space(12.0);
+                ui.add_space(14.0);
                 divider(ui, p);
-                ui.add_space(12.0);
+                ui.add_space(14.0);
                 section_heading(ui, p, "外观", "选择更适合当前环境的界面主题");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -734,10 +803,10 @@ impl Panel {
                     |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("桌面浮窗").size(13.0).color(p.text));
+                            ui.label(RichText::new("桌面浮窗").size(13.5).color(p.text));
                             ui.label(
                                 RichText::new("变成小窗常驻桌面，关闭主界面也能看到状态")
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(p.dim),
                             );
                         });
@@ -760,10 +829,10 @@ impl Panel {
                     |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("设备检测").size(13.0).color(p.text));
+                            ui.label(RichText::new("设备检测").size(13.5).color(p.text));
                             ui.label(
                                 RichText::new(format!("当前已发现 {device_count} 台设备"))
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(p.dim),
                             );
                         });
@@ -810,12 +879,12 @@ impl Panel {
                 20,
             ))
             .stroke(Stroke::new(1.0, color.gamma_multiply(0.4)))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(10, 7))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(12, 9))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(msg.as_str()).size(11.0).color(color));
+                    ui.label(RichText::new(msg.as_str()).size(11.5).color(color));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
@@ -882,6 +951,7 @@ impl eframe::App for Panel {
             self.go_mini(ctx);
         }
         self.strip_window_frame();
+        self.track_monitor(frame, ctx);
         self.drain_tray(ctx);
         self.sync_taskbar(frame);
         // 浮窗只读电量；主页摘要 20 秒一刷；配置页才需要 4 秒级全量读，
@@ -899,12 +969,19 @@ impl eframe::App for Panel {
             ctx.request_repaint();
         }
         // "Connecting" status dots breathe; give them frames to breathe in.
+        // 扫描期间也保持短间隔：结果回来得再快，也要有下一帧才能合并进列表。
         let connecting = self
             .manager
             .list()
             .iter()
             .any(|e| matches!(e.state.link, Link::Connecting));
+        let animating = connecting || self.manager.is_scanning();
         if self.cfg.mode == RunMode::Mini {
+            // 上一帧高度变过：这一帧窗口矩形已经更新，再决定要不要上移。
+            if self.mini_clamp {
+                self.mini_clamp = false;
+                self.keep_mini_on_screen(ctx, self.mini_height());
+            }
             self.place_mini(ctx);
             if ctx.input(|i| i.pointer.any_released()) {
                 self.remember_mini_pos(ctx);
@@ -917,14 +994,15 @@ impl eframe::App for Panel {
                 ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(size));
                 ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(size));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                self.mini_clamp = true;
                 self.mini_h = h;
             }
-            ctx.request_repaint_after(if connecting {
+            ctx.request_repaint_after(if animating {
                 Duration::from_millis(140)
             } else {
                 Duration::from_millis(600)
             });
-        } else if connecting {
+        } else if animating {
             ctx.request_repaint_after(Duration::from_millis(120));
         } else {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -994,6 +1072,7 @@ impl Panel {
         }
     }
 
+    /// 统一主窗口留白和页面外壳，导航与浮窗切换沿用原有入口。
     fn desktop_ui(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &'static theme::Palette) {
         let ctx = ctx.clone();
         // Escape unwinds one layer at a time: the settings popover first, then
@@ -1091,10 +1170,10 @@ impl Panel {
 
         egui::Frame::new()
             .inner_margin(Margin {
-                left: 20,
-                right: 20,
-                top: 20,
-                bottom: 14,
+                left: 32,
+                right: 32,
+                top: 28,
+                bottom: 22,
             })
             .show(&mut card_ui, |ui| {
                 self.error_strip(ui, p);
@@ -1119,21 +1198,26 @@ impl Panel {
                                 if let Some(id) = action.open_config {
                                     self.open_config(&id);
                                 }
-                                ui.add_space(18.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("PeriphHub · 2.4G / 蓝牙 / 有线外设统一管理")
-                                            .size(10.0)
-                                            .color(p.dim),
-                                    );
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(24.0);
+                                split_row(
+                                    ui,
+                                    |ui| {
                                         ui.label(
                                             RichText::new("关闭窗口后收起为桌面浮窗")
-                                                .size(10.0)
-                                                .color(p.dim),
+                                                .size(10.5)
+                                                .color(p.subtle),
                                         );
-                                    });
-                                });
+                                    },
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(
+                                                "PeriphHub · 2.4G / 蓝牙 / 有线外设统一管理",
+                                            )
+                                            .size(10.5)
+                                            .color(p.subtle),
+                                        );
+                                    },
+                                );
                             });
                     }
                     Route::Config(id) => self.show_config_page(ui, id, p),
@@ -1149,6 +1233,21 @@ impl Panel {
 /// 鼠标，两者组合后既不会跨设备串值，也不会因换鼠标误用别人的初始档位。
 fn dpi_baseline_key(info: &DeviceInfo) -> String {
     format!("{}|{}", info.id.0, info.model)
+}
+
+/// 窗口当前所在显示器在 egui 坐标里的矩形（含原点）。
+///
+/// winit 给的是物理像素，egui 的窗口坐标是点：按当前缩放换算，和
+/// `virtual_screen` 保持同一套坐标，才能拿它算居中。
+fn monitor_rect_of(window: &winit::window::Window, scale: f32) -> Option<egui::Rect> {
+    let monitor = window.current_monitor()?;
+    let pos = monitor.position();
+    let size = monitor.size();
+    let scale = scale.max(0.1);
+    Some(egui::Rect::from_min_size(
+        egui::pos2(pos.x as f32 / scale, pos.y as f32 / scale),
+        vec2(size.width as f32 / scale, size.height as f32 / scale),
+    ))
 }
 
 /// 整个虚拟桌面（所有显示器合并后的区域），单位与 egui 的窗口坐标一致（点）。
@@ -1291,28 +1390,4 @@ fn is_win11() -> bool {
         .parse::<u32>()
         .map(|build| build >= 22000)
         .unwrap_or(true)
-}
-
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    // 系统盘不一定是 C:，字体目录跟着 %WINDIR% 走。
-    let dir = std::env::var_os("WINDIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("C:/Windows"))
-        .join("Fonts");
-    for name in ["simhei.ttf", "msyh.ttc"] {
-        if let Ok(bytes) = std::fs::read(dir.join(name)) {
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
-            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                f.insert(0, "cjk".to_owned());
-            }
-            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                f.push("cjk".to_owned());
-            }
-            break;
-        }
-    }
-    ctx.set_fonts(fonts);
 }
