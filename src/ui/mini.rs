@@ -13,7 +13,7 @@ use eframe::egui::{
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::theme::{
-    alpha, battery_color, battery_label, battery_level, heading_font, paint_brand, Palette,
+    alpha, battery_color, battery_level, heading_font, paint_brand, Palette,
 };
 use crate::ui::widgets::{
     connection_color, mix, paint_device_glyph, shadow_card, short_model, CARD_RADIUS,
@@ -35,7 +35,6 @@ pub fn window_size(content_w: f32, content_h: f32) -> Vec2 {
 const HEAD_H: f32 = 54.0;
 const LIST_GAP: f32 = 8.0;
 const ROW_H: f32 = 54.0;
-const FOOT_H: f32 = 34.0;
 /// Past this many devices the widget stops growing and scrolls instead, so it
 /// never eats more desktop than it is worth.
 const MAX_ROWS: usize = 5;
@@ -52,28 +51,9 @@ pub struct MiniAction {
 
 /// Exact window height for the current content. `app` compares it against what
 /// the window currently is and only resizes when it really changed.
-pub fn height(devices: usize, attention: usize) -> f32 {
+pub fn height(devices: usize) -> f32 {
     let rows = devices.clamp(1, MAX_ROWS) as f32;
-    let foot = if attention > 0 && devices > 0 {
-        LIST_GAP + FOOT_H
-    } else {
-        0.0
-    };
-    HEAD_H + LIST_GAP + rows * ROW_H + foot + 10.0
-}
-
-/// 与工作台共用离线和低电量的关注规则。
-fn needs_attention(entry: &Entry) -> bool {
-    matches!(entry.state.link, Link::Offline(_))
-        || matches!(
-            battery_level(entry.state.battery, entry.info.connection.is_wired()),
-            crate::theme::BatteryLevel::Critical | crate::theme::BatteryLevel::Low
-        )
-}
-
-/// 关注数量参与浮窗尺寸计算。
-pub fn attention_count(manager: &DeviceManager) -> usize {
-    manager.list().iter().filter(|e| needs_attention(e)).count()
+    HEAD_H + LIST_GAP + rows * ROW_H + 10.0
 }
 
 /// 紧凑浮窗用双行身份和设备图标保持可读性，沿用原有动作。
@@ -88,7 +68,6 @@ pub fn view(
     let window = ui.ctx().content_rect();
     let card = window.shrink(SHADOW_PAD);
     let entries = manager.list();
-    let attention = entries.iter().filter(|e| needs_attention(e)).count();
     let online = entries
         .iter()
         .filter(|e| !matches!(e.state.link, Link::Offline(_)))
@@ -108,15 +87,7 @@ pub fn view(
     body.set_clip_rect(card);
     body.spacing_mut().item_spacing = Vec2::ZERO;
 
-    header(
-        &mut body,
-        p,
-        &mut action,
-        pinned,
-        online,
-        entries.len(),
-        attention,
-    );
+    header(&mut body, p, &mut action, pinned, online, entries.len());
     body.add_space(LIST_GAP);
 
     let list_h = entries.len().clamp(1, MAX_ROWS) as f32 * ROW_H;
@@ -145,11 +116,6 @@ pub fn view(
         }
     }
 
-    if attention > 0 && !entries.is_empty() {
-        body.add_space(LIST_GAP);
-        footer(&mut body, p, &mut action, attention);
-    }
-
     action
 }
 
@@ -172,7 +138,6 @@ fn header(
     pinned: bool,
     online: usize,
     total: usize,
-    attention: usize,
 ) {
     let width = body.available_width();
     let (rect, _) = body.allocate_exact_size(Vec2::new(width, HEAD_H), Sense::hover());
@@ -248,8 +213,6 @@ fn header(
     );
     let (dot_color, summary, summary_color) = if total == 0 {
         (p.dim, "无设备".to_string(), p.dim)
-    } else if attention > 0 {
-        (p.warn, format!("{attention} 项需关注"), p.warn)
     } else {
         (p.ok, format!("{online}/{total} 在线"), p.subtle)
     };
@@ -384,25 +347,18 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         title_col,
     );
 
-    // Second line: what the device is when all is well, what is wrong when it
-    // is not. A low battery is more urgent than the link type.
-    let (note, note_color) = match &entry.state.link {
-        Link::Offline(_) => ("断开连接，点击查看".to_string(), p.dim),
-        Link::Connecting => ("正在建立连接".to_string(), p.dim),
-        Link::Online => match level {
-            crate::theme::BatteryLevel::Critical | crate::theme::BatteryLevel::Low => {
-                (battery_label(level).to_string(), value_color)
-            }
-            _ => (
-                format!(
-                    "{} · {}",
-                    entry.info.brand.to_uppercase(),
-                    entry.info.connection.label()
-                ),
-                p.dim,
-            ),
-        },
+    // 第二行只描述"设备是什么/连得上吗"。电量状态不在这里重复：百分比
+    // 已经用颜色和进度条表达过一次，再写一行"电量低"就是第三种说法。
+    let note = match &entry.state.link {
+        Link::Offline(_) => "断开连接，点击查看".to_string(),
+        Link::Connecting => "正在建立连接".to_string(),
+        Link::Online => format!(
+            "{} · {}",
+            entry.info.brand.to_uppercase(),
+            entry.info.connection.label()
+        ),
     };
+    let note_color = p.dim;
     let has_gauge = matches!(entry.state.link, Link::Online) && entry.state.battery.is_some();
     let note = ellipsize(
         painter,
@@ -492,55 +448,6 @@ fn empty_row(
     }
 }
 
-/// 关注提示只在需要时出现，不改变正常浮窗的高度。
-fn footer(body: &mut Ui, p: &Palette, action: &mut MiniAction, attention: usize) {
-    let width = body.available_width();
-    let (rect, resp) = body.allocate_exact_size(Vec2::new(width, FOOT_H), Sense::click());
-    let hover =
-        body.ctx()
-            .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
-    let painter = body.painter();
-    painter.rect_filled(
-        Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), 1.0)),
-        0,
-        alpha(p.border, 170),
-    );
-    if hover > 0.001 {
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(rect.left(), rect.top() + 1.0),
-                rect.right_bottom(),
-            ),
-            CornerRadius::same(10),
-            alpha(p.chip_bg, (hover * 215.0) as u8),
-        );
-    }
-    painter.circle_filled(
-        Pos2::new(rect.left() + 6.0, rect.center().y + 0.5),
-        2.8,
-        p.warn,
-    );
-    painter.text(
-        Pos2::new(rect.left() + 15.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        format!("{attention} 台设备需要关注"),
-        FontId::proportional(11.0),
-        mix(p.dim, p.text, hover * 0.7),
-    );
-    painter.text(
-        Pos2::new(rect.right() - 12.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        "查看",
-        FontId::proportional(11.0),
-        mix(p.dim, p.text, hover),
-    );
-    if resp.hovered() {
-        body.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if resp.clicked() {
-        action.open_main = true;
-    }
-}
 
 /// 置顶状态用轻微色彩标识，所有工具保持一致的触达面积。
 fn icon_button(

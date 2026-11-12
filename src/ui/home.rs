@@ -8,7 +8,7 @@ use eframe::egui::{
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::driver::{self, DeviceProfile};
 use crate::theme::{
-    battery_color, battery_label, battery_level, battery_text, brand_badge, heading, Palette,
+    alpha, battery_color, battery_level, battery_text, brand_badge, heading, text, Palette,
 };
 use crate::ui::widgets::{
     action_link, connection_chip_colored, connection_color, device_tile, hairline, metric_col, mix,
@@ -18,9 +18,12 @@ use crate::ui::widgets::{
 
 /// Height of a device card's body block; every variant pads to it so cards in
 /// the same row keep their feet on one line.
-const BODY_H: f32 = 60.0;
+///
+/// 指标只剩"标签 + 数值"两行（约 45）时，这里必须跟着收：固定 60 会在数值
+/// 和分隔线之间留出一段谁也用不上的空白。
+const BODY_H: f32 = 46.0;
 /// Inner content height of every device card: header + body + rule + footer.
-const CARD_H: f32 = 174.0;
+const CARD_H: f32 = 158.0;
 /// Side of the letter tile in card headers. The title block must reserve the
 /// same height, or egui centers a zero-height rect on the row's midline and
 /// the two text lines hang below the tile (they did: ~14px too low).
@@ -48,24 +51,14 @@ pub fn view(
         .iter()
         .filter(|e| !matches!(e.state.link, Link::Offline(_)))
         .count();
-    let attention = entries
-        .iter()
-        .filter(|e| {
-            matches!(e.state.link, Link::Offline(_))
-                || matches!(
-                    battery_level(e.state.battery, e.info.connection.is_wired()),
-                    crate::theme::BatteryLevel::Critical | crate::theme::BatteryLevel::Low
-                )
-        })
-        .count();
 
     header(ui, p, &mut action, recently_scanned);
     ui.add_space(18.0);
-    hairline(ui, p, 255);
+    hairline(ui, p, 165);
     ui.add_space(14.0);
-    overview(ui, p, total, online, attention);
+    overview(ui, p, total, online);
     ui.add_space(14.0);
-    hairline(ui, p, 255);
+    hairline(ui, p, 165);
     ui.add_space(24.0);
 
     split_row(
@@ -74,13 +67,13 @@ pub fn view(
             status_dot(ui, p.ok, false);
             ui.label(
                 RichText::new(sync_text(last_scan))
-                    .size(11.0)
+                    .size(12.0)
                     .color(p.subtle),
             );
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new("我的设备").size(13.5).color(p.text));
+            ui.label(RichText::new("我的设备").size(13.0).color(p.text));
             pill(ui, p, &format!("{total} 台"), p.dim);
             if manager.is_demo() {
                 pill(ui, p, "演示数据", p.info);
@@ -144,9 +137,7 @@ fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: b
                 p,
                 label,
                 &format!("重新检测已连接的外设（{RESCAN_HINT}）"),
-            )
-            .clicked()
-            {
+            ) {
                 action.rescan = true;
             }
         },
@@ -156,15 +147,15 @@ fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: b
                 ui.label(
                     RichText::new("PERIPHHUB  /  WORKSPACE")
                         .size(11.0)
-                        .extra_letter_spacing(1.2)
+                        .extra_letter_spacing(0.9)
                         .color(p.subtle),
                 );
                 ui.add_space(6.0);
-                ui.label(heading("设备工作台", 24.0, p.text));
+                ui.label(heading("设备工作台", text::TITLE, p.text));
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("连接、状态与性能，一处掌控")
-                        .size(11.5)
+                        .size(12.0)
                         .color(p.dim),
                 );
             });
@@ -173,9 +164,12 @@ fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: b
 }
 
 /// 概览共享一块表面，均分宽度避免状态数字挤在左侧。
-fn overview(ui: &mut Ui, p: &Palette, total: usize, online: usize, attention: usize) {
+///
+/// 只有"总数 / 在线"两项：设备名对不上、电量读不到都是常态，把它们
+/// 归成"需要关注"会让首屏长期挂着一个黄色数字，提醒久了就是噪声。
+fn overview(ui: &mut Ui, p: &Palette, total: usize, online: usize) {
     let gap = 20.0;
-    let cell_w = (ui.available_width() - 2.0 - gap * 4.0) / 3.0;
+    let cell_w = (ui.available_width() - 1.0 - gap * 2.0) / 2.0;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         stat_cell(ui, p, cell_w, &total.to_string(), "台", "设备总数", p.text);
@@ -190,18 +184,6 @@ fn overview(ui: &mut Ui, p: &Palette, total: usize, online: usize, attention: us
             "台",
             "当前在线",
             if online == 0 { p.dim } else { p.ok },
-        );
-        ui.add_space(gap);
-        vrule(ui, p, 4.0, 34.0);
-        ui.add_space(gap);
-        stat_cell(
-            ui,
-            p,
-            cell_w,
-            &attention.to_string(),
-            "项",
-            "需要关注",
-            if attention == 0 { p.dim } else { p.warn },
         );
     });
 }
@@ -219,11 +201,11 @@ fn stat_cell(
     ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(label).size(11.0).color(p.dim));
+        ui.label(RichText::new(label).size(12.0).color(p.dim));
         ui.add_space(3.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(heading(value, 22.0, color));
+            ui.label(heading(value, text::HEADING, color));
             ui.add_space(2.0);
             ui.label(RichText::new(unit).size(11.0).color(p.dim));
         });
@@ -248,25 +230,23 @@ fn empty_state(ui: &mut Ui, p: &Palette, action: &mut HomeAction, scanning: bool
                     "请连接设备、接收器或 USB 数据线，然后重新扫描",
                 )
             };
-            ui.label(heading(title, 18.0, p.text));
+            ui.label(heading(title, text::HEADING, p.text));
             ui.add_space(7.0);
-            ui.label(RichText::new(note).size(12.5).color(p.dim));
+            ui.label(RichText::new(note).size(12.0).color(p.dim));
             if !scanning {
                 ui.add_space(4.0);
                 // 诚实说明支持范围：未知 VID/PID 的设备在 enumerate 里被整个
                 // 过滤掉了，用户手里的鼠标不在支持列表时，看到"未发现设备"
                 // 最容易得出的结论是程序坏了，而不是型号不支持。文案从设备
                 // 总表生成（见 supported_summary），新增型号不会漏改这里。
-                ui.label(RichText::new(supported_summary()).size(11.5).color(p.dim));
+                ui.label(RichText::new(supported_summary()).size(12.0).color(p.dim));
                 ui.add_space(20.0);
                 if primary_button(
                     ui,
                     p,
                     "扫描设备",
                     &format!("重新检测已连接的外设（{RESCAN_HINT}）"),
-                )
-                .clicked()
-                {
+                ) {
                     action.rescan = true;
                 }
             }
@@ -346,7 +326,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                             egui::Label::new(
                                 RichText::new(entry.info.brand.to_uppercase())
                                     .size(11.0)
-                                    .extra_letter_spacing(0.6)
+                                    .extra_letter_spacing(0.7)
                                     .color(p.subtle),
                             )
                             .truncate(),
@@ -354,7 +334,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                         let full = entry.info.model.as_str();
                         let title = short_model(full);
                         let label =
-                            ui.add(egui::Label::new(heading(title, 15.5, text_col)).truncate());
+                            ui.add(egui::Label::new(heading(title, text::SUBTITLE, text_col)).truncate());
                         // The shortened title is a convenience; the device's
                         // own name stays one hover away.
                         if title != full {
@@ -368,7 +348,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                 });
             });
             ui.add_space(12.0);
-            hairline(ui, p, 255);
+            hairline(ui, p, 165);
             ui.add_space(12.0);
 
             let body_top = ui.cursor().top();
@@ -393,7 +373,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
             }
 
             ui.add_space(12.0);
-            hairline(ui, p, 255);
+            hairline(ui, p, 165);
             ui.add_space(9.0);
 
             split_row(
@@ -426,7 +406,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(text)
-                            .size(11.0)
+                            .size(12.0)
                             .color(if offline || connecting {
                                 status_color
                             } else {
@@ -449,11 +429,19 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
         ui.ctx()
             .animate_value_with_time(card_id, if response.hovered() { 1.0 } else { 0.0 }, 0.10);
     if t > 0.001 {
-        let col = mix(p.border, p.accent, t * 0.55);
+        let col = mix(p.border, p.accent, t * 0.42);
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(CARD_RADIUS),
             Stroke::new(1.0, col),
+            StrokeKind::Inside,
+        );
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(CARD_RADIUS),
+            Stroke::new(2.0, alpha(p.accent, 130)),
             StrokeKind::Inside,
         );
     }
@@ -485,17 +473,6 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
     let dpi_text = current
         .map(|v| v.to_string())
         .unwrap_or_else(|| "--".into());
-    let stage_note = if !snap.caps.dpi {
-        "固件未开放".to_string()
-    } else if snap.stage_count > 1 {
-        format!(
-            "第 {} / {} 档",
-            snap.stage_active + 1,
-            snap.stage_count.max(1)
-        )
-    } else {
-        "单档".to_string()
-    };
     let hz = 1000 / snap.polling_ms.max(1) as u32;
 
     // Only the columns this device can actually fill; a fixed "1000 Hz" on a
@@ -504,7 +481,6 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
         label: &'a str,
         value: String,
         unit: &'a str,
-        note: String,
         color: egui::Color32,
         tip: &'a str,
     }
@@ -514,7 +490,6 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
             label: "电量",
             value: battery_text,
             unit: battery_unit,
-            note: battery_label(level).to_string(),
             color: if offline { p.dim } else { color },
             // 插线时设备照样报电量（而且多半在充电），所以提示只能看这一轮
             // 到底有没有读数，不能只看连接方式——否则会出现"71%"配一句
@@ -529,7 +504,6 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
             label: "当前 DPI",
             value: dpi_text,
             unit: "",
-            note: stage_note,
             color: if current.is_some() { value_col } else { p.dim },
             tip: "鼠标灵敏度，数值越高指针移动越快",
         }),
@@ -537,7 +511,6 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
             label: "回报率",
             value: hz.to_string(),
             unit: "Hz",
-            note: format!("{} ms 间隔", snap.polling_ms.max(1)),
             color: value_col,
             tip: "每秒向电脑上报位置的次数，越高越跟手",
         }),
@@ -559,9 +532,7 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
                 vrule(ui, p, 4.0, 38.0);
                 ui.add_space(gap);
             }
-            metric_col(
-                ui, p, col_w, c.label, &c.value, c.unit, &c.note, c.color, c.tip,
-            );
+            metric_col(ui, p, col_w, c.label, &c.value, c.unit, c.color, c.tip);
         }
     });
 }
@@ -571,10 +542,10 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
 fn read_only_body(ui: &mut Ui, p: &Palette, reason: Option<&str>) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
-        ui.label(RichText::new("只读设备").size(11.5).color(p.text));
+        ui.label(RichText::new("只读设备").size(12.0).color(p.text));
         ui.label(
             RichText::new(reason.unwrap_or("未检测到厂商配置接口，仅显示连接状态"))
-                .size(11.0)
+                .size(12.0)
                 .color(p.dim),
         );
     });

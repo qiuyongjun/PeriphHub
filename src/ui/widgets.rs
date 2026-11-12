@@ -7,7 +7,9 @@ use eframe::egui::{
 
 use crate::driver::DeviceType;
 use crate::hid::ConnectionType;
-use crate::theme::{alpha, card_shadow, heading, heading_font, Palette};
+use crate::theme::{
+    alpha, body, card_shadow, ctl, heading, heading_font, meta, micro, text, Palette,
+};
 
 /// Shortcut shown in rescan tooltips; must match the binding in `app.rs`.
 pub const RESCAN_HINT: &str = "F5 或 Ctrl+R";
@@ -113,6 +115,87 @@ pub fn card<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
     surface(ui, p, Margin::same(18), add).inner
 }
 
+/// 键盘焦点环：只画在控件内侧，不改变布局，也不和悬停描边抢位置。
+/// 自绘控件（档位、步进、开关、主按钮）要把自己注册进 Tab 顺序才有这个环。
+/// 是否处于"键盘导航"状态：只有用键盘移动焦点时才画焦点环。
+///
+/// 鼠标点过的控件同样会拿到焦点（egui 的默认行为）。如果照画不误，点一下
+/// 已经选中的档位按钮，就会在它的 1px 描边外面再套一圈 2px 蓝环——看起来
+/// 像按钮被套了两层边框。Windows / macOS 的通行做法是只在键盘导航时显示
+/// 焦点指示（focus-visible），鼠标操作不显示。
+fn keyboard_nav(ui: &Ui) -> bool {
+    let ctx = ui.ctx();
+    let frame = ctx.cumulative_frame_nr();
+    let id = egui::Id::new("ph-keyboard-nav");
+    let (last, mode) = ctx
+        .data(|d| d.get_temp::<(u64, bool)>(id))
+        .unwrap_or((0, false));
+    if last == frame {
+        return mode; // 同一帧里多个控件调用，只算一次
+    }
+    let key_moved = ctx.input(|i| {
+        [
+            egui::Key::Tab,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+        ]
+        .iter()
+        .any(|k| i.key_pressed(*k))
+    });
+    let clicked = ctx.input(|i| i.pointer.any_click());
+    let mode = if key_moved {
+        true
+    } else if clicked {
+        false
+    } else {
+        mode
+    };
+    ctx.data_mut(|d| d.insert_temp(id, (frame, mode)));
+    mode
+}
+
+/// 键盘焦点环：偏移在控件**外侧**，中间留一圈底色。
+///
+/// 以前画在内侧，2px 环紧贴控件自己的 1px 描边，就成了"深蓝边 + 浅蓝边"
+/// 两道；即使挪到外侧，只要还贴着也是两层。所以既要外置、也要留缝。
+pub fn focus_ring(ui: &Ui, rect: Rect, p: &Palette, radius: u8) {
+    if !keyboard_nav(ui) {
+        return;
+    }
+    ui.painter().rect_stroke(
+        rect.expand(3.0),
+        CornerRadius::same(radius.saturating_add(3)),
+        Stroke::new(1.5, alpha(p.accent, 130)),
+        egui::StrokeKind::Middle,
+    );
+}
+
+/// 自绘控件不经过 egui 的 Button，禁用态不会自动压暗——只是点不动，
+/// 看起来仍然可点。所有自绘颜色都要过一遍这个函数。
+fn faded(c: Color32, enabled: bool) -> Color32 {
+    if enabled {
+        c
+    } else {
+        c.gamma_multiply(0.45)
+    }
+}
+
+/// 返回"这次是否被键盘激活"。焦点本身由 egui 按 `Sense` 自动分配（`click()`
+/// 带 FOCUSABLE），这里只负责把回车/空格翻译成一次点击，并在点击后把焦点
+/// 留在控件上——否则键盘用户点过一次就丢失当前位置。
+fn keyboard_activated(ui: &mut Ui, resp: &Response) -> bool {
+    let focused = resp.has_focus();
+    if resp.clicked() {
+        resp.request_focus();
+    }
+    focused
+        && ui.input(|i| {
+            i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter)
+        })
+}
+
 /// 档位选择采用浅色填充与清晰描边，保留主要按钮的视觉优先级。
 pub fn chip(ui: &mut Ui, p: &Palette, text: &str, selected: bool) -> Response {
     let (fill, fg, stroke) = if selected {
@@ -125,22 +208,25 @@ pub fn chip(ui: &mut Ui, p: &Palette, text: &str, selected: bool) -> Response {
         (Color32::TRANSPARENT, p.dim, Stroke::new(1.0, p.border))
     };
     let resp = ui.add(
-        egui::Button::new(RichText::new(text).size(12.5).color(fg))
+        egui::Button::new(RichText::new(text).size(text::BODY).color(fg))
             .fill(fill)
             .stroke(stroke)
-            .corner_radius(CornerRadius::same(8))
-            .min_size(Vec2::new(54.0, 32.0)),
+            .corner_radius(CornerRadius::same(ctl::RADIUS))
+            .min_size(Vec2::new(54.0, ctl::H)),
     );
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         if !selected {
             ui.painter().rect_stroke(
                 resp.rect,
-                CornerRadius::same(8),
+                CornerRadius::same(ctl::RADIUS),
                 Stroke::new(1.0, alpha(p.accent, 130)),
                 egui::StrokeKind::Inside,
             );
         }
+    }
+    if resp.has_focus() {
+        focus_ring(ui, resp.rect, p, ctl::RADIUS);
     }
     resp
 }
@@ -149,85 +235,132 @@ pub fn chip(ui: &mut Ui, p: &Palette, text: &str, selected: bool) -> Response {
 /// `chip` 小一号的尺寸：字号和高度都跟着头部小字对齐，不喧宾夺主。
 pub fn chip_small(ui: &mut Ui, p: &Palette, text: &str) -> Response {
     let resp = ui.add(
-        egui::Button::new(RichText::new(text).size(11.5).color(p.text))
+        egui::Button::new(meta(text, p.text))
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(6))
-            .min_size(Vec2::new(0.0, 22.0)),
+            .corner_radius(CornerRadius::same(ctl::RADIUS_SM))
+            .min_size(Vec2::new(0.0, ctl::H_SM)),
     );
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().rect_stroke(
             resp.rect,
-            CornerRadius::same(6),
+            CornerRadius::same(ctl::RADIUS_SM),
             Stroke::new(1.0, alpha(p.accent, 120)),
             egui::StrokeKind::Inside,
         );
+    }
+    if resp.has_focus() {
+        focus_ring(ui, resp.rect, p, ctl::RADIUS_SM);
     }
     resp
 }
 
 /// DPI 按钮保持固定宽度，数值变化不引起重排；描边与色彩共同标识当前档。
-pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> Response {
-    let (fill, fg, stroke) = if selected {
-        (
-            mix(p.chip_bg, p.accent, if p.dark { 0.16 } else { 0.10 }),
-            p.accent,
-            Stroke::new(1.0, alpha(p.accent, 190)),
-        )
-    } else {
-        (Color32::TRANSPARENT, p.dim, Stroke::new(1.0, p.border))
-    };
+/// 返回"这次是否被激活"：鼠标点击与键盘回车/空格同等对待。
+pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> bool {
+    let size = Vec2::new(62.0, ctl::H);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let by_key = keyboard_activated(ui, &resp);
+    let focused = resp.has_focus();
+    let t = ui
+        .ctx()
+        .animate_value_with_time(resp.id.with("hover"), if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
+
+    let en = ui.is_enabled();
+    let fg = faded(
+        if selected {
+            p.accent
+        } else {
+            mix(p.dim, p.text, t * 0.75)
+        },
+        en,
+    );
     let galley = ui
         .painter()
-        .layout_no_wrap(value.to_string(), heading_font(13.0), fg);
-    let size = Vec2::new(62.0, 32.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        .layout_no_wrap(value.to_string(), heading_font(14.0), fg);
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(8), fill);
+    let fill = if selected {
+        mix(p.chip_bg, p.accent, if p.dark { 0.16 } else { 0.10 })
+    } else {
+        alpha(p.chip_bg, (t * 170.0) as u8)
+    };
+    painter.rect_filled(rect, CornerRadius::same(ctl::RADIUS), faded(fill, en));
     painter.rect_stroke(
         rect,
-        CornerRadius::same(8),
-        stroke,
+        CornerRadius::same(ctl::RADIUS),
+        Stroke::new(
+            1.0,
+            faded(if selected { alpha(p.accent, 190) } else { p.border }, en),
+        ),
         egui::StrokeKind::Inside,
     );
+    // 悬停时叠一圈 accent，而不是直接替换描边色：淡入过程中不会闪一下白边。
+    if t > 0.01 && !selected {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(ctl::RADIUS),
+            Stroke::new(1.0, alpha(p.accent, (t * 150.0) as u8)),
+            egui::StrokeKind::Inside,
+        );
+    }
     painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
+    if focused {
+        focus_ring(ui, rect, p, ctl::RADIUS);
+    }
+    let clicked = resp.clicked();
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        if !selected {
-            ui.painter().rect_stroke(
-                rect,
-                CornerRadius::same(8),
-                Stroke::new(1.0, alpha(p.accent, 150)),
-                egui::StrokeKind::Inside,
-            );
-        }
-        resp.on_hover_text(format!("{value} DPI"))
-    } else {
-        resp
+        resp.on_hover_text(format!("{value} DPI"));
     }
+    clicked || by_key
 }
 
 /// Fires immediately on press, then auto-repeats while the button is held,
 /// so users do not have to click dozens of times to cross a wide range.
-pub fn step_button(ui: &mut Ui, p: &Palette, label: &str, tip: &str) -> bool {
-    let resp = ui.add(
-        egui::Button::new(RichText::new(label).size(15.0).color(p.text))
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(7))
-            .min_size(Vec2::new(28.0, 28.0)),
-    );
-    if resp.hovered() {
-        ui.painter().rect_stroke(
-            resp.rect,
-            CornerRadius::same(7),
-            Stroke::new(1.0, alpha(p.accent, 130)),
-            egui::StrokeKind::Inside,
+///
+/// 加减号是画出来的两段线，不再用字体里的 `+` / `−`：符号字符随字体基线
+/// 落位，26px 的方框里会偏上 1px，而且笔画粗细跟旁边的箭头对不上。
+pub fn step_button(ui: &mut Ui, p: &Palette, plus: bool, tip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let by_key = keyboard_activated(ui, &resp);
+    let focused = resp.has_focus();
+    let t = ui
+        .ctx()
+        .animate_value_with_time(resp.id.with("hover"), if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
+    let en = ui.is_enabled();
+    let painter = ui.painter();
+    if t > 0.01 {
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(ctl::RADIUS_SM),
+            alpha(p.chip_bg, (t * 235.0) as u8),
         );
     }
-    let fired = hold_repeat(ui, resp.id, &resp);
-    if fired {
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(ctl::RADIUS_SM),
+        Stroke::new(1.0, faded(mix(p.border, p.accent, t * 0.55), en)),
+        egui::StrokeKind::Inside,
+    );
+    let c = rect.center();
+    let stroke = Stroke::new(1.5, faded(mix(p.dim, p.text, 0.45 + t * 0.55), en));
+    let arm = 4.4;
+    painter.line_segment(
+        [egui::pos2(c.x - arm, c.y), egui::pos2(c.x + arm, c.y)],
+        stroke,
+    );
+    if plus {
+        painter.line_segment(
+            [egui::pos2(c.x, c.y - arm), egui::pos2(c.x, c.y + arm)],
+            stroke,
+        );
+    }
+    if focused {
+        focus_ring(ui, rect, p, ctl::RADIUS_SM);
+    }
+    let fired = hold_repeat(ui, resp.id, &resp) || by_key;
+    if fired || resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp.on_hover_text(tip);
@@ -467,6 +600,10 @@ pub fn paint_device_glyph(
 /// Label / value / note stack. Bare columns read faster than boxed tiles and
 /// scale down better. No magnitude bar: DPI and polling rate have no ceiling
 /// to fill, so a bar only implied a ratio that does not exist.
+///
+/// 数值字号固定：以前按列宽在 15–19 之间自适应，同一排三个指标会因为数字宽度
+/// 不同而出现三种字号，整行看起来像没对齐。18 号在 340px 卡片的三列里放得下
+/// 五位数，溢出交给 `truncate`，不靠缩字号救。
 #[allow(clippy::too_many_arguments)]
 pub fn metric_col(
     ui: &mut Ui,
@@ -475,7 +612,6 @@ pub fn metric_col(
     label: &str,
     value: &str,
     unit: &str,
-    note: &str,
     value_color: Color32,
     tip: &str,
 ) {
@@ -484,33 +620,16 @@ pub fn metric_col(
             ui.set_width(width);
             // Default row spacing would double every gap below.
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add(egui::Label::new(RichText::new(label).size(11.0).color(p.dim)).truncate());
+            ui.add(egui::Label::new(meta(label, p.dim)).truncate());
             ui.add_space(5.0);
-            let val_w = ui
-                .painter()
-                .layout_no_wrap(value.to_owned(), heading_font(19.0), value_color)
-                .size()
-                .x;
-            let gap = if unit.is_empty() { 0.0 } else { 3.0 };
-            let unit_w = if unit.is_empty() {
-                0.0
-            } else {
-                ui.painter()
-                    .layout_no_wrap(unit.to_owned(), FontId::proportional(11.0), p.dim)
-                    .size()
-                    .x
-            };
-            let font_size = (19.0 * width / (val_w + gap + unit_w).max(1.0)).clamp(15.0, 19.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add(egui::Label::new(heading(value, font_size, value_color)).truncate());
+                ui.add(egui::Label::new(heading(value, text::METRIC, value_color)).truncate());
                 if !unit.is_empty() {
                     ui.add_space(3.0);
-                    ui.label(RichText::new(unit).size(11.0).color(p.dim));
+                    ui.label(micro(unit, p.dim));
                 }
             });
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(note).size(11.0).color(p.subtle)).truncate());
         });
     if !tip.is_empty() {
         out.response.on_hover_text(tip);
@@ -544,51 +663,62 @@ pub fn vrule(ui: &mut Ui, p: &Palette, top: f32, height: f32) {
         egui::pos2(rect.left(), rect.top() + top),
         Vec2::new(1.0, height),
     );
-    ui.painter().rect_filled(line, 0, alpha(p.border, 200));
+    ui.painter().rect_filled(line, 0, alpha(p.border, 170));
 }
 
 /// The one filled button in the app. 深色下用近白填充，浅色下用强调色：
 /// 强调色保留给链接与选中态，主按钮靠明度对比脱颖而出。
-pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> Response {
+pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> bool {
     let (fill, ink) = if p.dark {
         (p.text, p.bg)
     } else {
         (p.accent, p.on_accent)
     };
+    // 颜色先压暗再排版：galley 里存的是当时的颜色，事后再 faded 只改得了图标。
+    let en = ui.is_enabled();
+    let (fill, ink) = (faded(fill, en), faded(ink, en));
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), heading_font(12.5), ink);
-    let size = Vec2::new(galley.size().x + 44.0, 36.0);
+        .layout_no_wrap(text.to_owned(), heading_font(text::BODY), ink);
+    let size = Vec2::new(galley.size().x + 44.0, ctl::H_BTN);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let by_key = keyboard_activated(ui, &resp);
+    let focused = resp.has_focus();
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
+    // 按下时只让内容下沉 1px，底不跟着动：整块位移会像窗口抖了一下。
+    let shift = if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 };
     let painter = ui.painter();
-    let fill = mix(fill, p.accent, t * if p.dark { 0.16 } else { 0.10 });
-    painter.rect_filled(rect, CornerRadius::same(9), fill);
+    let fill = faded(mix(fill, p.accent, t * if p.dark { 0.16 } else { 0.10 }), en);
+    painter.rect_filled(rect, CornerRadius::same(ctl::RADIUS), fill);
     if p.dark {
+        // 近白填充在深色底上边缘会发亮，压一条极淡的内描边收住。
         painter.rect_stroke(
             rect,
-            CornerRadius::same(9),
+            CornerRadius::same(ctl::RADIUS),
             Stroke::new(1.0, alpha(Color32::WHITE, 40)),
             egui::StrokeKind::Inside,
         );
     }
-    let icon_c = egui::pos2(rect.left() + 18.0, rect.center().y);
+    let icon_c = egui::pos2(rect.left() + 18.0, rect.center().y + shift);
     paint_refresh(painter, icon_c, 5.4, ink);
     painter.galley(
-        egui::pos2(rect.left() + 31.0, rect.center().y - galley.size().y / 2.0),
+        egui::pos2(rect.left() + 31.0, rect.center().y - galley.size().y / 2.0 + shift),
         galley,
         ink,
     );
+    if focused {
+        focus_ring(ui, rect, p, ctl::RADIUS);
+    }
+    let clicked = resp.clicked();
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if tip.is_empty() {
-        resp
-    } else {
-        resp.on_hover_text(tip)
+    if !tip.is_empty() {
+        resp.on_hover_text(tip);
     }
+    clicked || by_key
 }
 
 /// 先为右侧动作预留宽度，左侧内容只能使用剩余区域，避免窄窗口相互挤压。
@@ -611,7 +741,8 @@ pub fn action_link(ui: &mut Ui, p: &Palette, text: &str, warn: bool) -> Response
         .painter()
         .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
     let size = Vec2::new(galley.size().x + 34.0, 26.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    // 与整卡点击等价，属于重复入口：不进 Tab，键盘用户直接停在卡片上。
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::CLICK);
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
@@ -629,7 +760,7 @@ pub fn action_link(ui: &mut Ui, p: &Palette, text: &str, warn: bool) -> Response
     );
     let cx = rect.right() - 13.0 + t * 2.0;
     let cy = rect.center().y;
-    let stroke = Stroke::new(1.3, color);
+    let stroke = Stroke::new(1.15, color);
     painter.line_segment(
         [egui::pos2(cx - 2.0, cy - 3.2), egui::pos2(cx + 1.2, cy)],
         stroke,
@@ -684,6 +815,9 @@ pub fn link_action(
             alpha(p.chip_bg, (t * 255.0) as u8),
         );
     }
+    if resp.has_focus() {
+        focus_ring(ui, rect, p, ctl::RADIUS_SM);
+    }
     let color = mix(p.dim, p.text, t);
     let painter = ui.painter();
     icon(
@@ -706,7 +840,7 @@ pub fn link_action(
 /// Circular "refresh" glyph: a 290° arc with a tangent arrowhead. Drawn by hand
 /// because no single CJK-safe character reads as "refresh".
 pub fn paint_refresh(painter: &egui::Painter, center: egui::Pos2, r: f32, color: Color32) {
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(1.2, color);
     let start = -0.35 * std::f32::consts::PI;
     let sweep = 1.65 * std::f32::consts::PI;
     let steps = 18;
@@ -743,11 +877,11 @@ fn setting_hint(ui: &mut Ui, p: &Palette, desc: &str, rec: &str) {
     if desc.is_empty() && rec.is_empty() {
         return;
     }
-    ui.add_space(3.0);
+    ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         if !desc.is_empty() {
-            ui.label(RichText::new(desc).size(11.0).color(p.dim));
+            ui.label(RichText::new(desc).size(12.0).color(p.dim));
         }
         if !rec.is_empty() {
             if !desc.is_empty() {
@@ -768,9 +902,11 @@ fn rec_tag(ui: &mut Ui, p: &Palette, rec: &str) {
         p.info
     };
     let text = format!("推荐 {rec}");
+    // 不低于 12px：11px 下"读"这类十来笔的汉字，笔画在 egui 的无 hinting
+    // 灰度抗锯齿里会并成一团，比正文小一号的代价是看不清字。
     let galley = ui
         .painter()
-        .layout_no_wrap(text, FontId::proportional(11.0), color);
+        .layout_no_wrap(text, FontId::proportional(12.0), color);
     let size = galley.size() + Vec2::new(10.0, 5.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
@@ -801,39 +937,53 @@ pub fn toggle_row(
             on_change(!value);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(38.0, 22.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
+            let by_key = keyboard_activated(ui, &resp);
+            let focused = resp.has_focus();
             let t = ui.ctx().animate_bool(resp.id, value);
             let hover = ui.ctx().animate_value_with_time(
                 resp.id.with("hover"),
                 if resp.hovered() { 1.0 } else { 0.0 },
                 0.08,
             );
+            let en = ui.is_enabled();
             let track = if value {
                 mix(p.accent, p.accent_hover, hover)
             } else {
                 mix(p.track, p.dim, hover * 0.12)
             };
             let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(11), track);
-            let cx = rect.left() + 11.0 + t * 16.0;
-            let knob = Color32::WHITE;
+            painter.rect_filled(rect, CornerRadius::same(11), faded(track, en));
+            let cx = rect.left() + 11.0 + t * 18.0;
+            // 滑块始终是白色：这是 Windows / iOS 开关的共同约定，深色主题下
+            // 浅蓝轨道配白滑块也够区分，靠下面那层投影把滑块托起来。
+            let knob = faded(Color32::WHITE, en);
             painter.circle_filled(
                 egui::pos2(cx, rect.center().y + 0.6),
-                7.6,
-                Color32::from_black_alpha(if p.dark { 60 } else { 20 }),
+                8.4,
+                Color32::from_black_alpha(if p.dark { 70 } else { 24 }),
             );
-            painter.circle_filled(egui::pos2(cx, rect.center().y), 7.2, knob);
-            if !value {
-                painter.circle_stroke(
-                    egui::pos2(cx, rect.center().y),
-                    7.2,
-                    Stroke::new(1.0, p.border),
-                );
+            painter.circle_filled(egui::pos2(cx, rect.center().y), 8.0, knob);
+            // 关闭态的滑块压在浅色轨道上，补一圈描边才立得起来。
+            painter.circle_stroke(
+                egui::pos2(cx, rect.center().y),
+                8.0,
+                Stroke::new(
+                    1.0,
+                    if value {
+                        alpha(p.on_accent, 0)
+                    } else {
+                        alpha(p.dim, if p.dark { 0 } else { 70 })
+                    },
+                ),
+            );
+            if focused {
+                focus_ring(ui, rect, p, 11);
             }
             if resp.hovered() || label_response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if resp.clicked() {
+            if resp.clicked() || by_key {
                 on_change(!value);
             }
         });
@@ -857,10 +1007,10 @@ pub fn stepper_row(
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let mut plus = false;
             let mut minus = false;
-            if step_button(ui, p, "+", "按住可连续增加") {
+            if step_button(ui, p, true, "按住可连续增加") {
                 plus = true;
             }
-            if step_button(ui, p, "−", "按住可连续减少") {
+            if step_button(ui, p, false, "按住可连续减少") {
                 minus = true;
             }
             ui.add_space(6.0);
@@ -868,7 +1018,7 @@ pub fn stepper_row(
                 Vec2::new(72.0, 28.0),
                 Layout::centered_and_justified(egui::Direction::LeftToRight),
                 |ui| {
-                    ui.label(RichText::new(value).size(12.5).strong().color(p.text));
+                    ui.label(RichText::new(value).size(13.0).strong().color(p.text));
                 },
             );
             if plus || minus {
@@ -884,16 +1034,16 @@ pub fn stepper_row(
 pub fn section_heading(ui: &mut Ui, p: &Palette, title: &str, description: &str) {
     // 卡片小标题不再用展示字族：14px 半粗在深色底上会显得过黑、过重，
     // 改成常规字重的正文色，让页面标题与设备名保持唯一的重心。
-    ui.label(RichText::new(title).size(13.5).color(p.text));
-    ui.add_space(3.0);
-    ui.label(RichText::new(description).size(11.0).color(p.dim));
+    ui.label(body(title, p.text));
+    ui.add_space(4.0);
+    ui.label(meta(description, p.dim));
 }
 
 /// 卡片内分隔线保持低对比，避免与外部边界竞争。
 pub fn divider(ui: &mut Ui, p: &Palette) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, p.border);
+    ui.painter().rect_filled(rect, 0.0, alpha(p.border, 190));
 }
 
 /// Battery bar that is honest about what it knows:

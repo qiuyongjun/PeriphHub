@@ -97,25 +97,70 @@ pub fn palette(mode: ThemeMode) -> &'static Palette {
     }
 }
 
+/// 界面字号阶梯。只取整数：egui 按亚像素排版，11.5 / 13.5 这类半像素值会让
+/// 汉字笔画落在半格上，边缘发灰、同一行里粗细不匀。七档够用，且每一档都有
+/// 明确职责——新增字号前先问它属于哪一档，别再插 12.5。
+pub mod text {
+    /// 页面主标题
+    pub const TITLE: f32 = 24.0;
+    /// 页内标题、统计数字
+    pub const HEADING: f32 = 20.0;
+    /// 设备名、卡片主标题
+    pub const SUBTITLE: f32 = 16.0;
+    /// 卡片内的指标数值（DPI / 回报率 / 电量）：比标题小一档，比正文大，
+    /// 固定值——不按列宽自适应，否则并排三个数字会是三种字号。
+    pub const METRIC: f32 = 18.0;
+    /// 正文、控件标签
+    pub const BODY: f32 = 13.0;
+    /// 次要说明、辅助句子
+    pub const META: f32 = 12.0;
+    /// 单位、微标签、全大写英文
+    pub const MICRO: f32 = 11.0;
+}
+
+/// 控件尺寸与圆角。按钮、标签、步进器、开关共用同一套刻度：之前控件圆角在
+/// 6/7/8/9 之间各写各的，同一行里"加号按钮"和旁边的档位标签圆角不一样，
+/// 放大看就是一排毛边。
+pub mod ctl {
+    /// 标准控件圆角（标签、按钮、图标按钮）
+    pub const RADIUS: u8 = 8;
+    /// 小控件圆角（步进按钮、行内小标签）
+    pub const RADIUS_SM: u8 = 7;
+    /// 标准控件高度
+    pub const H: f32 = 32.0;
+    /// 次要小控件高度
+    pub const H_SM: f32 = 26.0;
+    /// 主按钮高度
+    pub const H_BTN: f32 = 36.0;
+}
+
 /// 系统字体分离正文与展示字重；缺少某个字面时沿用原有字体回退链。
+///
+/// 中文正文取 `msyh.ttc` 的**第二个字面**（Microsoft YaHei UI）：它和雅黑
+/// 文档版同源，但字面更窄、字距更紧，是 Windows 为界面文本单独调过的一版。
+/// 文档版在 12–13px 上偏松散，同一行里中英文的节奏对不上，这是"看着不精致"
+/// 最直接的来源。TTC 的字面序号由 `FontData::from_blob` 的第二个参数指定。
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let dir = std::env::var_os("WINDIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("C:/Windows"))
         .join("Fonts");
-    for name in ["msyh.ttc", "simhei.ttf"] {
-        if let Ok(bytes) = std::fs::read(dir.join(name)) {
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
-            if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
-                f.insert(0, "cjk".to_owned());
-            }
-            if let Some(f) = fonts.families.get_mut(&FontFamily::Monospace) {
-                f.push("cjk".to_owned());
-            }
-            break;
+
+    // (字节, TTC 内字面序号)：雅黑取界面版，黑体只有一个字面。
+    let cjk_face = std::fs::read(dir.join("msyh.ttc"))
+        .map(|b| (b, 1u32))
+        .or_else(|_| std::fs::read(dir.join("simhei.ttf")).map(|b| (b, 0u32)));
+    if let Ok((bytes, index)) = cjk_face {
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            egui::FontData::from_blob(std::sync::Arc::new(bytes), index).into(),
+        );
+        if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
+            f.insert(0, "cjk".to_owned());
+        }
+        if let Some(f) = fonts.families.get_mut(&FontFamily::Monospace) {
+            f.push("cjk".to_owned());
         }
     }
     if let Ok(bytes) = std::fs::read(dir.join("segoeui.ttf")) {
@@ -160,6 +205,21 @@ pub fn heading(text: impl Into<String>, size: f32, color: Color32) -> RichText {
     RichText::new(text).font(heading_font(size)).color(color)
 }
 
+/// 正文：控件标签、可读句子。语义入口，避免调用方散落裸字号。
+pub fn body(text: impl Into<String>, color: Color32) -> RichText {
+    RichText::new(text).size(text::BODY).color(color)
+}
+
+/// 次要说明：跟随在标题下方或卡片脚注里的解释性文字。
+pub fn meta(text: impl Into<String>, color: Color32) -> RichText {
+    RichText::new(text).size(text::META).color(color)
+}
+
+/// 微标签：单位、档位序号、全大写英文。只用于短标记，不承载句子。
+pub fn micro(text: impl Into<String>, color: Color32) -> RichText {
+    RichText::new(text).size(text::MICRO).color(color)
+}
+
 /// 同步全局控件、排版与主题，避免原生控件与自绘表面割裂。
 pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     let p = palette(mode);
@@ -178,13 +238,15 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
         s.spacing.scroll = egui::style::ScrollStyle::thin();
         s.animation_time = 0.14;
         s.text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(13.0));
+            .insert(egui::TextStyle::Body, FontId::proportional(text::BODY));
         s.text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+            .insert(egui::TextStyle::Button, FontId::proportional(text::BODY));
         s.text_styles
-            .insert(egui::TextStyle::Small, FontId::proportional(11.0));
-        s.text_styles
-            .insert(egui::TextStyle::Heading, heading_font(24.0));
+            .insert(egui::TextStyle::Small, FontId::proportional(text::MICRO));
+        s.text_styles.insert(
+            egui::TextStyle::Heading,
+            heading_font(text::TITLE),
+        );
     });
 }
 
@@ -267,17 +329,6 @@ pub fn battery_color(level: BatteryLevel, p: &Palette) -> Color32 {
         BatteryLevel::Critical => p.danger,
         BatteryLevel::Wired => p.dim,
         BatteryLevel::Unknown => p.dim,
-    }
-}
-
-/// 返回电量状态说明。
-pub fn battery_label(level: BatteryLevel) -> &'static str {
-    match level {
-        BatteryLevel::Good => "电量充足",
-        BatteryLevel::Low => "电量偏低",
-        BatteryLevel::Critical => "电量低",
-        BatteryLevel::Wired => "有线供电",
-        BatteryLevel::Unknown => "电量未知",
     }
 }
 

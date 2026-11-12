@@ -4,7 +4,7 @@ use eframe::egui::{
 };
 
 use crate::theme::{alpha, heading, Palette};
-use crate::ui::widgets::mix;
+use crate::ui::widgets::{focus_ring, mix, CARD_RADIUS};
 
 pub struct Bar<'a> {
     pub title: &'a str,
@@ -31,8 +31,6 @@ pub struct BarAction {
 
 /// 为标题和工具动作预留独立空间，并保留原生拖动手势。
 pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
-    use crate::ui::widgets::CARD_RADIUS;
-
     let mut action = BarAction::default();
     let width = ui.available_width();
     let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
@@ -88,7 +86,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
                 crate::theme::brand_badge(ui, 28.0, p);
             }
             ui.add_space(7.0);
-            ui.add(egui::Label::new(heading(cfg.title, 13.5, p.text)).truncate());
+            ui.add(egui::Label::new(heading(cfg.title, 13.0, p.text)).truncate());
             if let Some(sub) = cfg.subtitle.filter(|_| ui.available_width() > 100.0) {
                 ui.add_space(8.0);
                 ui.label(RichText::new(sub).size(11.0).color(p.subtle));
@@ -153,7 +151,10 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
     let resp = ui.interact(
         drag,
         ui.scope_id().with("titlebar_drag"),
-        Sense::click_and_drag(),
+        // 拖拽热区只要 CLICK + DRAG：默认的 click_and_drag() 还带 FOCUSABLE，
+        // 会在 Tab 顺序里留一个看不见的停靠点（标题栏空白处），键盘用户按
+        // 一下 Tab 像什么都没发生。
+        Sense::CLICK | Sense::DRAG,
     );
     if resp.drag_started() {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -167,10 +168,12 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
 
 /// 无边框窗口沿用系统缩放行为，最大化时停用边缘手柄。
 ///
-/// 手柄范围按可见卡片矩形算，而不是含透明阴影边距的窗口矩形：窗口四周
-/// 留了 22px 画投影，如果按窗口边缘判定，用户看到的边和能拖的边会差出
-/// 整整一圈。
+/// 只在可见卡片边缘的圆角环带内判定：窗口四周留了 22px 透明边距画投影，
+/// 那片区域不是窗口的"边"，鼠标经过时既不该出缩放光标，也不该把点击变成
+/// 缩放。角上按圆弧算，圆角外的投影同样不响应。
 pub fn resize_handles(ui: &Ui, card: Rect, enabled: bool) {
+    const EDGE: f32 = 8.0;
+
     if !enabled {
         return;
     }
@@ -178,11 +181,20 @@ pub fn resize_handles(ui: &Ui, card: Rect, enabled: bool) {
     let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
         return;
     };
-    let edge = 8.0;
-    let left = pos.x <= card.left() + edge;
-    let right = pos.x >= card.right() - edge;
-    let top = pos.y <= card.top() + edge;
-    let bottom = pos.y >= card.bottom() - edge;
+    let radius = CARD_RADIUS as f32;
+    let inner = card.shrink(EDGE);
+    if inner.width() <= 0.0 || inner.height() <= 0.0 {
+        return;
+    }
+    let on_rim = in_round_rect(card, radius, pos)
+        && !in_round_rect(inner, (radius - EDGE).max(0.0), pos);
+    if !on_rim {
+        return;
+    }
+    let left = pos.x < inner.left();
+    let right = pos.x > inner.right();
+    let top = pos.y < inner.top();
+    let bottom = pos.y > inner.bottom();
     let dir = match (left, right, top, bottom) {
         (true, _, true, _) => Some((
             egui::ResizeDirection::NorthWest,
@@ -214,6 +226,20 @@ pub fn resize_handles(ui: &Ui, card: Rect, enabled: bool) {
     }
 }
 
+/// 点是否落在圆角矩形内：四角按到最近圆心的距离判定，其余区域就是普通矩形。
+fn in_round_rect(rect: Rect, radius: f32, p: egui::Pos2) -> bool {
+    if !rect.contains(p) {
+        return false;
+    }
+    let r = radius
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .max(0.0);
+    let cx = p.x.clamp(rect.left() + r, rect.right() - r);
+    let cy = p.y.clamp(rect.top() + r, rect.bottom() - r);
+    (p - egui::pos2(cx, cy)).length() <= r
+}
+
 enum WinBtn {
     Minimize,
     Maximize(bool),
@@ -224,7 +250,9 @@ enum WinBtn {
 fn window_button(ui: &mut Ui, p: &Palette, kind: WinBtn) -> Response {
     let close = matches!(kind, WinBtn::Close);
     let width = if close { 40.0 } else { 36.0 };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+    // Sense::CLICK 不带 FOCUSABLE：窗口按钮不进 Tab 顺序。Tab 的第一下
+    // 落在"关闭"上是键盘操作里最危险的默认值，Windows 自己也这么做。
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::CLICK);
     // Ease the hover state in and out instead of snapping.
     let t = ui
         .ctx()
@@ -239,7 +267,7 @@ fn window_button(ui: &mut Ui, p: &Palette, kind: WinBtn) -> Response {
     } else {
         mix(p.dim, p.text, t * 0.6)
     };
-    let stroke = Stroke::new(1.3, color);
+    let stroke = Stroke::new(1.2, color);
     let c = rect.center();
     let painter = ui.painter();
     match kind {
@@ -319,7 +347,7 @@ fn back_button(ui: &mut Ui, p: &Palette) -> Response {
             .rect_filled(rect, CornerRadius::same(7), mix(p.titlebar, p.chip_bg, t));
     }
     let c = rect.center();
-    let stroke = Stroke::new(1.5, mix(p.dim, p.text, t * 0.8));
+    let stroke = Stroke::new(1.4, mix(p.dim, p.text, t * 0.8));
     ui.painter().line_segment(
         [egui::pos2(c.x + 2.6, c.y - 4.6), egui::pos2(c.x - 2.4, c.y)],
         stroke,
@@ -333,6 +361,9 @@ fn back_button(ui: &mut Ui, p: &Palette) -> Response {
         [egui::pos2(c.x - 1.6, c.y), egui::pos2(c.x + 5.6, c.y)],
         stroke,
     );
+    if resp.has_focus() {
+        focus_ring(ui, rect, p, 7);
+    }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -361,6 +392,9 @@ fn icon_button(
     }
     // Icons brighten slightly as the hover fades in.
     paint(ui.painter(), rect, mix(p.dim, p.text, t * 0.7));
+    if resp.has_focus() {
+        focus_ring(ui, rect, p, 8);
+    }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -413,7 +447,7 @@ fn paint_gear(painter: &egui::Painter, rect: Rect, color: Color32) {
     // Three sliders read as "settings" instantly; the old radial ticks beside
     // the sun/moon toggle looked like a second theme button.
     let c = rect.center();
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(1.25, color);
     let rows = [(-4.2f32, -2.2f32), (0.0, 2.4), (4.2, -0.6)];
     for (dy, knob) in rows {
         let y = c.y + dy;

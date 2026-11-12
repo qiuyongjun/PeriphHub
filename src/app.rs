@@ -100,7 +100,7 @@ impl Panel {
             }
         }
         if let Some([x, y]) = cfg.mini_pos {
-            let size = mini::window_size(mini::WIDTH, mini::height(1, 0));
+            let size = mini::window_size(mini::WIDTH, mini::height(1));
             if !is_reachable(ctx, egui::pos2(x, y), size) {
                 cfg.mini_pos = None;
             }
@@ -301,10 +301,7 @@ impl Panel {
     }
 
     fn mini_height(&self) -> f32 {
-        mini::height(
-            self.manager.list().len(),
-            mini::attention_count(&self.manager),
-        )
+        mini::height(self.manager.list().len())
     }
 
     /// Where the main window should sit: last time's spot if it is still on
@@ -734,7 +731,7 @@ impl Panel {
                         }
                     },
                     |ui| {
-                        ui.label(theme::heading("设置", 17.0, p.text));
+                        ui.label(theme::heading("设置", 16.0, p.text));
                     },
                 );
                 ui.add_space(14.0);
@@ -779,7 +776,7 @@ impl Panel {
                     |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("桌面浮窗").size(13.5).color(p.text));
+                            ui.label(RichText::new("桌面浮窗").size(13.0).color(p.text));
                             ui.label(
                                 RichText::new("变成小窗常驻桌面，关闭主界面也能看到状态")
                                     .size(11.0)
@@ -805,7 +802,7 @@ impl Panel {
                     |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("设备检测").size(13.5).color(p.text));
+                            ui.label(RichText::new("设备检测").size(13.0).color(p.text));
                             ui.label(
                                 RichText::new(format!("当前已发现 {device_count} 台设备"))
                                     .size(11.0)
@@ -860,7 +857,7 @@ impl Panel {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(msg.as_str()).size(11.5).color(color));
+                    ui.label(RichText::new(msg.as_str()).size(12.0).color(color));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
@@ -927,6 +924,7 @@ impl eframe::App for Panel {
             self.go_mini(ctx);
         }
         self.strip_window_frame();
+        sync_hit_margin(ctx, self.cfg.mode);
         self.track_monitor(frame, ctx);
         self.drain_tray(ctx);
         self.sync_taskbar(frame);
@@ -1283,8 +1281,9 @@ fn is_reachable(ctx: &egui::Context, pos: egui::Pos2, size: Vec2) -> bool {
 /// - 而且它投的是"整块窗口矩形"，这个窗口比卡片大一圈 `SHADOW_PAD`，
 ///   叠上自绘阴影就成了两圈错位的影子。
 ///
-/// 所以这里只做两件事：关掉 winit 的阴影；在 Win11 上把 DWM 给透明窗口补的
-/// 那圈 1px 边框色关掉（Win10 没有该属性，调用会被静默拒绝）。
+/// 所以这里只做三件事：关掉 winit 的阴影；在 Win11 上把 DWM 给透明窗口补的
+/// 那圈 1px 边框色关掉（Win10 没有该属性，调用会被静默拒绝）；接管窗口过程，
+/// 让卡片外的透明边距不参与命中测试（见 `install_hit_test`）。
 ///
 /// 最大化时 `strip_window_frame` 继续兜底 caption/border 样式缝线。
 fn window_shell(cc: &eframe::CreationContext<'_>) -> Option<isize> {
@@ -1317,18 +1316,141 @@ fn window_shell(cc: &eframe::CreationContext<'_>) -> Option<isize> {
         }
     };
     // Win11（build >= 22000）：透明窗口仍会被 DWM 补一圈 1px 边框，关掉它，
-    // 卡片的轮廓只由自绘的圆角和描边决定。Win10 拒绝这些属性，无需处理。
+    // 卡片的轮廓只由自绘的圆角和描边决定。Win10 拒绝该属性，无需处理。
+    // 圆角交给自绘：Win11 的 `DWMWCP_ROUND` 作用在窗口矩形上，比卡片大一圈
+    // `SHADOW_PAD`，切出来的是透明区域，等于没生效。
     if is_win11() {
         set(
             windows_sys::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR as u32,
             windows_sys::Win32::Graphics::Dwm::DWMWA_COLOR_NONE,
         );
-        set(
-            windows_sys::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-            windows_sys::Win32::Graphics::Dwm::DWMWCP_ROUND as u32,
-        );
     }
+    install_hit_test(hwnd);
     Some(win.hwnd.get())
+}
+
+// ---- 透明投影边距的点击穿透 -------------------------------------------------
+
+/// 原窗口过程：`SetWindowLongPtrW` 换下来后，其余消息原样转发给它。
+static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+/// 可见卡片到窗口边缘的距离（物理像素，f32 位模式）。0 表示不做穿透。
+static HIT_INSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 卡片圆角（物理像素，f32 位模式）；角上的投影像素同样放行。
+static HIT_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 接管窗口过程，把卡片外的透明投影边距从命中测试里摘出去。
+///
+/// 窗口为了画阴影比卡片大一圈，这圈透明像素在系统看来仍是客户区：不处理
+/// 的话，点它不会落到下面的窗口/桌面，浮窗置顶时就是一圈"隐形挡板"。
+fn install_hit_test(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC,
+    };
+
+    if ORIGINAL_WNDPROC.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: hwnd 是本进程的窗口，窗口过程在本进程内；换下来的过程指针
+    // 只用于转发消息，生命周期到窗口销毁为止。
+    unsafe {
+        let old = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if old == 0 {
+            return;
+        }
+        ORIGINAL_WNDPROC.store(old, Ordering::Relaxed);
+        let proc: unsafe extern "system" fn(
+            windows_sys::Win32::Foundation::HWND,
+            u32,
+            windows_sys::Win32::Foundation::WPARAM,
+            windows_sys::Win32::Foundation::LPARAM,
+        ) -> windows_sys::Win32::Foundation::LRESULT = hit_test_proc;
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize);
+    }
+}
+
+/// 卡片外的点返回 `HTTRANSPARENT`，让系统继续寻找下面的窗口。
+unsafe extern "system" fn hit_test_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, GetClientRect, HTTRANSPARENT, WM_NCHITTEST, WNDPROC,
+    };
+
+    if msg == WM_NCHITTEST {
+        let inset = f32::from_bits(HIT_INSET.load(Ordering::Relaxed));
+        if inset > 0.0 {
+            // WM_NCHITTEST 的 lparam 是高/低 16 位屏幕坐标（物理像素，可负）。
+            let lp = lparam as u32;
+            let mut pt = POINT {
+                x: (lp as u16) as i16 as i32,
+                y: (lp >> 16) as u16 as i16 as i32,
+            };
+            let mut rc = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            // SAFETY: 两个都是本窗口的纯查询，pt/rc 在栈上。
+            if ScreenToClient(hwnd, &mut pt) != 0 && GetClientRect(hwnd, &mut rc) != 0 {
+                let radius = f32::from_bits(HIT_RADIUS.load(Ordering::Relaxed));
+                if !inside_card(rc, inset, radius, pt.x as f32, pt.y as f32) {
+                    return HTTRANSPARENT as isize;
+                }
+            }
+        }
+    }
+    let old = ORIGINAL_WNDPROC.load(Ordering::Relaxed);
+    if old == 0 {
+        return 0;
+    }
+    // SAFETY: old 是 SetWindowLongPtrW 换下来的原过程，参数原样转发。
+    let old_proc: WNDPROC = std::mem::transmute(old);
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
+/// 客户区坐标（物理像素）是否落在可见卡片的圆角矩形内。
+fn inside_card(
+    rc: windows_sys::Win32::Foundation::RECT,
+    inset: f32,
+    radius: f32,
+    x: f32,
+    y: f32,
+) -> bool {
+    let right = rc.right as f32 - inset;
+    let bottom = rc.bottom as f32 - inset;
+    if x < inset || y < inset || x > right || y > bottom {
+        return false;
+    }
+    let half = ((right - inset) * 0.5).min((bottom - inset) * 0.5).max(0.0);
+    let r = radius.min(half);
+    let cx = x.clamp(inset + r, right - r);
+    let cy = y.clamp(inset + r, bottom - r);
+    (x - cx).hypot(y - cy) <= r
+}
+
+/// 把当前卡片相对窗口的边距写进命中测试钩子（物理像素）。
+///
+/// 投影只在非最大化时存在；最大化时整窗都是卡片，不做穿透。
+fn sync_hit_margin(ctx: &egui::Context, mode: RunMode) {
+    use std::sync::atomic::Ordering;
+
+    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    let (pad, radius) = match (mode, maximized) {
+        (RunMode::Desktop, true) => (0.0, 0.0),
+        _ => (mini::SHADOW_PAD, CARD_RADIUS as f32),
+    };
+    let scale = ctx.pixels_per_point();
+    HIT_INSET.store((pad * scale).to_bits(), Ordering::Relaxed);
+    HIT_RADIUS.store((radius * scale).to_bits(), Ordering::Relaxed);
 }
 
 /// CurrentBuildNumber >= 22000 即 Win11；读不到时按 Win11 处理——那些

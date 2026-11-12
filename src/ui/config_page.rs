@@ -7,7 +7,9 @@ use eframe::egui::{self, Align, Layout, RichText, Stroke, Ui, Vec2};
 use crate::devices::{Cmd, DeviceId, DeviceInfo, DeviceState, EditorState, Link, Snapshot};
 use crate::driver::Limits;
 use crate::sysinput;
-use crate::theme::{alpha, battery_color, battery_label, battery_level, heading, Palette};
+use crate::theme::{
+    alpha, battery_color, battery_level, heading, meta, micro, text, Palette,
+};
 use crate::ui::widgets::{
     battery_bar, card, chip, chip_small, connection_chip, connection_color, device_tile, divider,
     dpi_chip, link_action, paint_refresh, primary_button, section_heading, shadow_card, split_row,
@@ -50,11 +52,11 @@ pub fn view(
         |ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(heading("设备配置", 20.0, p.text));
+                ui.label(heading("设备配置", text::HEADING, p.text));
                 ui.add_space(3.0);
                 ui.label(
                     RichText::new("更改即时写入设备，无需手动保存")
-                        .size(11.5)
+                        .size(12.0)
                         .color(p.dim),
                 );
             });
@@ -180,7 +182,7 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
                         .extra_letter_spacing(0.6)
                         .color(p.subtle),
                 );
-                ui.add(egui::Label::new(heading(&info.model, 15.5, p.text)).truncate())
+                ui.add(egui::Label::new(heading(&info.model, text::SUBTITLE, p.text)).truncate())
                     .on_hover_text(&info.model);
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -200,26 +202,29 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
         if show_battery {
             let level = battery_level(state.battery, wired);
             let color = battery_color(level, p);
-            ui.label(RichText::new("电量").size(11.0).color(p.dim));
-            ui.add_space(2.0);
+            let value = state
+                .battery
+                .map(|b| b.min(100).to_string())
+                .unwrap_or_else(|| "--".into());
+            // 百分比跟在"电量"标签同一行的右端，紧贴进度条右上角：
+            // 原来竖直堆成 标签 / 28px 数字 / 状态 / 进度条 四行，
+            // 一个数字占掉整张卡三分之一的竖向空间。
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let value = state
-                    .battery
-                    .map(|b| b.min(100).to_string())
-                    .unwrap_or_else(|| "--".into());
-                ui.label(heading(value, 28.0, color));
-                if state.battery.is_some() {
-                    ui.add_space(2.0);
-                    ui.label(RichText::new("%").size(12.0).color(p.dim));
-                }
+                ui.label(meta("电量", p.dim));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if state.battery.is_some() {
+                        ui.label(micro("%", p.dim));
+                        ui.add_space(2.0);
+                    }
+                    ui.label(heading(value, text::METRIC, color));
+                });
             });
-            ui.add_space(2.0);
-            ui.label(RichText::new(battery_label(level)).size(11.0).color(color));
-            ui.add_space(10.0);
+            ui.add_space(7.0);
             battery_bar(ui, p, state.battery, wired, color);
 
-            ui.add_space(14.0);
+            // 进度条下面不再有状态文字，留白跟着收一档，否则条和分隔线之间空得发虚。
+            ui.add_space(10.0);
             divider(ui, p);
             ui.add_space(10.0);
         }
@@ -232,12 +237,6 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
             let active = snap.stage_active as usize;
             let current = snap.dpi.get(active).copied().unwrap_or(0);
             status_row(ui, p, "当前 DPI", &current.to_string());
-            status_row(
-                ui,
-                p,
-                "档位",
-                &format!("{} / {}", snap.stage_active + 1, snap.stage_count.max(1)),
-            );
         }
     });
 }
@@ -245,9 +244,9 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
 /// 只读状态行：标签靠左、数值靠右，读起来像一张规格表。
 fn status_row(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.0).color(p.dim));
+        ui.label(RichText::new(label).size(12.0).color(p.dim));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).size(12.5).strong().color(p.text));
+            ui.label(RichText::new(value).size(13.0).strong().color(p.text));
         });
     });
     ui.add_space(7.0);
@@ -318,7 +317,7 @@ fn dpi_card(
             |ui| {
                 ui.label(
                     RichText::new(format!("当前 {current}"))
-                        .size(12.0)
+                        .size(13.0)
                         .color(p.accent),
                 );
                 // 设备离线/只读时这个按钮点了也只会把命令丢进死队列，索性不出现。
@@ -357,7 +356,7 @@ fn dpi_card(
                     ui.spacing_mut().item_spacing.y = 8.0;
                     for (i, v) in snap.dpi.iter().enumerate() {
                         let selected = i == active;
-                        if dpi_chip(ui, p, *v, selected).clicked() && !selected {
+                        if dpi_chip(ui, p, *v, selected) && !selected {
                             action.cmds.push(Cmd::Activate(i as u8));
                         }
                     }
@@ -418,10 +417,10 @@ fn dpi_editor(
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let base = next.unwrap_or(current);
             let step = if base < 1000 { 50i32 } else { 100 };
-            if step_button(ui, p, "+", &format!("按住可连续增加（每次 +{step}）")) {
+            if step_button(ui, p, true, &format!("按住可连续增加（每次 +{step}）")) {
                 next = Some((base as i32 + step).clamp(min as i32, max as i32) as u16);
             }
-            if step_button(ui, p, "−", &format!("按住可连续减少（每次 −{step}）")) {
+            if step_button(ui, p, false, &format!("按住可连续减少（每次 −{step}）")) {
                 next = Some((base as i32 - step).clamp(min as i32, max as i32) as u16);
             }
         });
@@ -438,7 +437,7 @@ fn dpi_editor(
         } else {
             format!("数值可直接输入，回车或移开光标后生效（{min}–{max}）")
         })
-        .size(11.0)
+        .size(12.0)
         .color(p.dim),
     );
 }
@@ -466,28 +465,32 @@ fn dpi_input(ui: &mut Ui, p: &Palette, stage: u8, current: u16, min: u16, max: u
         draft.seen = current;
     }
 
+    // 尺寸对齐上方的档位标签（62×32），而不是做成一个 92×30 的输入框：
+    // 这是"当前档位的数值，可以直接改写"，不是一个独立表单字段。字号也跟着
+    // 档位数字走（展示字族 14），不再用 16 号正文——它比周围的标签大两圈，
+    // 会把整行视觉重心拉到一个次要控件上。
     let response = egui::Frame::new()
         .fill(p.inset)
         .stroke(Stroke::new(
             1.0,
             if focused {
-                alpha(p.accent, 150)
+                alpha(p.accent, 190)
             } else {
                 p.border
             },
         ))
-        .corner_radius(egui::CornerRadius::same(8))
+        .corner_radius(egui::CornerRadius::same(crate::theme::ctl::RADIUS_SM))
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut draft.text)
                     .id(id)
-                    .desired_width(76.0)
+                    .desired_width(46.0)
                     .char_limit(5)
-                    .font(egui::FontId::proportional(16.0))
-                    .align(egui::Align2::RIGHT_CENTER)
+                    .font(crate::theme::heading_font(14.0))
+                    .align(egui::Align2::CENTER_CENTER)
                     .text_color(p.text)
                     .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::symmetric(8, 5))
+                    .margin(egui::Margin::symmetric(7, 4))
                     .hint_text("DPI"),
             )
         })
@@ -578,7 +581,7 @@ fn limited_card(ui: &mut Ui, p: &Palette, snap: &Snapshot) {
                 ui.add_space(6.0);
                 ui.label(RichText::new(label).size(12.0).color(p.text));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(note).size(11.0).color(p.dim));
+                    ui.label(RichText::new(note).size(12.0).color(p.dim));
                 });
             });
         };
@@ -751,7 +754,7 @@ fn settings_card(
 
             if matches!(state.link, Link::Connecting) {
                 ui.add_space(8.0);
-                ui.label(RichText::new("正在连接设备…").size(11.0).color(p.dim));
+                ui.label(RichText::new("正在连接设备…").size(12.0).color(p.dim));
             }
         });
     });
@@ -760,7 +763,7 @@ fn settings_card(
 /// Small explanatory footnote, used where a whole row of settings shares one
 /// piece of advice.
 fn setting_note(ui: &mut Ui, p: &Palette, text: &str) {
-    ui.label(RichText::new(text).size(11.0).color(p.dim));
+    ui.label(RichText::new(text).size(12.0).color(p.dim));
 }
 
 /// 最近一次写入的系统值及其有效期。系统设置没有 `EditorState` 那样的乐观
@@ -929,14 +932,14 @@ pub fn missing(ui: &mut Ui, p: &Palette) -> MissingAction {
     card(ui, p, |ui| {
         ui.label(
             RichText::new("设备已移除")
-                .size(15.0)
+                .size(16.0)
                 .strong()
                 .color(p.text),
         );
         ui.add_space(3.0);
         ui.label(
             RichText::new("该设备已断开或拔出，当前没有可读取的配置。")
-                .size(11.5)
+                .size(12.0)
                 .color(p.dim),
         );
         ui.add_space(14.0);
@@ -948,7 +951,7 @@ pub fn missing(ui: &mut Ui, p: &Palette) -> MissingAction {
                 action.back = true;
             }
             ui.add_space(6.0);
-            if primary_button(ui, p, "重新扫描", "重新检测已连接的外设").clicked() {
+            if primary_button(ui, p, "重新扫描", "重新检测已连接的外设") {
                 action.rescan = true;
             }
         });
@@ -965,9 +968,9 @@ fn notice(ui: &mut Ui, p: &Palette, title: &str, body: &str, color: egui::Color3
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).size(12.5).strong().color(color));
+            ui.label(RichText::new(title).size(13.0).strong().color(color));
             ui.add_space(2.0);
-            ui.label(RichText::new(body).size(11.5).color(p.dim));
+            ui.label(RichText::new(body).size(12.0).color(p.dim));
         });
 }
 
