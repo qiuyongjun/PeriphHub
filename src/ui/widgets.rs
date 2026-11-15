@@ -30,7 +30,10 @@ pub const CARD_RADIUS: u8 = 12;
 /// 两瓣叠加做出方向感：紧贴边缘的小 σ 给接触阴影，大 σ 给周围的环境阴影，
 /// 两者都向下偏移一点，光看起来来自上方（系统阴影也是这个味道）。
 ///
-/// σ=8、offsetY=3 时可见衰减在 14px 内就归零，压在调用方留的 `SHADOW_PAD`（22px）内。
+/// σ=8、offsetY=3 时看得见的部分（alpha ≥ 2/255）到 12px 就结束，加上下移
+/// 是 15px，压在调用方留的 `SHADOW_PAD`（16px）内。两者是一对：动 pad 之前
+/// 先看这里最外一环还剩多少 alpha，`visible_shadow_stays_inside_the_padding`
+/// 就是这条约束的看门人。
 ///
 /// `focused` 来自 `InputState::focused`：窗口失焦时整体收淡一档，和系统窗口
 /// "不活动时影子更浅"的行为对齐，否则切到别的应用后这块卡片会显得浮在桌面
@@ -63,9 +66,11 @@ pub fn shadow_card(
     painter.rect_filled(rect, CornerRadius::same(radius), fill);
 }
 
-/// 反解每层透明度，使阴影连续衰减到透明边距内。
-fn paint_shadow_lobe(painter: &Painter, rect: Rect, radius: u8, sigma: f32, peak: f32) {
-    let reach = (2.7 * sigma).ceil() as i32;
+/// 环 `r`（距卡片边缘的像素数）那一圈要叠的 alpha，0 表示这一环画了也看不见。
+///
+/// 抽成纯函数是为了让"透明边距够不够"能被离线验证：只要有一环落在窗口外，
+/// 卡片边缘就会留下一条被裁断的硬边。见 `shadow_stays_inside_the_padding`。
+fn ring_alpha(sigma: f32, peak: f32, r: i32) -> u8 {
     let density = |r: i32| {
         if r <= 0 {
             peak
@@ -73,9 +78,15 @@ fn paint_shadow_lobe(painter: &Painter, rect: Rect, radius: u8, sigma: f32, peak
             peak * (-((r as f32) / sigma).powi(2)).exp()
         }
     };
+    let a = 1.0 - (1.0 - density(r)) / (1.0 - density(r + 1));
+    (a * 255.0).round() as u8
+}
+
+/// 反解每层透明度，使阴影连续衰减到透明边距内。
+fn paint_shadow_lobe(painter: &Painter, rect: Rect, radius: u8, sigma: f32, peak: f32) {
+    let reach = (2.7 * sigma).ceil() as i32;
     for r in (1..=reach).rev() {
-        let a = 1.0 - (1.0 - density(r)) / (1.0 - density(r + 1));
-        let alpha = (a * 255.0).round() as u8;
+        let alpha = ring_alpha(sigma, peak, r);
         if alpha == 0 {
             continue;
         }
@@ -1130,6 +1141,37 @@ pub fn short_model(model: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 透明边距必须盖住投影里"看得见"的那一段，否则卡片边缘会留下一条被裁断的
+    /// 硬边。判据取 alpha ≥ 2/255：1/255 的那几环画在桌面上（浅色主题下更是
+    /// 0.1 的峰值）人眼分不出来，允许被窗口裁掉——收窄边距的意义正在于此。
+    /// 每个瓣都向下偏移 `dy`，所以底部要比环半径多留这一截。
+    ///
+    /// 22 那一版多留了 8px 纯空白；16 是"看得见的部分 + 下移"刚好装下的值。
+    /// 改 `SHADOW_PAD` 或改 σ/dy 都要先过这条断言。
+    #[test]
+    fn visible_shadow_stays_inside_the_padding() {
+        let pad = crate::ui::mini::SHADOW_PAD;
+        // 与 `shadow_card` 里的 lobes 同源：取两瓣中最亮的一档（深色 + 聚焦）。
+        let lobes = [(2.4, 1.0, 0.18), (8.0, 3.0, 0.22)];
+        for (sigma, dy, peak) in lobes {
+            let furthest = (1..=40)
+                .filter(|&r| ring_alpha(sigma, peak, r) >= 2)
+                .max()
+                .expect("投影总得有看得见的环");
+            assert!(
+                furthest as f32 + dy <= pad,
+                "σ={sigma} 的投影看得见到 {}px（含下移 {dy}px），超出 SHADOW_PAD（{pad}px）",
+                furthest
+            );
+        }
+        // 太短就失去"浮起"的观感：环境阴影只看得到 12px 以内时，卡片会贴死在桌面上。
+        let reach = (1..=40)
+            .filter(|&r| ring_alpha(8.0, 0.22, r) >= 2)
+            .max()
+            .unwrap();
+        assert!(reach >= 10, "环境阴影只剩 {reach}px，卡片会贴死在桌面上");
+    }
 
     /// Press in one frame, release in the next: exactly one step.
     #[test]

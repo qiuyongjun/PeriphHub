@@ -309,10 +309,6 @@ pub const PROFILES: &[DeviceProfile] = &[
         driver: None,
         reason: Some("能识别到这把键盘，但灯效、按键映射要按厂商私有帧读写，本版本还没接入。"),
     },
-    // 键盘插线后的身份：接收器是 3554:FA09，线连走的是键盘自己的控制器
-    // （258A:010C，BY Tech）。厂商集合是 0xFF00 的 feature 报表，与接收器那套
-    // 20 字节帧不同，所以仍然只读；登记它至少能让有线状态下的键盘出现在列表里。
-    // 排在具体型号之后：首页"支持范围"是按表顺序念的。
     DeviceProfile {
         vid: 0x25A7,
         pid: 0xFA70,
@@ -326,17 +322,26 @@ pub const PROFILES: &[DeviceProfile] = &[
              因此只能识别设备，读不到也无法修改键盘参数。",
         ),
     },
+    // 键盘插线后的身份：接收器是 3554:FA09，线连走的是键盘自己的控制器
+    // （258A:010C，BY Tech）。厂商集合是 0xFF00 的 feature 报表，与接收器那套
+    // 20 字节帧不同，所以仍然只读；登记它至少能让有线状态下的键盘出现在列表里。
+    // 排在具体型号之后：首页"支持范围"是按表顺序念的。
     DeviceProfile {
         vid: 0x258A,
         pid: 0x010C,
         brand: "BY Tech",
-        model: "Gaming Keyboard",
+        // 型号故意写通用名：只读探测（`cargo run --example probe -- 258a`）
+        // 显示这个控制器的每条接口都自报 product="Gaming Keyboard"、
+        // 厂商"BY Tech"、无序列号，而 F87 和 RK98 插线后都变成它。写具体
+        // 型号只能是猜——猜错比不猜更糟，用户会以为面板认出了他的键盘。
+        model: "通用有线键盘",
         kind: DeviceType::Keyboard,
         wired: true,
         driver: None,
         reason: Some(
-            "有线模式下键盘换成 BY Tech 自己的控制器，只有 feature 报表、没有可用的应答\
-             通道，协议还没破解。想改灯效或按键，把接收器插上、键盘切到 2.4G 即可。",
+            "有线模式下键盘换成 BY Tech 的通用控制器，自报的名字只有「Gaming Keyboard」，\
+             认不出具体型号；它只有 feature 报表，读出来的是固件镜像流，没有可写路径。\
+             2.4G 接收器目前也仍是只读，改灯效/按键还得等有线协议摸清。",
         ),
     },
 ];

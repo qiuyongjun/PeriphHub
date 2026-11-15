@@ -643,6 +643,9 @@ mod tests {
         // "RK98" 里已含品牌缩写，不能再叠出 "RK RK98"。
         assert!(!text.contains("RK RK98"));
         assert!(text.contains("可配置 Rapoo VT1 Pro、Logitech Lightspeed 接收器"));
-        assert!(text.contains("AULA F87、RK98、BY Tech Gaming Keyboard 仅识别"));
+        assert!(
+            text.contains("AULA F87、RK98、BY Tech 通用有线键盘 仅识别"),
+            "{text}"
+        );
     }
 }

@@ -20,21 +20,27 @@ use crate::ui::widgets::{
 };
 
 /// Widget card width. The native window is this plus `SHADOW_PAD` on each side.
-pub const WIDTH: f32 = 320.0;
+pub const WIDTH: f32 = 304.0;
 /// 卡片四周的透明边距：egui 只能在窗口矩形内作画，系统级阴影在 Win10 上
 /// 又拿不到（DWM 缝线无法隐藏），所以投影由自己在卡片后面画，这段边距
-/// 就是阴影的落脚处。可见衰减约 14px（σ=8 + 3px 下移），留到 22 是为了
-/// 让阴影在窗口边缘之前就已经淡到 0，不会出现被裁断的硬边。
-pub const SHADOW_PAD: f32 = 22.0;
+/// 就是阴影的落脚处。
+///
+/// 取 16 而不是更宽：σ=8 那瓣**看得见**的环（alpha ≥ 2/255）到 12px 就没了，
+/// 加上 3px 下移正好 15px；再往外只剩 1/255 的尾巴，被窗口边缘裁掉也看不出
+/// 接缝。再往上加只会让窗口矩形比卡片多出一圈纯空白——贴边、Alt-Tab 缩略图、
+/// 命中测试都按窗口矩形算，那圈空白都是要付账的（`visible_shadow_stays_inside_the_padding`
+/// 把这条约束钉住了）。
+pub const SHADOW_PAD: f32 = 16.0;
 
 /// 浮窗原生窗口尺寸 = 卡片内容尺寸 + 四周 `SHADOW_PAD`。
 pub fn window_size(content_w: f32, content_h: f32) -> Vec2 {
     Vec2::new(content_w + 2.0 * SHADOW_PAD, content_h + 2.0 * SHADOW_PAD)
 }
 
-const HEAD_H: f32 = 54.0;
+/// 行高按两行文字（13 + 11）加 4px 余量取整，比上一版收紧，浮窗整体更小。
+const HEAD_H: f32 = 46.0;
 const LIST_GAP: f32 = 8.0;
-const ROW_H: f32 = 54.0;
+const ROW_H: f32 = 48.0;
 /// Past this many devices the widget stops growing and scrolls instead, so it
 /// never eats more desktop than it is worth.
 const MAX_ROWS: usize = 5;
@@ -149,7 +155,10 @@ fn header(
     let mut x = rect.right();
     let mut slots = [Rect::ZERO; 4];
     for slot in slots.iter_mut() {
-        let r = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 15.0), Vec2::splat(24.0));
+        let r = Rect::from_min_size(
+            Pos2::new(x - 24.0, rect.center().y - 12.0),
+            Vec2::splat(24.0),
+        );
         *slot = r;
         x = r.left() - 2.0;
     }
@@ -203,7 +212,7 @@ fn header(
     );
     paint_brand(&painter, badge, p);
 
-    let title_pos = Pos2::new(badge.right() + 8.0, rect.top() + 12.0);
+    let title_pos = Pos2::new(badge.right() + 8.0, rect.top() + 9.0);
     painter.text(
         title_pos,
         Align2::LEFT_TOP,
@@ -216,7 +225,7 @@ fn header(
     } else {
         (p.ok, format!("{online}/{total} 在线"), p.subtle)
     };
-    let dot_c = Pos2::new(title_pos.x + 2.6, rect.top() + 37.0);
+    let dot_c = Pos2::new(title_pos.x + 2.6, rect.top() + 33.0);
     painter.circle_filled(dot_c, 2.6, dot_color);
     painter.text(
         Pos2::new(dot_c.x + 7.0, dot_c.y),

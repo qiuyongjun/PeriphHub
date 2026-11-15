@@ -167,8 +167,14 @@ cargo test
    `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `PeriphHub` 值（带引号的 exe 绝对路径）。
    程序每次启动时若发现自启动已开，会重写一次该值，这样 exe 改名或挪目录后路径不会失效。
 
-> 注意：浮窗是**透明无边框窗口**，卡片贴满整个窗口，不留透明留白；圆角由 EGUI 手绘（14px，
-> 带 1px 抗锯齿），窗口四周不会出现额外的透明带。
+> 注意：浮窗与主界面都是**透明无边框窗口**，卡片四周留 `mini::SHADOW_PAD`（16pt）透明边距：
+> 窗口矩形比可见卡片大一圈，这圈边距是自绘投影（`ui::widgets::shadow_card`，σ=8 的两瓣高斯，
+> 看得见的部分到 12px 就结束，加下移 15px）的落脚处。圆角（`CARD_RADIUS` = 12）同样是手绘的，
+> 窗口本身没有圆角。
+> 这圈边距的代价与对应补丁：透明像素靠 `app::install_hit_test` 在 `WM_NCHITTEST` 里返回
+> `HTTRANSPARENT`，否则浮窗置顶时是一圈"隐形挡板"；边缘缩放的命中区按可见卡片 + 圆角判定
+> （`ui::chrome::resize_handles`）；贴边、Alt-Tab、任务栏缩略图仍按窗口矩形算，所以卡片实际
+> 离屏幕边会比设定值多出 16pt。
 >
 > **窗口顶部那条 1px 深线的来由（已修）**：winit 对无边框窗口保留 `WS_CAPTION` / `WS_SIZEBOX`
 > 样式，靠改写非客户区（`WM_NCCALCSIZE`）把标题栏藏起来；为了让 DWM 仍画一层投影，它会故意把
@@ -189,8 +195,10 @@ cargo test
 >    这里没有设）。
 >
 > 摘样式后屏幕上剩下的唯一一圈线，是界面自己画的卡片描边（`theme::Palette::border`，浅色 229、深色 46）。
-> Windows 11 上额外把 `DWMWA_BORDER_COLOR` 设为 `NONE`、`DWMWA_WINDOW_CORNER_PREFERENCE` 设为
-> `DONOTROUND`，避免系统圆角叠在手绘圆角上；Windows 10 不支持这两个属性，调用失败即忽略。
+> Windows 11 上额外把 `DWMWA_BORDER_COLOR` 设为 `NONE`，关掉 DWM 给透明窗口补的那一圈 1px 边框。
+> `DWMWA_WINDOW_CORNER_PREFERENCE` 现在**不再设置**：它作用在窗口矩形上，而这个矩形比卡片大一圈
+> `SHADOW_PAD`，圆角切出来的是透明区域，等于没生效（78e391c 已移除）。Windows 10 不支持这些属性，
+> 调用失败即忽略。
 
 ---
 
@@ -203,15 +211,15 @@ cargo test
 | 罗技 G304（Lightspeed 接收器） | `046D:C53F` | 5 档 DPI（200–12000，可改可切，写入板载配置）、回报率 125–1000 Hz、电量、设备名 |
 | 狼蛛 F87（含 2.4G 接收器） | `3554:FA09` | 只读：能在列表里看到设备与连接方式，但没有可读写参数 |
 | RK98（含 2.4G 接收器） | `25A7:FA70` | 只读：能识别设备，但连电量都读不到 |
-| 键盘插线时的控制器 | `258A:010C` | 只读：F87/RK98 用线连接后都以 BY Tech 这个控制器出现，只有 feature 报表、没有应答通道，协议未破解（见 `docs/aula-f87.md` §9） |
+| 键盘插线时的控制器 | `258A:010C` | 只读：F87/RK98 用线连接后都以 BY Tech 这个通用控制器出现，设备自报的名字只有 `Gaming Keyboard`，认不出具体型号；只有 feature 报表、没有应答通道，协议未破解（见 `docs/aula-f87.md` §9） |
 
 插线不是"同一个设备换条线"这么简单：鼠标在有线模式下换成另一个 PID（`0x4414`），
 键盘换成 BY Tech 的通用控制器（`258A:010C`）。设备表里用 `DeviceProfile::wired` 区分这两种形态，
 `hid::classify_connection` 按表判定连接方式——只看实例路径的话，接收器和插线设备都是 `USB\` 开头，
 分不出来。
 
-三套协议分别放在 `src/driver/` 下：`rapoo.rs`（32 字节 `0xBA` 帧，EEPROM 读写）、
-`hidpp.rs`（罗技 HID++ 2.0，20 字节 `0x11` 帧）。只读设备没有驱动，只在 `driver::SUPPORTED` 总表里登记（`driver` 字段为 `None`）。
+两套协议分别放在 `src/driver/` 下：`rapoo.rs`（32 字节 `0xBA` 帧，EEPROM 读写）、
+`hidpp.rs`（罗技 HID++ 2.0，20 字节 `0x11` 帧）。只读设备没有驱动，只在 `driver::PROFILES` 总表里登记（`driver` 字段为 `None`）。
 
 为什么后两台只读：
 
