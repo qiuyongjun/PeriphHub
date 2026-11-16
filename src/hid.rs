@@ -157,8 +157,10 @@ fn instance_vid_pid(instance: &str) -> Option<(u16, u16)> {
 /// 传入的是原始字节，尾部允许有未使用的零。
 fn container_key(bytes: &[u8]) -> Option<String> {
     let wide: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let text = wide_to_string(&wide);
     // 不支持容器 ID 的设备会返回这个固定的“空 GUID”；它不能当分组键，

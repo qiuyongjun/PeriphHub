@@ -271,7 +271,7 @@ fn main() {
             "  {name}: 520 前 16 = [{}]  6B 回读 = {}{}",
             head(&r, 16),
             if ok6 != 0 {
-                format!("{:02x?}", &back)
+                format!("{:02x?}", back)
             } else {
                 "失败".to_string()
             },
