@@ -4,7 +4,7 @@ use eframe::egui::{
 };
 
 use crate::theme::{alpha, heading, Palette};
-use crate::ui::widgets::{focus_ring, mix, CARD_RADIUS};
+use crate::ui::widgets::{activated, focus_ring, mix, CARD_RADIUS};
 
 pub struct Bar<'a> {
     pub title: &'a str,
@@ -78,7 +78,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
             ui.spacing_mut().item_spacing.x = 4.0;
             if cfg.back {
                 let back = back_button(ui, p);
-                if back.clicked() {
+                if activated(ui, &back) {
                     action.back = true;
                 }
                 drag_left = back.rect.right() + 4.0;
@@ -118,7 +118,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
             }
             if cfg.window_buttons || cfg.show_actions {
                 if cfg.show_actions {
-                    if icon_button(ui, p, "设置", paint_gear).clicked() {
+                    if icon_button(ui, p, "设置", paint_gear) {
                         action.settings = true;
                     }
                     let theme_tip = if p.dark {
@@ -130,12 +130,10 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
                     let titlebar = p.titlebar;
                     if icon_button(ui, p, theme_tip, move |painter, rect, color| {
                         paint_theme(painter, rect, color, dark, titlebar)
-                    })
-                    .clicked()
-                    {
+                    }) {
                         action.toggle_theme = true;
                     }
-                    if icon_button(ui, p, "切换为浮窗模式", paint_mini).clicked() {
+                    if icon_button(ui, p, "切换为浮窗模式", paint_mini) {
                         action.mini = true;
                     }
                 }
@@ -186,8 +184,8 @@ pub fn resize_handles(ui: &Ui, card: Rect, enabled: bool) {
     if inner.width() <= 0.0 || inner.height() <= 0.0 {
         return;
     }
-    let on_rim = in_round_rect(card, radius, pos)
-        && !in_round_rect(inner, (radius - EDGE).max(0.0), pos);
+    let on_rim =
+        in_round_rect(card, radius, pos) && !in_round_rect(inner, (radius - EDGE).max(0.0), pos);
     if !on_rim {
         return;
     }
@@ -376,7 +374,7 @@ fn icon_button(
     p: &Palette,
     tip: &str,
     paint: impl FnOnce(&egui::Painter, Rect, Color32),
-) -> Response {
+) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 32.0), Sense::click());
     let t = ui
         .ctx()
@@ -398,7 +396,9 @@ fn icon_button(
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.on_hover_text(tip)
+    let triggered = activated(ui, &resp);
+    resp.on_hover_text(tip);
+    triggered
 }
 
 /// Sun while dark mode is active ("switch to light"), moon in light mode.

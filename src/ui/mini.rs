@@ -12,15 +12,14 @@ use eframe::egui::{
 };
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
-use crate::theme::{
-    alpha, battery_color, battery_level, heading_font, paint_brand, Palette,
-};
+use crate::theme::{alpha, battery_color, battery_level, heading_font, paint_brand, text, Palette};
 use crate::ui::widgets::{
-    connection_color, mix, paint_device_glyph, shadow_card, short_model, CARD_RADIUS,
+    activated, connection_color, focus_ring, mix, paint_device_glyph, shadow_card, short_model,
+    CARD_RADIUS,
 };
 
 /// Widget card width. The native window is this plus `SHADOW_PAD` on each side.
-pub const WIDTH: f32 = 304.0;
+pub const WIDTH: f32 = 320.0;
 /// 卡片四周的透明边距：egui 只能在窗口矩形内作画，系统级阴影在 Win10 上
 /// 又拿不到（DWM 缝线无法隐藏），所以投影由自己在卡片后面画，这段边距
 /// 就是阴影的落脚处。
@@ -38,9 +37,9 @@ pub fn window_size(content_w: f32, content_h: f32) -> Vec2 {
 }
 
 /// 行高按两行文字（13 + 11）加 4px 余量取整，比上一版收紧，浮窗整体更小。
-const HEAD_H: f32 = 46.0;
+const HEAD_H: f32 = 50.0;
 const LIST_GAP: f32 = 8.0;
-const ROW_H: f32 = 48.0;
+const ROW_H: f32 = 52.0;
 /// Past this many devices the widget stops growing and scrolls instead, so it
 /// never eats more desktop than it is worth.
 const MAX_ROWS: usize = 5;
@@ -76,7 +75,11 @@ pub fn view(
     let entries = manager.list();
     let online = entries
         .iter()
-        .filter(|e| !matches!(e.state.link, Link::Offline(_)))
+        .filter(|e| matches!(e.state.link, Link::Online))
+        .count();
+    let connecting = entries
+        .iter()
+        .filter(|e| matches!(e.state.link, Link::Connecting))
         .count();
 
     paint_card(ui, p, card);
@@ -93,7 +96,15 @@ pub fn view(
     body.set_clip_rect(card);
     body.spacing_mut().item_spacing = Vec2::ZERO;
 
-    header(&mut body, p, &mut action, pinned, online, entries.len());
+    header(
+        &mut body,
+        p,
+        &mut action,
+        pinned,
+        online,
+        connecting,
+        entries.len(),
+    );
     body.add_space(LIST_GAP);
 
     let list_h = entries.len().clamp(1, MAX_ROWS) as f32 * ROW_H;
@@ -143,6 +154,7 @@ fn header(
     action: &mut MiniAction,
     pinned: bool,
     online: usize,
+    connecting: usize,
     total: usize,
 ) {
     let width = body.available_width();
@@ -151,20 +163,24 @@ fn header(
     // a borrow of the painter.
     let painter = body.painter().clone();
 
-    // Buttons live on the right, laid out from the edge inward.
+    // 30px 工具按钮兼顾紧凑与触达面积，全部支持 Tab、回车和空格。
     let mut x = rect.right();
     let mut slots = [Rect::ZERO; 4];
     for slot in slots.iter_mut() {
         let r = Rect::from_min_size(
-            Pos2::new(x - 24.0, rect.center().y - 12.0),
-            Vec2::splat(24.0),
+            Pos2::new(x - 30.0, rect.center().y - 15.0),
+            Vec2::splat(30.0),
         );
         *slot = r;
         x = r.left() - 2.0;
     }
-    let quit = icon_button(body, slots[0], p, "退出 PeriphHub", paint_close, false);
-    let open = icon_button(body, slots[1], p, "打开主界面", paint_open, false);
-    let pin = icon_button(
+    if icon_button(body, slots[0], p, "退出 PeriphHub", paint_close, false) {
+        action.quit = true;
+    }
+    if icon_button(body, slots[1], p, "打开主界面", paint_open, false) {
+        action.open_main = true;
+    }
+    if icon_button(
         body,
         slots[2],
         p,
@@ -175,7 +191,9 @@ fn header(
         },
         paint_pin,
         pinned,
-    );
+    ) {
+        action.toggle_pin = true;
+    }
     // Same sun/moon glyph as the titlebar, so the control reads identically on
     // both surfaces. The crescent knocks itself out with the card colour.
     let theme_tip = if p.dark {
@@ -184,24 +202,14 @@ fn header(
         "切换到深色模式"
     };
     let (dark, card) = (p.dark, p.card);
-    let theme = icon_button(
+    if icon_button(
         body,
         slots[3],
         p,
         theme_tip,
         move |painter, c, color| paint_theme(painter, c, color, dark, card),
         false,
-    );
-    if quit.clicked() {
-        action.quit = true;
-    }
-    if open.clicked() {
-        action.open_main = true;
-    }
-    if pin.clicked() {
-        action.toggle_pin = true;
-    }
-    if theme.clicked() {
+    ) {
         action.toggle_theme = true;
     }
 
@@ -223,7 +231,14 @@ fn header(
     let (dot_color, summary, summary_color) = if total == 0 {
         (p.dim, "无设备".to_string(), p.dim)
     } else {
-        (p.ok, format!("{online}/{total} 在线"), p.subtle)
+        let status = if online > 0 {
+            p.ok
+        } else if connecting > 0 {
+            p.warn
+        } else {
+            p.dim
+        };
+        (status, format!("{online}/{total} 在线"), p.dim)
     };
     let dot_c = Pos2::new(title_pos.x + 2.6, rect.top() + 33.0);
     painter.circle_filled(dot_c, 2.6, dot_color);
@@ -251,7 +266,7 @@ fn header(
     let resp = body.interact(
         drag,
         body.scope_id().with("mini-drag"),
-        Sense::click_and_drag(),
+        Sense::CLICK | Sense::DRAG,
     );
     if resp.drag_started() {
         body.ctx()
@@ -310,9 +325,9 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         },
     };
     let value_font = if metric {
-        heading_font(13.5)
+        heading_font(text::BODY)
     } else {
-        FontId::proportional(11.5)
+        FontId::proportional(text::META)
     };
     let value_top = if metric {
         rect.top() + 10.0
@@ -359,7 +374,7 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     // 第二行只描述"设备是什么/连得上吗"。电量状态不在这里重复：百分比
     // 已经用颜色和进度条表达过一次，再写一行"电量低"就是第三种说法。
     let note = match &entry.state.link {
-        Link::Offline(_) => "断开连接，点击查看".to_string(),
+        Link::Offline(_) => "点击查看离线原因".to_string(),
         Link::Connecting => "正在建立连接".to_string(),
         Link::Online => format!(
             "{} · {}",
@@ -372,14 +387,14 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     let note = ellipsize(
         painter,
         &note,
-        FontId::proportional(11.0),
+        FontId::proportional(text::META),
         rect.right() - text_left - if has_gauge { 56.0 } else { 10.0 },
     );
     painter.text(
         Pos2::new(text_left, rect.top() + 30.0),
         Align2::LEFT_TOP,
         note,
-        FontId::proportional(11.0),
+        FontId::proportional(text::META),
         note_color,
     );
     if has_gauge {
@@ -397,10 +412,13 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         }
     }
 
+    if resp.has_focus() {
+        focus_ring(ui, rect, p, 10);
+    }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if resp.clicked() {
+    if activated(ui, &resp) {
         action.open_config = Some(entry.info.id.clone());
     }
 }
@@ -439,24 +457,27 @@ fn empty_row(
         Pos2::new(rect.center().x, rect.center().y - 8.0),
         Align2::CENTER_CENTER,
         title,
-        FontId::proportional(12.5),
+        FontId::proportional(text::BODY),
         p.text,
     );
     painter.text(
         Pos2::new(rect.center().x, rect.center().y + 10.0),
         Align2::CENTER_CENTER,
         note,
-        FontId::proportional(11.0),
+        FontId::proportional(text::META),
         p.dim,
     );
-    if resp.hovered() {
+    if resp.has_focus() {
+        focus_ring(body, rect, p, 10);
+    }
+    let triggered = activated(body, &resp);
+    if resp.hovered() && !scanning {
         body.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if resp.clicked() {
+    if triggered && !scanning {
         action.rescan = true;
     }
 }
-
 
 /// 置顶状态用轻微色彩标识，所有工具保持一致的触达面积。
 fn icon_button(
@@ -466,7 +487,7 @@ fn icon_button(
     tip: &str,
     paint: impl FnOnce(&egui::Painter, Pos2, Color32),
     accent: bool,
-) -> egui::Response {
+) -> bool {
     let resp = ui.interact(rect, ui.scope_id().with(tip), Sense::click());
     let t = ui
         .ctx()
@@ -474,9 +495,9 @@ fn icon_button(
     if t > 0.001 || accent {
         ui.painter().rect_filled(
             rect,
-            CornerRadius::same(6),
+            CornerRadius::same(7),
             if accent {
-                alpha(p.accent, (18.0 + t * 15.0) as u8)
+                alpha(p.accent, (24.0 + t * 20.0) as u8)
             } else {
                 alpha(p.chip_bg, (t * 255.0) as u8)
             },
@@ -484,10 +505,15 @@ fn icon_button(
     }
     let base = if accent { p.accent } else { p.dim };
     paint(ui.painter(), rect.center(), mix(base, p.text, t * 0.6));
+    if resp.has_focus() {
+        focus_ring(ui, rect, p, 7);
+    }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.on_hover_text(tip)
+    let triggered = activated(ui, &resp);
+    resp.on_hover_text(tip);
+    triggered
 }
 
 fn paint_close(painter: &egui::Painter, c: Pos2, color: Color32) {

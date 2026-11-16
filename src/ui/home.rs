@@ -1,19 +1,19 @@
 use std::time::Instant;
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui,
-    Vec2,
+    self, Align, CornerRadius, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::driver::{self, DeviceProfile};
 use crate::theme::{
-    alpha, battery_color, battery_level, battery_text, brand_badge, heading, text, Palette,
+    battery_color, battery_level, battery_text, brand_badge, card_shadow, heading, meta, text,
+    Palette,
 };
 use crate::ui::widgets::{
-    action_link, connection_chip_colored, connection_color, device_tile, hairline, metric_col, mix,
-    pill, primary_button, short_model, skeleton, split_row, status_dot, surface, vrule,
-    CARD_RADIUS, RESCAN_HINT,
+    action_link, activated, connection_chip_colored, connection_color, device_tile, focus_ring,
+    hairline, metric_col, mix, pill, primary_button, refresh_button, short_model, skeleton,
+    split_row, status_dot, surface, vrule, CARD_RADIUS, RESCAN_HINT,
 };
 
 /// Height of a device card's body block; every variant pads to it so cards in
@@ -49,32 +49,29 @@ pub fn view(
     let total = entries.len();
     let online = entries
         .iter()
-        .filter(|e| !matches!(e.state.link, Link::Offline(_)))
+        .filter(|e| matches!(e.state.link, Link::Online))
         .count();
+    let connecting = entries
+        .iter()
+        .filter(|e| matches!(e.state.link, Link::Connecting))
+        .count();
+    let scanning = manager.is_scanning();
 
-    header(ui, p, &mut action, recently_scanned);
-    ui.add_space(18.0);
-    hairline(ui, p, 165);
-    ui.add_space(14.0);
-    overview(ui, p, total, online);
-    ui.add_space(14.0);
-    hairline(ui, p, 165);
-    ui.add_space(24.0);
+    header(ui, p, &mut action, recently_scanned, scanning);
+    ui.add_space(16.0);
+    overview(ui, p, total, online, connecting, last_scan, scanning);
+    ui.add_space(20.0);
 
     split_row(
         ui,
         |ui| {
-            status_dot(ui, p.ok, false);
-            ui.label(
-                RichText::new(sync_text(last_scan))
-                    .size(12.0)
-                    .color(p.subtle),
-            );
+            if !entries.is_empty() {
+                ui.label(meta("点击卡片进入配置", p.dim));
+            }
         },
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(RichText::new("我的设备").size(13.0).color(p.text));
-            pill(ui, p, &format!("{total} 台"), p.dim);
+            ui.label(heading("我的设备", text::SUBTITLE, p.text));
             if manager.is_demo() {
                 pill(ui, p, "演示数据", p.info);
             }
@@ -122,93 +119,90 @@ pub fn view(
     action
 }
 
-/// 页首强调工作台身份，扫描动作保持唯一的实色主按钮。
-fn header(ui: &mut Ui, p: &Palette, action: &mut HomeAction, recently_scanned: bool) {
+/// 页首只保留页面身份与唯一的检测动作，让设备内容尽早上屏。
+fn header(
+    ui: &mut Ui,
+    p: &Palette,
+    action: &mut HomeAction,
+    recently_scanned: bool,
+    scanning: bool,
+) {
     split_row(
         ui,
         |ui| {
-            let label = if recently_scanned {
-                "已重新扫描"
+            let label = if scanning {
+                "正在扫描…"
+            } else if recently_scanned {
+                "已更新"
             } else {
                 "重新扫描"
             };
-            if primary_button(
-                ui,
-                p,
-                label,
-                &format!("重新检测已连接的外设（{RESCAN_HINT}）"),
-            ) {
-                action.rescan = true;
-            }
+            ui.add_enabled_ui(!scanning, |ui| {
+                if refresh_button(
+                    ui,
+                    p,
+                    label,
+                    &format!("重新检测已连接的外设（{RESCAN_HINT}）"),
+                ) {
+                    action.rescan = true;
+                }
+            });
         },
         |ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(
-                    RichText::new("PERIPHHUB  /  WORKSPACE")
-                        .size(11.0)
-                        .extra_letter_spacing(0.9)
-                        .color(p.subtle),
-                );
-                ui.add_space(6.0);
                 ui.label(heading("设备工作台", text::TITLE, p.text));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("连接、状态与性能，一处掌控")
-                        .size(12.0)
-                        .color(p.dim),
-                );
+                ui.add_space(5.0);
+                ui.label(meta("连接状态一目了然，设备配置触手可及", p.dim));
             });
         },
     );
 }
 
-/// 概览共享一块表面，均分宽度避免状态数字挤在左侧。
-///
-/// 只有"总数 / 在线"两项：设备名对不上、电量读不到都是常态，把它们
-/// 归成"需要关注"会让首屏长期挂着一个黄色数字，提醒久了就是噪声。
-fn overview(ui: &mut Ui, p: &Palette, total: usize, online: usize) {
-    let gap = 20.0;
-    let cell_w = (ui.available_width() - 1.0 - gap * 2.0) / 2.0;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        stat_cell(ui, p, cell_w, &total.to_string(), "台", "设备总数", p.text);
-        ui.add_space(gap);
-        vrule(ui, p, 4.0, 34.0);
-        ui.add_space(gap);
-        stat_cell(
-            ui,
-            p,
-            cell_w,
-            &online.to_string(),
-            "台",
-            "当前在线",
-            if online == 0 { p.dim } else { p.ok },
-        );
-    });
-}
-
-/// 数字与单位分级排版，单位不占用指标的主要视觉权重。
-fn stat_cell(
+/// 用一条紧凑概览替代重复的大数字区块，同时呈现扫描与连接过程。
+fn overview(
     ui: &mut Ui,
     p: &Palette,
-    width: f32,
-    value: &str,
-    unit: &str,
-    label: &str,
-    color: Color32,
+    total: usize,
+    online: usize,
+    connecting: usize,
+    last_scan: Option<Instant>,
+    scanning: bool,
 ) {
-    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
-        ui.set_width(width);
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(label).size(12.0).color(p.dim));
-        ui.add_space(3.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(heading(value, text::HEADING, color));
-            ui.add_space(2.0);
-            ui.label(RichText::new(unit).size(11.0).color(p.dim));
-        });
+    surface(ui, p, Margin::symmetric(16, 11), |ui| {
+        split_row(
+            ui,
+            |ui| {
+                let color = if scanning || connecting > 0 {
+                    p.warn
+                } else if total == 0 {
+                    p.dim
+                } else {
+                    p.ok
+                };
+                status_dot(ui, color, scanning);
+                ui.add_space(2.0);
+                ui.label(meta(sync_text(last_scan, scanning), p.dim));
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    ui.label(heading(total.to_string(), text::HEADING, p.text));
+                    ui.label(meta("台设备", p.dim));
+                    ui.add_space(13.0);
+                    ui.label(heading(
+                        online.to_string(),
+                        text::HEADING,
+                        if online > 0 { p.ok } else { p.dim },
+                    ));
+                    ui.label(meta("台在线", p.dim));
+                    if connecting > 0 {
+                        ui.add_space(7.0);
+                        pill(ui, p, &format!("{connecting} 连接中"), p.warn);
+                    }
+                });
+            },
+        );
     });
 }
 
@@ -284,6 +278,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
         .stroke(Stroke::new(1.0, border))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(Margin::same(16))
+        .shadow(card_shadow(p))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -307,7 +302,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     .painter()
                     .layout_no_wrap(
                         entry.info.connection.label().to_owned(),
-                        egui::FontId::proportional(11.5),
+                        egui::FontId::proportional(text::MICRO),
                         tint,
                     )
                     .size()
@@ -333,8 +328,9 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                         );
                         let full = entry.info.model.as_str();
                         let title = short_model(full);
-                        let label =
-                            ui.add(egui::Label::new(heading(title, text::SUBTITLE, text_col)).truncate());
+                        let label = ui.add(
+                            egui::Label::new(heading(title, text::SUBTITLE, text_col)).truncate(),
+                        );
                         // The shortened title is a convenience; the device's
                         // own name stays one hover away.
                         if title != full {
@@ -382,7 +378,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     let label = if !entry.info.has_config {
                         "查看详情"
                     } else if offline {
-                        "重新连接"
+                        "查看离线原因"
                     } else if connecting {
                         "查看状态"
                     } else {
@@ -438,17 +434,12 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
         );
     }
     if response.has_focus() {
-        ui.painter().rect_stroke(
-            rect,
-            CornerRadius::same(CARD_RADIUS),
-            Stroke::new(2.0, alpha(p.accent, 130)),
-            StrokeKind::Inside,
-        );
+        focus_ring(ui, rect, p, CARD_RADIUS);
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.clicked() || clicked_button
+    activated(ui, &response) || clicked_button
 }
 
 /// 只展示设备真实开放的指标，未知值继续使用占位而非推测。
@@ -486,7 +477,7 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
     }
     let cols = [
         // "有线"不是读数：连接方式已经写在卡头，没读到电量就不占一列。
-        (entry.state.battery.is_some() || !wired).then(|| Col {
+        (entry.state.battery.is_some() || !wired).then_some(Col {
             label: "电量",
             value: battery_text,
             unit: battery_unit,
@@ -576,8 +567,11 @@ fn loading_body(ui: &mut Ui, p: &Palette) {
     });
 }
 
-/// 显示最近扫描的实际时间。
-fn sync_text(last: Option<Instant>) -> String {
+/// 显示真实扫描进度与最近完成时间，不把"刚发起"误报成"已更新"。
+fn sync_text(last: Option<Instant>, scanning: bool) -> String {
+    if scanning {
+        return "正在检测设备…".into();
+    }
     match last {
         Some(t) => {
             let s = t.elapsed().as_secs();
@@ -589,7 +583,7 @@ fn sync_text(last: Option<Instant>) -> String {
                 format!("{} 分钟前更新", s / 60)
             }
         }
-        None => "启动时已扫描".into(),
+        None => "设备自动检测已开启".into(),
     }
 }
 

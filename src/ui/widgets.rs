@@ -137,7 +137,7 @@ pub fn card<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
 fn keyboard_nav(ui: &Ui) -> bool {
     let ctx = ui.ctx();
     let frame = ctx.cumulative_frame_nr();
-    let id = egui::Id::new("ph-keyboard-nav");
+    let id = egui::Id::unique("ph-keyboard-nav");
     let (last, mode) = ctx
         .data(|d| d.get_temp::<(u64, bool)>(id))
         .unwrap_or((0, false));
@@ -201,10 +201,13 @@ fn keyboard_activated(ui: &mut Ui, resp: &Response) -> bool {
     if resp.clicked() {
         resp.request_focus();
     }
-    focused
-        && ui.input(|i| {
-            i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter)
-        })
+    focused && ui.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter))
+}
+
+/// 鼠标、回车与空格共用同一激活路径，供完全自绘的卡片和图标按钮复用。
+pub fn activated(ui: &mut Ui, resp: &Response) -> bool {
+    let by_key = keyboard_activated(ui, resp);
+    resp.clicked() || by_key
 }
 
 /// 档位选择采用浅色填充与清晰描边，保留主要按钮的视觉优先级。
@@ -274,9 +277,11 @@ pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let by_key = keyboard_activated(ui, &resp);
     let focused = resp.has_focus();
-    let t = ui
-        .ctx()
-        .animate_value_with_time(resp.id.with("hover"), if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
+    let t = ui.ctx().animate_value_with_time(
+        resp.id.with("hover"),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        0.08,
+    );
 
     let en = ui.is_enabled();
     let fg = faded(
@@ -302,7 +307,14 @@ pub fn dpi_chip(ui: &mut Ui, p: &Palette, value: u16, selected: bool) -> bool {
         CornerRadius::same(ctl::RADIUS),
         Stroke::new(
             1.0,
-            faded(if selected { alpha(p.accent, 190) } else { p.border }, en),
+            faded(
+                if selected {
+                    alpha(p.accent, 190)
+                } else {
+                    p.border
+                },
+                en,
+            ),
         ),
         egui::StrokeKind::Inside,
     );
@@ -336,9 +348,11 @@ pub fn step_button(ui: &mut Ui, p: &Palette, plus: bool, tip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
     let by_key = keyboard_activated(ui, &resp);
     let focused = resp.has_focus();
-    let t = ui
-        .ctx()
-        .animate_value_with_time(resp.id.with("hover"), if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
+    let t = ui.ctx().animate_value_with_time(
+        resp.id.with("hover"),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        0.08,
+    );
     let en = ui.is_enabled();
     let painter = ui.painter();
     if t > 0.01 {
@@ -453,7 +467,7 @@ pub fn connection_chip(ui: &mut Ui, p: &Palette, conn: ConnectionType) {
 /// one rather than a colour that promises a live link.
 pub fn connection_chip_colored(ui: &mut Ui, p: &Palette, conn: ConnectionType, color: Color32) {
     let bg = alpha(color, if p.dark { 26 } else { 18 });
-    let font = egui::FontId::proportional(11.5);
+    let font = egui::FontId::proportional(text::MICRO);
     let text = conn.label();
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
     let size = galley.size() + Vec2::new(18.0, 8.0);
@@ -677,13 +691,25 @@ pub fn vrule(ui: &mut Ui, p: &Palette, top: f32, height: f32) {
     ui.painter().rect_filled(line, 0, alpha(p.border, 170));
 }
 
-/// The one filled button in the app. 深色下用近白填充，浅色下用强调色：
-/// 强调色保留给链接与选中态，主按钮靠明度对比脱颖而出。
+/// 主按钮用于空态等唯一关键动作；深色下用近白填充，浅色下用强调色。
 pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> bool {
-    let (fill, ink) = if p.dark {
-        (p.text, p.bg)
+    refresh_button_impl(ui, p, text, tip, true)
+}
+
+/// 带刷新图标的次要按钮，用于已有内容页，避免与设备卡片争夺视觉重心。
+pub fn refresh_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> bool {
+    refresh_button_impl(ui, p, text, tip, false)
+}
+
+fn refresh_button_impl(ui: &mut Ui, p: &Palette, text: &str, tip: &str, primary: bool) -> bool {
+    let (fill, ink) = if primary {
+        if p.dark {
+            (p.text, p.bg)
+        } else {
+            (p.accent, p.on_accent)
+        }
     } else {
-        (p.accent, p.on_accent)
+        (p.chip_bg, p.text)
     };
     // 颜色先压暗再排版：galley 里存的是当时的颜色，事后再 faded 只改得了图标。
     let en = ui.is_enabled();
@@ -699,11 +725,18 @@ pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> bool {
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
     // 按下时只让内容下沉 1px，底不跟着动：整块位移会像窗口抖了一下。
-    let shift = if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 };
+    let shift = if resp.is_pointer_button_down_on() {
+        1.0
+    } else {
+        0.0
+    };
     let painter = ui.painter();
-    let fill = faded(mix(fill, p.accent, t * if p.dark { 0.16 } else { 0.10 }), en);
+    let fill = faded(
+        mix(fill, p.accent, t * if p.dark { 0.16 } else { 0.10 }),
+        en,
+    );
     painter.rect_filled(rect, CornerRadius::same(ctl::RADIUS), fill);
-    if p.dark {
+    if primary && p.dark {
         // 近白填充在深色底上边缘会发亮，压一条极淡的内描边收住。
         painter.rect_stroke(
             rect,
@@ -711,11 +744,21 @@ pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, tip: &str) -> bool {
             Stroke::new(1.0, alpha(Color32::WHITE, 40)),
             egui::StrokeKind::Inside,
         );
+    } else if !primary {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(ctl::RADIUS),
+            Stroke::new(1.0, faded(mix(p.border, p.accent, t * 0.55), en)),
+            egui::StrokeKind::Inside,
+        );
     }
     let icon_c = egui::pos2(rect.left() + 18.0, rect.center().y + shift);
     paint_refresh(painter, icon_c, 5.4, ink);
     painter.galley(
-        egui::pos2(rect.left() + 31.0, rect.center().y - galley.size().y / 2.0 + shift),
+        egui::pos2(
+            rect.left() + 31.0,
+            rect.center().y - galley.size().y / 2.0 + shift,
+        ),
         galley,
         ink,
     );
@@ -748,9 +791,9 @@ pub fn split_row(ui: &mut Ui, right: impl FnOnce(&mut Ui), left: impl FnOnce(&mu
 /// text, and a chevron that steps right on hover.
 pub fn action_link(ui: &mut Ui, p: &Palette, text: &str, warn: bool) -> Response {
     let color = if warn { p.warn } else { p.accent };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), FontId::proportional(text::META), color);
     let size = Vec2::new(galley.size().x + 34.0, 26.0);
     // 与整卡点击等价，属于重复入口：不进 Tab，键盘用户直接停在卡片上。
     let (rect, resp) = ui.allocate_exact_size(size, Sense::CLICK);
@@ -812,7 +855,7 @@ pub fn link_action(
     tip: &str,
     icon: impl FnOnce(&egui::Painter, egui::Pos2, f32, Color32),
 ) -> Response {
-    let font = FontId::proportional(11.5);
+    let font = FontId::proportional(text::META);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, p.text);
     let size = Vec2::new(galley.size().x + 36.0, 26.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());

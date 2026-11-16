@@ -13,7 +13,8 @@ use crate::theme::{self, ThemeMode};
 use crate::tray::{self, Tray, TrayAction};
 use crate::ui::mini;
 use crate::ui::widgets::{
-    chip, divider, section_heading, shadow_card, split_row, toggle_row, CARD_RADIUS,
+    activated, chip, divider, focus_ring, section_heading, shadow_card, split_row, toggle_row,
+    CARD_RADIUS,
 };
 use crate::ui::{chrome, config_page, home};
 
@@ -64,6 +65,8 @@ pub struct Panel {
     /// 提示不经过它——离线是持续状态，浮层画到恢复在线为止。
     err_toast: Option<ErrToast>,
     last_rescan: Option<Instant>,
+    /// 手动扫描已发起但结果尚未合并，完成前不能显示“已更新”。
+    rescan_pending: bool,
     /// Native handle of this window, kept so the frame style can be stripped.
     hwnd: Option<isize>,
     /// Height we last asked the window to be while in mini mode, so the resize
@@ -152,6 +155,7 @@ impl Panel {
             error,
             err_toast: None,
             last_rescan: None,
+            rescan_pending: false,
             hwnd,
             mini_h: 0.0,
             mini_placed: false,
@@ -172,11 +176,10 @@ impl Panel {
         }
     }
 
-    /// Rescan and remember when it happened, so the header button can flash
-    /// an honest "already rescanned" confirmation instead of doing nothing.
+    /// 发起后台扫描；完成时间只在结果真正合并后记录，避免过早显示“已更新”。
     fn do_rescan(&mut self, ctx: &egui::Context) {
         self.manager.rescan();
-        self.last_rescan = Some(Instant::now());
+        self.rescan_pending = true;
         ctx.request_repaint();
     }
 
@@ -722,7 +725,7 @@ impl Panel {
                     }),
             )
             .show(ctx, |ui| {
-                ui.set_width(320.0);
+                ui.set_width(380.0);
                 split_row(
                     ui,
                     |ui| {
@@ -731,55 +734,12 @@ impl Panel {
                         }
                     },
                     |ui| {
-                        ui.label(theme::heading("设置", 16.0, p.text));
-                    },
-                );
-                ui.add_space(14.0);
-                divider(ui, p);
-                ui.add_space(14.0);
-                section_heading(ui, p, "外观", "选择更适合当前环境的界面主题");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let dark = self.cfg.theme == ThemeMode::Dark;
-                    if chip(ui, p, "深色模式", dark).clicked() && !dark {
-                        self.toggle_theme(ctx);
-                    }
-                    if chip(ui, p, "浅色模式", !dark).clicked() && dark {
-                        self.toggle_theme(ctx);
-                    }
-                });
-                ui.add_space(14.0);
-                divider(ui, p);
-                ui.add_space(12.0);
-                section_heading(ui, p, "应用行为", "管理启动方式和后台运行状态");
-                ui.add_space(8.0);
-                let autostart = self.autostart;
-                toggle_row(
-                    ui,
-                    p,
-                    "开机自启动",
-                    "登录 Windows 后自动启动，开机就能看到设备电量",
-                    "常驻开启",
-                    autostart,
-                    |v| {
-                        self.set_autostart(ctx, v);
-                    },
-                );
-                ui.add_space(10.0);
-                split_row(
-                    ui,
-                    |ui| {
-                        if chip(ui, p, "收起为浮窗", false).clicked() {
-                            self.go_mini(ctx);
-                        }
-                    },
-                    |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("桌面浮窗").size(13.0).color(p.text));
+                            ui.label(theme::heading("设置", 16.0, p.text));
                             ui.label(
-                                RichText::new("变成小窗常驻桌面，关闭主界面也能看到状态")
-                                    .size(11.0)
+                                RichText::new("外观、应用行为与 Windows 指针")
+                                    .size(12.0)
                                     .color(p.dim),
                             );
                         });
@@ -788,45 +748,125 @@ impl Panel {
                 ui.add_space(14.0);
                 divider(ui, p);
                 ui.add_space(12.0);
+
+                // 系统指针是全局功能，放在设置里可随时访问，不依赖设备在线或快照就绪。
+                // 弹层主体滚动，标题与关闭按钮始终留在原位。
+                let viewport_h =
+                    ctx.input(|i| i.viewport().inner_rect.map_or(720.0, |rect| rect.height()));
+                let max_h = (viewport_h - 160.0).clamp(280.0, 560.0);
+                let scanning = self.manager.is_scanning();
                 let device_count = self.manager.list().len();
-                split_row(
-                    ui,
-                    |ui| {
-                        if chip(ui, p, "重新扫描", false)
-                            .on_hover_text("重新检测已连接的外设（F5 或 Ctrl+R）")
-                            .clicked()
-                        {
-                            self.do_rescan(ctx);
-                        }
-                    },
-                    |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("设备检测").size(13.0).color(p.text));
-                            ui.label(
-                                RichText::new(format!("当前已发现 {device_count} 台设备"))
-                                    .size(11.0)
-                                    .color(p.dim),
-                            );
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-scroll")
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        section_heading(ui, p, "外观", "选择更适合当前环境的界面主题");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let dark = self.cfg.theme == ThemeMode::Dark;
+                            if chip(ui, p, "深色模式", dark).clicked() && !dark {
+                                self.toggle_theme(ctx);
+                            }
+                            if chip(ui, p, "浅色模式", !dark).clicked() && dark {
+                                self.toggle_theme(ctx);
+                            }
                         });
-                    },
-                );
-                ui.add_space(12.0);
-                divider(ui, p);
-                ui.add_space(8.0);
-                split_row(
-                    ui,
-                    |ui| {
-                        ui.label(
-                            RichText::new(concat!("版本 ", env!("CARGO_PKG_VERSION")))
-                                .size(11.0)
-                                .color(p.dim),
+                        ui.add_space(14.0);
+                        divider(ui, p);
+                        ui.add_space(12.0);
+                        section_heading(ui, p, "应用行为", "管理启动方式和后台运行状态");
+                        ui.add_space(8.0);
+                        let autostart = self.autostart;
+                        toggle_row(
+                            ui,
+                            p,
+                            "开机自启动",
+                            "登录 Windows 后自动启动，开机就能看到设备电量",
+                            "常驻开启",
+                            autostart,
+                            |v| {
+                                self.set_autostart(ctx, v);
+                            },
                         );
-                    },
-                    |ui| {
-                        ui.label(RichText::new("PeriphHub").size(11.0).strong().color(p.dim));
-                    },
-                );
+                        ui.add_space(10.0);
+                        split_row(
+                            ui,
+                            |ui| {
+                                if chip(ui, p, "收起为浮窗", false).clicked() {
+                                    self.go_mini(ctx);
+                                }
+                            },
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.label(RichText::new("桌面浮窗").size(13.0).color(p.text));
+                                    ui.label(
+                                        RichText::new("变成小窗常驻桌面，关闭主界面也能看到状态")
+                                            .size(12.0)
+                                            .color(p.dim),
+                                    );
+                                });
+                            },
+                        );
+                        ui.add_space(14.0);
+                        divider(ui, p);
+                        ui.add_space(12.0);
+                        split_row(
+                            ui,
+                            |ui| {
+                                ui.add_enabled_ui(!scanning, |ui| {
+                                    if chip(
+                                        ui,
+                                        p,
+                                        if scanning {
+                                            "扫描中…"
+                                        } else {
+                                            "重新扫描"
+                                        },
+                                        false,
+                                    )
+                                    .on_hover_text("重新检测已连接的外设（F5 或 Ctrl+R）")
+                                    .clicked()
+                                    {
+                                        self.do_rescan(ctx);
+                                    }
+                                });
+                            },
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.label(RichText::new("设备检测").size(13.0).color(p.text));
+                                    ui.label(
+                                        RichText::new(format!("当前已发现 {device_count} 台设备"))
+                                            .size(12.0)
+                                            .color(p.dim),
+                                    );
+                                });
+                            },
+                        );
+                        ui.add_space(14.0);
+                        config_page::system_card(ui, p);
+                        ui.add_space(14.0);
+                        divider(ui, p);
+                        ui.add_space(8.0);
+                        split_row(
+                            ui,
+                            |ui| {
+                                ui.label(
+                                    RichText::new(concat!("版本 ", env!("CARGO_PKG_VERSION")))
+                                        .size(11.0)
+                                        .color(p.dim),
+                                );
+                            },
+                            |ui| {
+                                ui.label(
+                                    RichText::new("PeriphHub").size(11.0).strong().color(p.dim),
+                                );
+                            },
+                        );
+                    });
             });
         if close {
             self.settings_open = false;
@@ -856,12 +896,12 @@ impl Panel {
             .inner_margin(Margin::symmetric(12, 9))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(msg.as_str()).size(12.0).color(color));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                split_row(
+                    ui,
+                    |ui| {
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("忽略").size(11.0).color(p.dim))
+                                egui::Button::new(RichText::new("忽略").size(12.0).color(p.dim))
                                     .fill(Color32::TRANSPARENT)
                                     .stroke(Stroke::NONE),
                             )
@@ -869,8 +909,15 @@ impl Panel {
                         {
                             dismissed = true;
                         }
-                    });
-                });
+                    },
+                    |ui| {
+                        // 任意长度的 Win32 错误都要换行，而不是挤掉“忽略”按钮。
+                        ui.add(
+                            egui::Label::new(RichText::new(msg.as_str()).size(12.0).color(color))
+                                .wrap(),
+                        );
+                    },
+                );
             });
         if dismissed {
             self.error = None;
@@ -882,7 +929,7 @@ impl Panel {
 
 /// Small round close affordance for the settings popover.
 fn close_button(ui: &mut Ui, p: &theme::Palette) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
@@ -901,10 +948,13 @@ fn close_button(ui: &mut Ui, p: &theme::Palette) -> bool {
     ] {
         ui.painter().line_segment([c + a, c + b], stroke);
     }
+    if resp.has_focus() {
+        focus_ring(ui, rect, p, 7);
+    }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.clicked()
+    activated(ui, &resp)
 }
 
 impl eframe::App for Panel {
@@ -942,6 +992,11 @@ impl eframe::App for Panel {
             self.capture_dpi_baselines();
             ctx.request_repaint();
         }
+        if self.rescan_pending && !self.manager.is_scanning() {
+            self.rescan_pending = false;
+            self.last_rescan = Some(Instant::now());
+            ctx.request_repaint();
+        }
         // "Connecting" status dots breathe; give them frames to breathe in.
         // 扫描期间也保持短间隔：结果回来得再快，也要有下一帧才能合并进列表。
         let connecting = self
@@ -950,7 +1005,7 @@ impl eframe::App for Panel {
             .iter()
             .any(|e| matches!(e.state.link, Link::Connecting));
         let animating = connecting || self.manager.is_scanning();
-        if self.cfg.mode == RunMode::Mini {
+        let mut after = if self.cfg.mode == RunMode::Mini {
             // 上一帧高度变过：这一帧窗口矩形已经更新，再决定要不要上移。
             if self.mini_clamp {
                 self.mini_clamp = false;
@@ -971,16 +1026,22 @@ impl eframe::App for Panel {
                 self.mini_clamp = true;
                 self.mini_h = h;
             }
-            ctx.request_repaint_after(if animating {
+            if animating {
                 Duration::from_millis(140)
             } else {
                 Duration::from_millis(600)
-            });
+            }
         } else if animating {
-            ctx.request_repaint_after(Duration::from_millis(120));
+            Duration::from_millis(120)
         } else {
-            ctx.request_repaint_after(Duration::from_secs(1));
+            Duration::from_secs(1)
+        };
+        // 插拔通知正在等合并窗口：把重绘提前到窗口关闭那一刻，否则刚睡醒的
+        // 一轮 1 秒等待会让"拔了就消失"慢到能看出来。
+        if let Some(left) = self.manager.pending_scan_in() {
+            after = after.min(left);
         }
+        ctx.request_repaint_after(after);
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
@@ -1332,8 +1393,7 @@ fn window_shell(cc: &eframe::CreationContext<'_>) -> Option<isize> {
 // ---- 透明投影边距的点击穿透 -------------------------------------------------
 
 /// 原窗口过程：`SetWindowLongPtrW` 换下来后，其余消息原样转发给它。
-static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// 可见卡片到窗口边缘的距离（物理像素，f32 位模式）。0 表示不做穿透。
 static HIT_INSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// 卡片圆角（物理像素，f32 位模式）；角上的投影像素同样放行。

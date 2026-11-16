@@ -35,52 +35,52 @@ pub struct Palette {
     pub close_hover: Color32,
 }
 
-/// 中性近黑与冷灰表面，层级只靠明度和 1px 描边；冰蓝只用于可操作处。
+/// 冷调中性色让深色界面更有层次，浅色辅助文字保持足够对比度；冰蓝只用于可操作处。
 pub const DARK: Palette = Palette {
     dark: true,
-    bg: Color32::from_rgb(10, 10, 11),
-    card: Color32::from_rgb(18, 18, 20),
-    card_top: Color32::from_rgb(18, 18, 20),
-    card_hover: Color32::from_rgb(23, 23, 26),
-    inset: Color32::from_rgb(15, 15, 17),
-    track: Color32::from_rgb(42, 42, 47),
-    text: Color32::from_rgb(242, 242, 244),
-    dim: Color32::from_rgb(150, 150, 157),
-    subtle: Color32::from_rgb(133, 133, 141),
-    accent: Color32::from_rgb(143, 179, 255),
-    accent_hover: Color32::from_rgb(183, 204, 255),
+    bg: Color32::from_rgb(12, 14, 18),
+    card: Color32::from_rgb(20, 23, 29),
+    card_top: Color32::from_rgb(20, 23, 29),
+    card_hover: Color32::from_rgb(26, 30, 38),
+    inset: Color32::from_rgb(16, 18, 23),
+    track: Color32::from_rgb(48, 53, 63),
+    text: Color32::from_rgb(241, 244, 248),
+    dim: Color32::from_rgb(158, 166, 179),
+    subtle: Color32::from_rgb(137, 146, 160),
+    accent: Color32::from_rgb(129, 167, 255),
+    accent_hover: Color32::from_rgb(174, 199, 255),
     on_accent: Color32::from_rgb(11, 18, 32),
-    border: Color32::from_rgb(38, 38, 43),
-    chip_bg: Color32::from_rgb(23, 23, 26),
-    titlebar: Color32::from_rgb(11, 11, 13),
-    ok: Color32::from_rgb(127, 183, 154),
-    warn: Color32::from_rgb(212, 176, 106),
-    danger: Color32::from_rgb(204, 134, 134),
-    info: Color32::from_rgb(154, 165, 196),
+    border: Color32::from_rgb(45, 50, 60),
+    chip_bg: Color32::from_rgb(27, 31, 39),
+    titlebar: Color32::from_rgb(15, 17, 22),
+    ok: Color32::from_rgb(119, 190, 155),
+    warn: Color32::from_rgb(218, 181, 108),
+    danger: Color32::from_rgb(220, 137, 145),
+    info: Color32::from_rgb(154, 173, 214),
     close_hover: Color32::from_rgb(180, 70, 80),
 };
 
 pub const LIGHT: Palette = Palette {
     dark: false,
-    bg: Color32::from_rgb(245, 245, 246),
+    bg: Color32::from_rgb(246, 248, 251),
     card: Color32::from_rgb(255, 255, 255),
     card_top: Color32::from_rgb(255, 255, 255),
-    card_hover: Color32::from_rgb(248, 248, 250),
-    inset: Color32::from_rgb(241, 241, 243),
-    track: Color32::from_rgb(221, 221, 226),
-    text: Color32::from_rgb(23, 23, 26),
-    dim: Color32::from_rgb(110, 110, 118),
-    subtle: Color32::from_rgb(124, 124, 132),
-    accent: Color32::from_rgb(47, 107, 255),
-    accent_hover: Color32::from_rgb(30, 86, 224),
+    card_hover: Color32::from_rgb(248, 250, 253),
+    inset: Color32::from_rgb(242, 245, 249),
+    track: Color32::from_rgb(218, 224, 232),
+    text: Color32::from_rgb(25, 32, 44),
+    dim: Color32::from_rgb(93, 104, 120),
+    subtle: Color32::from_rgb(108, 119, 135),
+    accent: Color32::from_rgb(55, 102, 235),
+    accent_hover: Color32::from_rgb(39, 82, 201),
     on_accent: Color32::from_rgb(255, 255, 255),
-    border: Color32::from_rgb(228, 228, 232),
-    chip_bg: Color32::from_rgb(241, 241, 243),
-    titlebar: Color32::from_rgb(250, 250, 251),
-    ok: Color32::from_rgb(44, 138, 99),
+    border: Color32::from_rgb(226, 231, 238),
+    chip_bg: Color32::from_rgb(242, 245, 249),
+    titlebar: Color32::from_rgb(250, 252, 254),
+    ok: Color32::from_rgb(37, 139, 94),
     warn: Color32::from_rgb(166, 119, 30),
     danger: Color32::from_rgb(194, 80, 92),
-    info: Color32::from_rgb(94, 106, 138),
+    info: Color32::from_rgb(85, 105, 153),
     close_hover: Color32::from_rgb(214, 75, 87),
 };
 
@@ -243,20 +243,18 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
             .insert(egui::TextStyle::Button, FontId::proportional(text::BODY));
         s.text_styles
             .insert(egui::TextStyle::Small, FontId::proportional(text::MICRO));
-        s.text_styles.insert(
-            egui::TextStyle::Heading,
-            heading_font(text::TITLE),
-        );
+        s.text_styles
+            .insert(egui::TextStyle::Heading, heading_font(text::TITLE));
     });
 }
 
-/// 卡片保持平面，只留一圈极轻的边缘阴影；层次靠描边和底色，不靠投影。
+/// 卡片以细描边为主、柔和投影为辅，悬浮层级清晰但不显得厚重。
 pub fn card_shadow(p: &Palette) -> egui::Shadow {
     egui::Shadow {
-        offset: [0, 1],
-        blur: 2,
+        offset: [0, 3],
+        blur: 10,
         spread: 0,
-        color: Color32::from_black_alpha(if p.dark { 22 } else { 8 }),
+        color: Color32::from_black_alpha(if p.dark { 30 } else { 12 }),
     }
 }
 

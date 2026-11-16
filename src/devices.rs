@@ -14,6 +14,9 @@ use crate::hid::{self, ConnectionType};
 pub const FULL_EVERY: Duration = Duration::from_secs(4);
 pub const BATTERY_EVERY: Duration = Duration::from_secs(20);
 const RETRY_EVERY: Duration = Duration::from_millis(1500);
+/// 插拔通知的合并窗口。一台复合设备插上会连着报好几条接口通知，每条都扫一
+/// 遍等于把枚举开销翻几倍；等这一小会儿，最后一次事件之后的状态才是终态。
+const HOTPLUG_DEBOUNCE: Duration = Duration::from_millis(400);
 /// 退出时等采集线程收尾的总时长上限（见 `DeviceManager::shutdown`）。
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(1500);
 /// 采集线程正在执行可能写 EEPROM 的调用时，退出多等一会儿；仍不是无限
@@ -565,6 +568,25 @@ fn demo_worker(
     }
 }
 
+/// 把最新枚举到的身份写回一个已经在列表里的条目。
+///
+/// 同一个 container id 不等于同一个身份：三模键盘插线是 `258A:010C`（有线），
+/// 走接收器是 `3554:FA09`（2.4G），落在同一个 container 里但 VID/PID 不同。
+/// 连接方式是型号表加实例路径算出来的，不随快照更新，所以不在这里刷新就会
+/// 永远停在第一次枚举时的值——线拔了卡片还写着"有线"。
+fn refresh_info(entry: &mut Entry, dev: &hid::HidDevice) {
+    entry.info.connection = dev.connection;
+    entry.info.brand = dev.brand.clone();
+    entry.info.limits = dev.limits;
+    entry.info.reason = dev.reason;
+    // 设备自己报的名字（HID++ 读回来的真实型号）比型号表里的占位名准：已经
+    // 有快照时不要用表里的通用名把它盖回去。
+    if entry.state.snap.is_none() {
+        entry.info.model = dev.model.clone();
+        entry.info.kind = dev.kind;
+    }
+}
+
 pub struct DeviceManager {
     entries: Vec<Entry>,
     demo: bool,
@@ -581,6 +603,13 @@ pub struct DeviceManager {
     scan_rx: Option<Receiver<Vec<hid::HidDevice>>>,
     /// 扫描进行中又点了"重新扫描"：等这一轮结果应用完再补一轮。
     rescan_queued: bool,
+    /// 系统插拔通知的"有新事件"位。回调线程只置位，枚举仍由 UI 线程发起。
+    dirty: Arc<AtomicBool>,
+    /// 这一波通知里第一条的时刻。到 `HOTPLUG_DEBOUNCE` 之后才真正扫描。
+    dirty_since: Option<Instant>,
+    /// 插拔订阅的句柄。只为了生存期而拿着它：Drop 时注销，回调不会打到已经
+    /// 销毁的管理器上。
+    _watch: Option<hid::DeviceWatch>,
 }
 
 impl DeviceManager {
@@ -588,6 +617,17 @@ impl DeviceManager {
         let demo = std::env::var("PERIPHHUB_DEMO")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // 订阅插拔通知：回调只置位，扫描还是回到 `poll` 里发起。订阅失败就
+        // 退回手动扫描，功能不受影响。
+        let dirty = Arc::new(AtomicBool::new(false));
+        let watch = if demo {
+            None
+        } else {
+            hid::watch(ctx, dirty.clone())
+        };
+        if !demo && watch.is_none() {
+            crate::log::line("WARN", "订阅设备插拔通知失败，插拔后只能手动重新扫描");
+        }
         let mut manager = Self {
             entries: Vec::new(),
             demo,
@@ -595,6 +635,9 @@ impl DeviceManager {
             read_mode: Arc::new(AtomicU8::new(ReadMode::Full as u8)),
             scan_rx: None,
             rescan_queued: false,
+            dirty,
+            dirty_since: None,
+            _watch: watch,
         };
         manager.start_scan();
         manager
@@ -607,6 +650,13 @@ impl DeviceManager {
     /// 枚举线程还在跑。界面据此显示"正在扫描"，而不是"没有发现设备"。
     pub fn is_scanning(&self) -> bool {
         self.scan_rx.is_some()
+    }
+
+    /// 插拔合并窗口还有多久关闭。界面据此把重绘提前到窗口关闭那一刻，否则
+    /// 要等下一次常规重绘（最长 1 秒）才会真正发起扫描。
+    pub fn pending_scan_in(&self) -> Option<Duration> {
+        self.dirty_since
+            .map(|t| HOTPLUG_DEBOUNCE.saturating_sub(t.elapsed()))
     }
 
     /// 页面切换时广播新的读取策略。
@@ -727,6 +777,25 @@ impl DeviceManager {
         }
     }
 
+    /// 插拔通知的状态机：只回答"现在该扫了吗"，真正的扫描由 `poll` 发起。
+    ///
+    /// 拆出来是为了能单独测——直接调 `start_scan` 会真的去枚举系统设备。
+    fn hotplug_due(&mut self) -> bool {
+        if self.dirty.swap(false, Ordering::Relaxed) {
+            // 只认这一波里第一条的时间：持续插拔不应该把窗口一直往后推，
+            // 否则界面上永远等不到更新。
+            self.dirty_since.get_or_insert_with(Instant::now);
+        }
+        if self
+            .dirty_since
+            .is_some_and(|t| t.elapsed() >= HOTPLUG_DEBOUNCE)
+        {
+            self.dirty_since = None;
+            return true;
+        }
+        false
+    }
+
     fn seed_demo_devices(&mut self) {
         if !self.entries.is_empty() {
             return;
@@ -760,16 +829,25 @@ impl DeviceManager {
         // 同 id（container id）但 path 变了 = 设备重插过，旧 worker 一直重试
         // 失效 path 会永远离线；丢弃条目让下面的循环重建 worker（旧 worker
         // 随 channel 关闭自然退出）。
-        self.entries.retain(
-            |e| match found.iter().find(|d| d.id == e.info.id.0.as_ref()) {
-                Some(d) => !e.info.has_config || e.path.as_deref() == Some(d.path.as_slice()),
-                None => false,
-            },
-        );
+        //
+        // 驱动规格变了同样要重建：三模键盘插线和走接收器是两个 PID，落在同
+        // 一个 container 里但通道和能力都不同，沿用旧 worker 会一直读不到。
+        // 只读设备（无驱动、无 worker）本来就不存 path，重插也无需重建。
+        self.entries.retain(|e| {
+            let Some(d) = found.iter().find(|d| d.id == e.info.id.0.as_ref()) else {
+                return false;
+            };
+            e.spec == d.driver && (e.spec.is_none() || e.path.as_deref() == Some(d.path.as_slice()))
+        });
         // 手动重扫是用户明确要求"再试一次"，把自愈计数清零。自愈次数用尽
         // 后 worker 已经被丢掉（tx/rx 为空），只清零不会恢复，必须真的
         // 重建线程；否则同 id/path 的设备会一直停在离线状态。
         for e in &mut self.entries {
+            // 同一个 container 里身份可能已经变了（插线 ↔ 接收器），连接方式
+            // 和型号都得跟着换，否则线拔了卡片还挂着"有线"。
+            if let Some(d) = found.iter().find(|d| d.id == e.info.id.0.as_ref()) {
+                refresh_info(e, d);
+            }
             e.restarts = 0;
             e.last_restart = None;
             if e.tx.is_none() {
@@ -826,6 +904,10 @@ impl DeviceManager {
     /// Drain worker messages; returns true if any visible state changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = self.apply_scan_result();
+        if self.hotplug_due() {
+            self.start_scan();
+            changed = true;
+        }
         for entry in &mut self.entries {
             let mut died = false;
             if let Some(rx) = &entry.rx {
@@ -1045,19 +1127,160 @@ mod tests {
     #[test]
     fn scan_results_are_applied_when_they_arrive() {
         let (tx, rx) = mpsc::channel();
-        let mut manager = DeviceManager {
-            entries: Vec::new(),
-            demo: false,
-            ctx: egui::Context::default(),
-            read_mode: Arc::new(AtomicU8::new(ReadMode::Summary as u8)),
-            scan_rx: Some(rx),
-            rescan_queued: false,
-        };
+        let mut manager = test_manager();
+        manager.scan_rx = Some(rx);
         assert!(manager.is_scanning());
         assert!(!manager.poll(), "结果还没到，不该报告列表变化");
         tx.send(Vec::new()).expect("send scan result");
         assert!(manager.poll());
         assert!(!manager.is_scanning());
         assert!(manager.list().is_empty());
+    }
+
+    fn test_manager() -> DeviceManager {
+        DeviceManager {
+            entries: Vec::new(),
+            demo: false,
+            ctx: egui::Context::default(),
+            read_mode: Arc::new(AtomicU8::new(ReadMode::Summary as u8)),
+            scan_rx: None,
+            rescan_queued: false,
+            dirty: Arc::new(AtomicBool::new(false)),
+            dirty_since: None,
+            _watch: None,
+        }
+    }
+
+    fn found_device(id: &str, model: &str, connection: ConnectionType) -> hid::HidDevice {
+        hid::HidDevice {
+            id: id.to_string(),
+            path: vec![0x5c, 0, 0],
+            vid: 0x258A,
+            pid: 0x010C,
+            brand: "BY Tech".to_string(),
+            model: model.to_string(),
+            kind: DeviceType::Keyboard,
+            connection,
+            // 只读设备：reconcile 不会给它起采集线程，测试里没有副作用。
+            driver: None,
+            limits: Limits::default(),
+            reason: None,
+        }
+    }
+
+    fn read_only_entry(id: &str, model: &str, connection: ConnectionType) -> Entry {
+        Entry {
+            info: DeviceInfo {
+                id: DeviceId(Arc::from(id)),
+                brand: "BY Tech".to_string(),
+                model: model.to_string(),
+                kind: DeviceType::Keyboard,
+                connection,
+                has_config: false,
+                limits: Limits::default(),
+                reason: None,
+            },
+            state: DeviceState::default(),
+            sent: 0,
+            path: None,
+            spec: None,
+            restarts: 0,
+            last_restart: None,
+            busy: None,
+            tx: None,
+            rx: None,
+            join: None,
+        }
+    }
+
+    /// 一台复合设备插上会连着报好几条接口通知；它们必须合成一轮扫描，而且
+    /// 要等最后一波事件过去再扫（否则扫到的是半注册状态）。
+    #[test]
+    fn hotplug_events_are_coalesced_into_one_scan() {
+        let mut manager = test_manager();
+        for _ in 0..5 {
+            manager.dirty.store(true, Ordering::Relaxed);
+            assert!(!manager.hotplug_due(), "窗口没关就扫，等于每条通知扫一遍");
+        }
+        assert!(manager.pending_scan_in().is_some());
+        // 窗口已过（不想在测试里真睡 400 ms，直接把起点往前挪）。
+        manager.dirty_since = Some(ago(HOTPLUG_DEBOUNCE));
+        assert!(manager.hotplug_due());
+        assert!(!manager.hotplug_due(), "扫过一轮之后没有新事件，不该再扫");
+        assert!(manager.pending_scan_in().is_none());
+    }
+
+    /// 没有通知时不该自己扫：`pending_scan_in` 是界面用的提前重绘量，一直
+    /// 有值会让界面不停重绘。
+    #[test]
+    fn no_hotplug_event_means_no_scan() {
+        let mut manager = test_manager();
+        assert!(!manager.hotplug_due());
+        assert!(manager.pending_scan_in().is_none());
+    }
+
+    /// 三模键盘从有线切到 2.4G：container id 不变，但连接方式必须跟着换，
+    /// 不然线拔了首页还写着"有线"。
+    #[test]
+    fn reconcile_refreshes_the_identity_of_a_kept_entry() {
+        let mut manager = test_manager();
+        manager.entries.push(read_only_entry(
+            "c:abc",
+            "通用有线键盘",
+            ConnectionType::Wired,
+        ));
+        manager.reconcile(vec![found_device(
+            "c:abc",
+            "F87",
+            ConnectionType::Wireless24G,
+        )]);
+        assert_eq!(manager.entries.len(), 1);
+        assert_eq!(
+            manager.entries[0].info.connection,
+            ConnectionType::Wireless24G
+        );
+        assert_eq!(manager.entries[0].info.model, "F87");
+    }
+
+    /// 拔掉的设备必须从列表里消失——这就是"键盘拔了卡片还在"的根因。
+    #[test]
+    fn reconcile_drops_devices_that_are_gone() {
+        let mut manager = test_manager();
+        manager.entries.push(read_only_entry(
+            "c:abc",
+            "通用有线键盘",
+            ConnectionType::Wired,
+        ));
+        manager.reconcile(Vec::new());
+        assert!(manager.entries.is_empty());
+    }
+
+    /// 已经有了快照（设备自报的真实型号），就别让型号表里的占位名把它盖
+    /// 回去；连接方式仍然要刷新。
+    #[test]
+    fn reconcile_keeps_a_snapshot_derived_model() {
+        let mut manager = test_manager();
+        let mut entry = read_only_entry(
+            "c:abc",
+            "G304 Lightspeed Wireless Gaming Mouse",
+            ConnectionType::Wired,
+        );
+        entry.state.snap = Some(Arc::new(Snapshot::default()));
+        entry.info.kind = DeviceType::Mouse;
+        manager.entries.push(entry);
+        manager.reconcile(vec![found_device(
+            "c:abc",
+            "接收器",
+            ConnectionType::Wireless24G,
+        )]);
+        assert_eq!(
+            manager.entries[0].info.model,
+            "G304 Lightspeed Wireless Gaming Mouse"
+        );
+        assert_eq!(manager.entries[0].info.kind, DeviceType::Mouse);
+        assert_eq!(
+            manager.entries[0].info.connection,
+            ConnectionType::Wireless24G
+        );
     }
 }

@@ -152,7 +152,10 @@ pub enum HidppLayout {
 }
 
 /// 一个协议适配器需要的全部型号差异。
-#[derive(Clone, Copy, Debug)]
+///
+/// `PartialEq` 用于热插拔后的对比：同一个 container id 换了身份（插线 ↔ 接收
+/// 器）时规格会变，旧 worker 必须重建而不是继续用着。
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DriverSpec {
     pub kind: Kind,
     /// 板载扇区布局；只有 `Kind::Hidpp` 会用到，Rapoo 留 `None`。

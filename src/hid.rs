@@ -1,11 +1,17 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use eframe::egui;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_Device_IDW, CM_Get_Parent, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
-    SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceInterfaceDetailW,
-    SetupDiGetDeviceRegistryPropertyW, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    SPDRP_BASE_CONTAINERID, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
-    SP_DEVINFO_DATA,
+    CM_Get_Device_IDW, CM_Get_Parent, CM_Register_Notification, CM_Unregister_Notification,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceInterfaceDetailW,
+    SetupDiGetDeviceRegistryPropertyW, CM_NOTIFY_ACTION, CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL,
+    CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL, CM_NOTIFY_EVENT_DATA, CM_NOTIFY_FILTER,
+    CM_NOTIFY_FILTER_0, CM_NOTIFY_FILTER_0_2, CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE, CR_SUCCESS,
+    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HCMNOTIFICATION, SPDRP_BASE_CONTAINERID,
+    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetHidGuid, HidD_GetManufacturerString,
@@ -455,9 +461,110 @@ pub fn enumerate() -> Vec<HidDevice> {
     devices
 }
 
+/// 一个 HID 接口插拔订阅的句柄。
+///
+/// 只有 Drop 有意义：注销订阅并释放回调上下文。持有它的对象（`DeviceManager`）
+/// 活着期间，回调才有一块稳定可读的上下文。
+pub struct DeviceWatch {
+    handle: HCMNOTIFICATION,
+    cx: *mut WatchCtx,
+}
+
+impl Drop for DeviceWatch {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.handle.is_null() {
+                CM_Unregister_Notification(self.handle);
+            }
+            if !self.cx.is_null() {
+                drop(Box::from_raw(self.cx));
+            }
+        }
+    }
+}
+
+/// 回调线程与 UI 线程之间唯一的共享状态：一个标志位加一个叫醒句柄。
+struct WatchCtx {
+    changed: Arc<AtomicBool>,
+    ctx: egui::Context,
+}
+
+/// 系统线程上的插拔回调。**只置位，不枚举**：`enumerate` 要给每个候选接口
+/// 开句柄，几十个接口就是几百毫秒，压在 PnP 通知链里会拖慢系统。
+unsafe extern "system" fn on_device_change(
+    _notify: HCMNOTIFICATION,
+    context: *const c_void,
+    action: CM_NOTIFY_ACTION,
+    _data: *const CM_NOTIFY_EVENT_DATA,
+    _size: u32,
+) -> u32 {
+    // 只认接口到达/移除；query-remove 之类的中间动作后面还会跟着正式事件，
+    // 重复置位只会多一次被合并掉的扫描。
+    if matches!(
+        action,
+        CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL | CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL
+    ) && !context.is_null()
+    {
+        // SAFETY: 注册时传进去的是 `Box::into_raw` 出来的 `WatchCtx`，只有
+        // `DeviceWatch::drop` 会在注销订阅之后释放它，所以回调活着时这块内存
+        // 一定有效；里面只有 `Arc<AtomicBool>` 和 `egui::Context`，都是线程安全的。
+        let cx = &*(context as *const WatchCtx);
+        cx.changed.store(true, Ordering::Relaxed);
+        cx.ctx.request_repaint();
+    }
+    0 // ERROR_SUCCESS
+}
+
+/// 订阅 HID 接口的插拔通知，把"有变化"记到 `changed` 上并叫醒界面。
+///
+/// 返回 `None` 表示订阅失败（系统策略或旧系统），调用方退回"只能手动重新
+/// 扫描"的老行为；界面照常可用，不是致命错误。
+pub fn watch(ctx: &egui::Context, changed: Arc<AtomicBool>) -> Option<DeviceWatch> {
+    unsafe {
+        let mut guid: windows_sys::core::GUID = std::mem::zeroed();
+        HidD_GetHidGuid(&mut guid);
+        let filter = CM_NOTIFY_FILTER {
+            cbSize: std::mem::size_of::<CM_NOTIFY_FILTER>() as u32,
+            Flags: 0,
+            FilterType: CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE,
+            Reserved: 0,
+            u: CM_NOTIFY_FILTER_0 {
+                DeviceInterface: CM_NOTIFY_FILTER_0_2 { ClassGuid: guid },
+            },
+        };
+        let cx = Box::into_raw(Box::new(WatchCtx {
+            changed,
+            ctx: ctx.clone(),
+        }));
+        let mut handle: HCMNOTIFICATION = std::ptr::null_mut();
+        let registered = CM_Register_Notification(
+            &filter,
+            cx as *const c_void,
+            Some(on_device_change),
+            &mut handle,
+        );
+        if registered != CR_SUCCESS {
+            drop(Box::from_raw(cx));
+            return None;
+        }
+        Some(DeviceWatch { handle, cx })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 订阅本身必须能建起来：它是"拔掉就消失"的唯一驱动源。订阅失败只能
+    /// 手动重扫，所以把这条钉成测试，别让某次重构把它悄悄弄坏。
+    #[test]
+    fn device_watch_registers_and_drops() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let subscription = watch(&egui::Context::default(), flag.clone());
+        assert!(subscription.is_some(), "订阅 HID 插拔通知失败");
+        assert!(!flag.load(Ordering::Relaxed), "还没插拔就不该置位");
+        drop(subscription);
+    }
 
     #[test]
     fn classifies_bluetooth_first() {

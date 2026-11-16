@@ -7,9 +7,7 @@ use eframe::egui::{self, Align, Layout, RichText, Stroke, Ui, Vec2};
 use crate::devices::{Cmd, DeviceId, DeviceInfo, DeviceState, EditorState, Link, Snapshot};
 use crate::driver::Limits;
 use crate::sysinput;
-use crate::theme::{
-    alpha, battery_color, battery_level, heading, meta, micro, text, Palette,
-};
+use crate::theme::{alpha, battery_color, battery_level, heading, meta, micro, text, Palette};
 use crate::ui::widgets::{
     battery_bar, card, chip, chip_small, connection_chip, connection_color, device_tile, divider,
     dpi_chip, link_action, paint_refresh, primary_button, section_heading, shadow_card, split_row,
@@ -282,7 +280,6 @@ fn settings_column(
         limited_card(ui, p, snap);
         ui.add_space(14.0);
     }
-    system_card(ui, p);
     cmds.append(&mut action.cmds);
 }
 
@@ -798,7 +795,7 @@ fn sys_write(ui: &Ui, id: egui::Id, v: u32, write: impl FnOnce(u32) -> bool) -> 
 /// Windows-level pointer and wheel settings. They are not stored on the mouse,
 /// so they get their own card and say so — otherwise people expect them to
 /// travel with the device the way DPI does.
-fn system_card(ui: &mut Ui, p: &Palette) {
+pub fn system_card(ui: &mut Ui, p: &Palette) {
     // A refused write has no visible symptom (the number simply stays put), so
     // it is remembered for a few seconds and shown as a notice.
     let fail_id = ui.scope_id().with("sys-write-refused");
@@ -891,7 +888,7 @@ fn system_card(ui: &mut Ui, p: &Palette) {
         setting_note(
             ui,
             p,
-            "这两项点完立即生效，所有程序一起变，和当前这台鼠标无关",
+            "这些设置点完立即生效，所有程序一起变，和当前这台鼠标无关",
         );
     });
 
