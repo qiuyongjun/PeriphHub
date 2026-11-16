@@ -607,6 +607,10 @@ pub struct DeviceManager {
     dirty: Arc<AtomicBool>,
     /// 这一波通知里第一条的时刻。到 `HOTPLUG_DEBOUNCE` 之后才真正扫描。
     dirty_since: Option<Instant>,
+    /// 最近一次真正把枚举结果合并进设备表的时刻；手动与自动扫描共用。
+    last_scan_completed: Option<Instant>,
+    /// 最近一次枚举线程中断且结果没有应用的时刻，用于在界面上承认失败。
+    last_scan_failed: Option<Instant>,
     /// 插拔订阅的句柄。只为了生存期而拿着它：Drop 时注销，回调不会打到已经
     /// 销毁的管理器上。
     _watch: Option<hid::DeviceWatch>,
@@ -637,6 +641,8 @@ impl DeviceManager {
             rescan_queued: false,
             dirty,
             dirty_since: None,
+            last_scan_completed: None,
+            last_scan_failed: None,
             _watch: watch,
         };
         manager.start_scan();
@@ -647,9 +653,26 @@ impl DeviceManager {
         self.demo
     }
 
-    /// 枚举线程还在跑。界面据此显示"正在扫描"，而不是"没有发现设备"。
+    /// 枚举线程还在跑，或插拔事件正在等合并窗口。界面据此显示"正在扫描"，
+    /// 而不是"没有发现设备"。
     pub fn is_scanning(&self) -> bool {
-        self.scan_rx.is_some()
+        self.scan_rx.is_some() || self.dirty_since.is_some()
+    }
+
+    /// 自动插拔检测是否可用。订阅失败时界面必须明示手动扫描兜底，而不是
+    /// 继续宣称"自动检测已开启"。
+    pub fn auto_detect_enabled(&self) -> bool {
+        self.demo || self._watch.is_some()
+    }
+
+    /// 最近一次真正合并了枚举结果的时间。自动扫描完成后也要刷新它。
+    pub fn last_scan_completed(&self) -> Option<Instant> {
+        self.last_scan_completed
+    }
+
+    /// 最近一次结果没有合并的时间；用于让"扫描失败"覆盖旧的"已更新"。
+    pub fn last_scan_failed(&self) -> Option<Instant> {
+        self.last_scan_failed
     }
 
     /// 插拔合并窗口还有多久关闭。界面据此把重绘提前到窗口关闭那一刻，否则
@@ -725,6 +748,9 @@ impl DeviceManager {
     fn start_scan(&mut self) {
         if self.demo {
             self.seed_demo_devices();
+            // 演示数据不会走枚举通道，但“重新扫描”确实完成了：刷新完成时间，
+            // 让按钮的“已更新”反馈保持一致。
+            self.last_scan_completed = Some(Instant::now());
             return;
         }
         if self.scan_rx.is_some() {
@@ -745,6 +771,7 @@ impl DeviceManager {
             crate::log::line("WARN", &format!("启动设备枚举线程失败：{e}，改为同步扫描"));
             let found = hid::enumerate();
             self.reconcile(found);
+            self.last_scan_completed = Some(Instant::now());
             return;
         }
         self.scan_rx = Some(rx);
@@ -756,6 +783,8 @@ impl DeviceManager {
         match result {
             Some(Ok(found)) => {
                 self.scan_rx = None;
+                // 只有结果真的应用了才算“已更新”；发起时间不算完成时间。
+                self.last_scan_completed = Some(Instant::now());
                 self.reconcile(found);
                 if self.rescan_queued {
                     self.rescan_queued = false;
@@ -767,6 +796,9 @@ impl DeviceManager {
                 // 枚举线程没能把结果送回来（panic 或进程在退）；别让界面
                 // 永远停在"正在扫描"。
                 self.scan_rx = None;
+                // 这不是完成：不能刷新“已更新”，让界面显示失败态。
+                self.last_scan_failed = Some(Instant::now());
+                crate::log::line("WARN", "设备枚举线程中断，本轮扫描结果没有应用");
                 if self.rescan_queued {
                     self.rescan_queued = false;
                     self.start_scan();
@@ -906,7 +938,9 @@ impl DeviceManager {
         let mut changed = self.apply_scan_result();
         if self.hotplug_due() {
             self.start_scan();
-            changed = true;
+            // 只有真的开始枚举才要求立即重绘；扫描进行中重复触发只会排队，
+            // 真正的状态变化会随结果合并出现。
+            changed |= self.scan_rx.is_some();
         }
         for entry in &mut self.entries {
             let mut died = false;
@@ -1135,6 +1169,36 @@ mod tests {
         assert!(manager.poll());
         assert!(!manager.is_scanning());
         assert!(manager.list().is_empty());
+        assert!(
+            manager.last_scan_completed().is_some(),
+            "结果合并后才算扫描完成"
+        );
+        assert!(manager.last_scan_failed().is_none());
+    }
+
+    /// 枚举线程崩溃/断开不是扫描完成：不能刷新“已更新”，界面要能看到失败。
+    #[test]
+    fn failed_scan_is_not_marked_completed() {
+        let (tx, rx) = mpsc::channel();
+        let mut manager = test_manager();
+        manager.scan_rx = Some(rx);
+        drop(tx);
+        assert!(manager.poll());
+        assert!(!manager.is_scanning());
+        assert!(manager.last_scan_failed().is_some());
+        assert!(manager.last_scan_completed().is_none());
+        assert!(!manager.auto_detect_enabled(), "测试管理器没有订阅");
+    }
+
+    /// 插拔事件等待合并窗口的 400ms 也是“检测中”，首页/浮窗要给出反馈。
+    #[test]
+    fn pending_hotplug_window_counts_as_scanning() {
+        let mut manager = test_manager();
+        manager.dirty.store(true, Ordering::Relaxed);
+        assert!(!manager.poll());
+        assert!(manager.dirty_since.is_some());
+        assert!(manager.is_scanning());
+        assert!(manager.pending_scan_in().is_some());
     }
 
     fn test_manager() -> DeviceManager {
@@ -1147,6 +1211,8 @@ mod tests {
             rescan_queued: false,
             dirty: Arc::new(AtomicBool::new(false)),
             dirty_since: None,
+            last_scan_completed: None,
+            last_scan_failed: None,
             _watch: None,
         }
     }

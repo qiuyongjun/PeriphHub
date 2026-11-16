@@ -35,14 +35,11 @@ pub struct HomeAction {
     pub rescan: bool,
 }
 
+/// 扫描完成/失败后短时间展示结果反馈；与浮窗共用同一节奏。
+const SCAN_NOTICE_SECS: u64 = 2;
+
 /// 工作台概览与自适应设备网格，保留现有状态排序和页面入口。
-pub fn view(
-    ui: &mut Ui,
-    p: &Palette,
-    manager: &DeviceManager,
-    recently_scanned: bool,
-    last_scan: Option<Instant>,
-) -> HomeAction {
+pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager) -> HomeAction {
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut action = HomeAction::default();
     let entries = manager.list();
@@ -56,10 +53,24 @@ pub fn view(
         .filter(|e| matches!(e.state.link, Link::Connecting))
         .count();
     let scanning = manager.is_scanning();
+    let completed = manager.last_scan_completed();
+    let failed = manager.last_scan_failed();
+    let recently_scanned = completed
+        .is_some_and(|c| failed.is_none_or(|f| c > f) && c.elapsed().as_secs() < SCAN_NOTICE_SECS);
 
     header(ui, p, &mut action, recently_scanned, scanning);
     ui.add_space(16.0);
-    overview(ui, p, total, online, connecting, last_scan, scanning);
+    overview(
+        ui,
+        p,
+        total,
+        online,
+        connecting,
+        completed,
+        failed,
+        manager.auto_detect_enabled(),
+        scanning,
+    );
     ui.add_space(20.0);
 
     split_row(
@@ -159,30 +170,43 @@ fn header(
     );
 }
 
-/// 用一条紧凑概览替代重复的大数字区块，同时呈现扫描与连接过程。
+/// 用一条紧凑概览替代重复的大数字区块，同时呈现扫描、失败与连接过程。
+#[allow(clippy::too_many_arguments)]
 fn overview(
     ui: &mut Ui,
     p: &Palette,
     total: usize,
     online: usize,
     connecting: usize,
-    last_scan: Option<Instant>,
+    completed: Option<Instant>,
+    failed: Option<Instant>,
+    auto_detect: bool,
     scanning: bool,
 ) {
     surface(ui, p, Margin::symmetric(16, 11), |ui| {
         split_row(
             ui,
             |ui| {
-                let color = if scanning || connecting > 0 {
+                let failed_recent = failed.is_some_and(|f| {
+                    completed.is_none_or(|c| f > c) && f.elapsed().as_secs() < SCAN_NOTICE_SECS
+                });
+                // 状态点代表“整条检测链路是否可信”：自动检测不可用、扫描失败、
+                // 插拔合并中或设备连接中都算需要留意；全部离线不是正常态。
+                let color = if scanning || connecting > 0 || failed_recent || !auto_detect {
                     p.warn
                 } else if total == 0 {
                     p.dim
+                } else if online == 0 {
+                    p.danger
                 } else {
                     p.ok
                 };
                 status_dot(ui, color, scanning);
                 ui.add_space(2.0);
-                ui.label(meta(sync_text(last_scan, scanning), p.dim));
+                ui.label(meta(
+                    sync_text(completed, failed, auto_detect, scanning),
+                    p.dim,
+                ));
             },
             |ui| {
                 ui.horizontal(|ui| {
@@ -567,12 +591,22 @@ fn loading_body(ui: &mut Ui, p: &Palette) {
     });
 }
 
-/// 显示真实扫描进度与最近完成时间，不把"刚发起"误报成"已更新"。
-fn sync_text(last: Option<Instant>, scanning: bool) -> String {
+/// 显示真实扫描进度、最近完成/失败时间和自动检测可用性；不把"刚发起"
+/// 误报成"已更新"。
+fn sync_text(
+    completed: Option<Instant>,
+    failed: Option<Instant>,
+    auto_detect: bool,
+    scanning: bool,
+) -> String {
     if scanning {
         return "正在检测设备…".into();
     }
-    match last {
+    let failed_is_newest = failed.is_some_and(|f| completed.is_none_or(|c| f > c));
+    if failed_is_newest && failed.is_some_and(|f| f.elapsed().as_secs() < SCAN_NOTICE_SECS) {
+        return "上次检测失败，请重新扫描".into();
+    }
+    match completed {
         Some(t) => {
             let s = t.elapsed().as_secs();
             if s < 3 {
@@ -583,6 +617,7 @@ fn sync_text(last: Option<Instant>, scanning: bool) -> String {
                 format!("{} 分钟前更新", s / 60)
             }
         }
+        None if !auto_detect => "自动检测不可用，请手动扫描".into(),
         None => "设备自动检测已开启".into(),
     }
 }

@@ -474,7 +474,18 @@ impl Drop for DeviceWatch {
     fn drop(&mut self) {
         unsafe {
             if !self.handle.is_null() {
-                CM_Unregister_Notification(self.handle);
+                let result = CM_Unregister_Notification(self.handle);
+                if result != CR_SUCCESS {
+                    // 注销失败意味着系统回调可能还会访问上下文。宁可泄漏这块
+                    // 小内存，也不能释放后留下悬垂指针。
+                    crate::log::line(
+                        "ERROR",
+                        &format!("注销设备插拔通知失败（{result}），回调上下文暂不释放"),
+                    );
+                    std::mem::forget(Box::from_raw(self.cx));
+                    self.cx = std::ptr::null_mut();
+                    return;
+                }
             }
             if !self.cx.is_null() {
                 drop(Box::from_raw(self.cx));
@@ -554,6 +565,7 @@ pub fn watch(ctx: &egui::Context, changed: Arc<AtomicBool>) -> Option<DeviceWatc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::CM_NOTIFY_ACTION_DEVICEQUERYREMOVE;
 
     /// 订阅本身必须能建起来：它是"拔掉就消失"的唯一驱动源。订阅失败只能
     /// 手动重扫，所以把这条钉成测试，别让某次重构把它悄悄弄坏。
@@ -564,6 +576,53 @@ mod tests {
         assert!(subscription.is_some(), "订阅 HID 插拔通知失败");
         assert!(!flag.load(Ordering::Relaxed), "还没插拔就不该置位");
         drop(subscription);
+    }
+
+    /// 回调函数本身必须可测：它只置位并叫醒界面，不直接枚举设备。到达/移除
+    /// 都要置位，中间态和空上下文则不能误触发。
+    #[test]
+    fn device_change_callback_sets_the_dirty_flag() {
+        for action in [
+            CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL,
+            CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL,
+        ] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let cx = Box::into_raw(Box::new(WatchCtx {
+                changed: flag.clone(),
+                ctx: egui::Context::default(),
+            }));
+            let result = unsafe {
+                on_device_change(
+                    std::ptr::null_mut(),
+                    cx as *const c_void,
+                    action,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0);
+            assert!(flag.load(Ordering::Relaxed), "接口到达/移除必须置位");
+            unsafe { drop(Box::from_raw(cx)) };
+        }
+
+        // query-remove 后面还会跟着正式事件，不能在这里发起额外扫描。
+        let flag = Arc::new(AtomicBool::new(false));
+        let cx = Box::into_raw(Box::new(WatchCtx {
+            changed: flag.clone(),
+            ctx: egui::Context::default(),
+        }));
+        let result = unsafe {
+            on_device_change(
+                std::ptr::null_mut(),
+                cx as *const c_void,
+                CM_NOTIFY_ACTION_DEVICEQUERYREMOVE,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(result, 0);
+        assert!(!flag.load(Ordering::Relaxed));
+        unsafe { drop(Box::from_raw(cx)) };
     }
 
     #[test]

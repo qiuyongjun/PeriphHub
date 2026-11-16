@@ -64,9 +64,6 @@ pub struct Panel {
     /// 配置页的浮层设备错误：最近一次展示的消息与首次出现时间。设备离线
     /// 提示不经过它——离线是持续状态，浮层画到恢复在线为止。
     err_toast: Option<ErrToast>,
-    last_rescan: Option<Instant>,
-    /// 手动扫描已发起但结果尚未合并，完成前不能显示“已更新”。
-    rescan_pending: bool,
     /// Native handle of this window, kept so the frame style can be stripped.
     hwnd: Option<isize>,
     /// Height we last asked the window to be while in mini mode, so the resize
@@ -154,8 +151,6 @@ impl Panel {
             quitting: false,
             error,
             err_toast: None,
-            last_rescan: None,
-            rescan_pending: false,
             hwnd,
             mini_h: 0.0,
             mini_placed: false,
@@ -176,10 +171,10 @@ impl Panel {
         }
     }
 
-    /// 发起后台扫描；完成时间只在结果真正合并后记录，避免过早显示“已更新”。
+    /// 发起后台扫描。完成/失败时间由 DeviceManager 在结果合并时记录；
+    /// 这里只负责叫醒界面，避免把“发起”误报成“完成”。
     fn do_rescan(&mut self, ctx: &egui::Context) {
         self.manager.rescan();
-        self.rescan_pending = true;
         ctx.request_repaint();
     }
 
@@ -749,11 +744,12 @@ impl Panel {
                 divider(ui, p);
                 ui.add_space(12.0);
 
-                // 系统指针是全局功能，放在设置里可随时访问，不依赖设备在线或快照就绪。
-                // 弹层主体滚动，标题与关闭按钮始终留在原位。
+                // 标题、关闭按钮与外边距约占 168pt；留出这些固定开销后再滚动，
+                // 避免小窗口下弹层底边被裁或触发生成位置约束抖动。
+                const SETTINGS_CHROME_H: f32 = 168.0;
                 let viewport_h =
                     ctx.input(|i| i.viewport().inner_rect.map_or(720.0, |rect| rect.height()));
-                let max_h = (viewport_h - 160.0).clamp(280.0, 560.0);
+                let max_h = (viewport_h - SETTINGS_CHROME_H).clamp(280.0, 560.0);
                 let scanning = self.manager.is_scanning();
                 let device_count = self.manager.list().len();
                 egui::ScrollArea::vertical()
@@ -989,12 +985,8 @@ impl eframe::App for Panel {
         if self.manager.poll() {
             // 基线只可能在"刚读到新快照"时出现，跟着 poll 的结果做就够了；
             // 以前每帧都扫一遍设备列表、为每台设备拼一次 key，纯属空转。
+            // 扫描完成/失败时间由 manager 维护，自动与手动扫描共用。
             self.capture_dpi_baselines();
-            ctx.request_repaint();
-        }
-        if self.rescan_pending && !self.manager.is_scanning() {
-            self.rescan_pending = false;
-            self.last_rescan = Some(Instant::now());
             ctx.request_repaint();
         }
         // "Connecting" status dots breathe; give them frames to breathe in.
@@ -1082,10 +1074,7 @@ impl eframe::App for Panel {
 impl Panel {
     fn mini_ui(&mut self, ui: &mut Ui, p: &'static theme::Palette) {
         let ctx = ui.ctx().clone();
-        let recently_scanned = self
-            .last_rescan
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
-        let action = mini::view(ui, p, &self.manager, self.cfg.mini_pinned, recently_scanned);
+        let action = mini::view(ui, p, &self.manager, self.cfg.mini_pinned);
         if action.toggle_pin {
             let next = !self.cfg.mini_pinned;
             self.set_pinned(&ctx, next);
@@ -1099,10 +1088,13 @@ impl Panel {
         if let Some(id) = action.open_config {
             self.show_main(&ctx);
             self.open_config(&id);
+        } else if action.open_settings {
+            // 浮窗内直达设置：尤其覆盖默认启动即浮窗、没有设备可点配置页的场景。
+            self.show_main(&ctx);
+            self.settings_open = true;
         } else if action.open_main {
             self.show_main(&ctx);
-        }
-        if action.quit {
+        } else if action.quit {
             self.quit(&ctx);
         }
     }
@@ -1217,16 +1209,7 @@ impl Panel {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let recently_scanned = self
-                                    .last_rescan
-                                    .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
-                                let action = home::view(
-                                    ui,
-                                    p,
-                                    &self.manager,
-                                    recently_scanned,
-                                    self.last_rescan,
-                                );
+                                let action = home::view(ui, p, &self.manager);
                                 if action.rescan {
                                     self.do_rescan(&ctx);
                                 }

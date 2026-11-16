@@ -442,8 +442,8 @@ fn paint_mini(painter: &egui::Painter, rect: Rect, color: Color32) {
     );
 }
 
-/// 滑杆形态使设置入口与主题按钮一眼可区分。
-fn paint_gear(painter: &egui::Painter, rect: Rect, color: Color32) {
+/// 滑杆形态使设置入口与主题按钮一眼可区分；浮窗设置按钮复用同一图标。
+pub fn paint_gear(painter: &egui::Painter, rect: Rect, color: Color32) {
     // Three sliders read as "settings" instantly; the old radial ticks beside
     // the sun/moon toggle looked like a second theme button.
     let c = rect.center();

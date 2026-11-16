@@ -55,7 +55,7 @@ keyDownDelay  keyUpDelay  openDPIXY  glassFunc  support8k  fwVersion
 | 11 | **传感器角度** | `sensorAngle` 可调 | 无（`0x08C4` 未验证） | 未实现 |
 | 12 | **玻璃追踪** | `glassFunc`，3950 引擎玻璃桌面补偿 | 无 | 未实现 |
 | 13 | 8000Hz OTA | `support8k`，本机 false | 无 | 不适用 |
-| 14 | 指针速度/滚轮速度 | 直接改 Windows 设置 | 配置页底部「系统指针」卡：指针速度 1–20、滚轮行数、整屏滚动 | ✅ 已实现 |
+| 14 | 指针速度/滚轮速度 | 直接改 Windows 设置 | 设置弹层「系统指针」卡：指针速度 1–20、滚轮行数、整屏滚动 | ✅ 已实现 |
 | 15 | 恢复出厂 / 重置设备 | 有 | 无 | 未实现 |
 
 ### 2.2 按键与宏

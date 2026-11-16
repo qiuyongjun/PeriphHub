@@ -13,6 +13,7 @@ use eframe::egui::{
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::theme::{alpha, battery_color, battery_level, heading_font, paint_brand, text, Palette};
+use crate::ui::chrome::paint_gear;
 use crate::ui::widgets::{
     activated, connection_color, focus_ring, mix, paint_device_glyph, shadow_card, short_model,
     CARD_RADIUS,
@@ -43,11 +44,14 @@ const ROW_H: f32 = 52.0;
 /// Past this many devices the widget stops growing and scrolls instead, so it
 /// never eats more desktop than it is worth.
 const MAX_ROWS: usize = 5;
+/// 扫描完成/失败后的短反馈窗口，与首页概览保持一致。
+const SCAN_NOTICE_SECS: u64 = 2;
 
 #[derive(Default)]
 pub struct MiniAction {
     pub open_main: bool,
     pub open_config: Option<DeviceId>,
+    pub open_settings: bool,
     pub toggle_pin: bool,
     pub toggle_theme: bool,
     pub rescan: bool,
@@ -61,14 +65,8 @@ pub fn height(devices: usize) -> f32 {
     HEAD_H + LIST_GAP + rows * ROW_H + 10.0
 }
 
-/// 紧凑浮窗用双行身份和设备图标保持可读性，沿用原有动作。
-pub fn view(
-    ui: &mut Ui,
-    p: &Palette,
-    manager: &DeviceManager,
-    pinned: bool,
-    recently_scanned: bool,
-) -> MiniAction {
+/// 紧凑浮窗用双行身份和设备图标保持可读性；设置入口不再依赖主界面。
+pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager, pinned: bool) -> MiniAction {
     let mut action = MiniAction::default();
     let window = ui.ctx().content_rect();
     let card = window.shrink(SHADOW_PAD);
@@ -109,11 +107,21 @@ pub fn view(
 
     let list_h = entries.len().clamp(1, MAX_ROWS) as f32 * ROW_H;
     if entries.is_empty() {
+        // 完成/失败反馈只展示最新一次结果；失败会覆盖旧的“已更新”。
+        let completed = manager.last_scan_completed();
+        let failed = manager.last_scan_failed();
+        let scan_failed = failed.is_some_and(|f| {
+            completed.is_none_or(|c| f > c) && f.elapsed().as_secs() < SCAN_NOTICE_SECS
+        });
+        let recently_scanned = completed.is_some_and(|c| {
+            failed.is_none_or(|f| c > f) && c.elapsed().as_secs() < SCAN_NOTICE_SECS
+        });
         empty_row(
             &mut body,
             p,
             &mut action,
             recently_scanned,
+            scan_failed,
             manager.is_scanning(),
             list_h,
         );
@@ -163,9 +171,10 @@ fn header(
     // a borrow of the painter.
     let painter = body.painter().clone();
 
-    // 30px 工具按钮兼顾紧凑与触达面积，全部支持 Tab、回车和空格。
+    // 30px 工具按钮兼顾紧凑与触达面积；设置放在最左侧，浮窗内即可直达。
+    // ID 用稳定 key，不跟 tooltip/置顶状态变化，否则键盘焦点会在切换时丢失。
     let mut x = rect.right();
-    let mut slots = [Rect::ZERO; 4];
+    let mut slots = [Rect::ZERO; 5];
     for slot in slots.iter_mut() {
         let r = Rect::from_min_size(
             Pos2::new(x - 30.0, rect.center().y - 15.0),
@@ -174,16 +183,25 @@ fn header(
         *slot = r;
         x = r.left() - 2.0;
     }
-    if icon_button(body, slots[0], p, "退出 PeriphHub", paint_close, false) {
+    if icon_button(
+        body,
+        slots[0],
+        p,
+        "quit",
+        "退出 PeriphHub",
+        paint_close,
+        false,
+    ) {
         action.quit = true;
     }
-    if icon_button(body, slots[1], p, "打开主界面", paint_open, false) {
+    if icon_button(body, slots[1], p, "open", "打开主界面", paint_open, false) {
         action.open_main = true;
     }
     if icon_button(
         body,
         slots[2],
         p,
+        "pin",
         if pinned {
             "取消置顶"
         } else {
@@ -206,11 +224,26 @@ fn header(
         body,
         slots[3],
         p,
+        "theme",
         theme_tip,
         move |painter, c, color| paint_theme(painter, c, color, dark, card),
         false,
     ) {
         action.toggle_theme = true;
+    }
+    if icon_button(
+        body,
+        slots[4],
+        p,
+        "settings",
+        "打开设置与系统指针",
+        // chrome 的齿轮以矩形中心为基准；浮窗按钮回调给的是中心点，包一层即可。
+        |painter, c, color| {
+            paint_gear(painter, Rect::from_center_size(c, Vec2::splat(16.0)), color)
+        },
+        false,
+    ) {
+        action.open_settings = true;
     }
 
     // Monogram, name, and the one number that matters.
@@ -423,60 +456,67 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     }
 }
 
-/// 空态保留扫描入口，并区分后台扫描过程与扫描结论。
+/// 空态保留扫描入口，并区分后台扫描过程、扫描结论与最近一次失败。
+#[allow(clippy::too_many_arguments)]
 fn empty_row(
     body: &mut Ui,
     p: &Palette,
     action: &mut MiniAction,
     recently_scanned: bool,
+    scan_failed: bool,
     scanning: bool,
     height: f32,
 ) {
-    let width = body.available_width();
-    let (rect, resp) = body.allocate_exact_size(Vec2::new(width, height), Sense::click());
-    let hover =
-        body.ctx()
-            .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
-    let painter = body.painter();
-    if hover > 0.001 {
-        painter.rect_filled(
-            rect,
-            CornerRadius::same(11),
-            alpha(p.chip_bg, (hover * 215.0) as u8),
+    // 禁用态交给 egui：不会进 Tab，也不会响应回车/空格；不再画一个看起来
+    // 可激活却吞掉键盘动作的焦点环。
+    body.add_enabled_ui(!scanning, |ui| {
+        let width = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let hover =
+            ui.ctx()
+                .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.10);
+        let painter = ui.painter();
+        if hover > 0.001 {
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(11),
+                alpha(p.chip_bg, (hover * 215.0) as u8),
+            );
+        }
+        // 后台首轮扫描期间不能报"未发现设备"：那是结论，不是过程。
+        let (title, note) = if scanning {
+            ("正在扫描…", "正在检测已连接的外设")
+        } else if scan_failed {
+            ("上次扫描失败", "检查设备后点击重新扫描")
+        } else if recently_scanned {
+            ("仍未发现设备", "检查接收器或数据线后重新扫描")
+        } else {
+            ("未发现设备", "点击扫描已连接的外设")
+        };
+        painter.text(
+            Pos2::new(rect.center().x, rect.center().y - 8.0),
+            Align2::CENTER_CENTER,
+            title,
+            FontId::proportional(text::BODY),
+            if scan_failed { p.warn } else { p.text },
         );
-    }
-    // 后台首轮扫描期间不能报"未发现设备"：那是结论，不是过程。
-    let (title, note) = if scanning {
-        ("正在扫描…", "正在检测已连接的外设")
-    } else if recently_scanned {
-        ("仍未发现设备", "检查接收器或数据线后重新扫描")
-    } else {
-        ("未发现设备", "点击扫描已连接的外设")
-    };
-    painter.text(
-        Pos2::new(rect.center().x, rect.center().y - 8.0),
-        Align2::CENTER_CENTER,
-        title,
-        FontId::proportional(text::BODY),
-        p.text,
-    );
-    painter.text(
-        Pos2::new(rect.center().x, rect.center().y + 10.0),
-        Align2::CENTER_CENTER,
-        note,
-        FontId::proportional(text::META),
-        p.dim,
-    );
-    if resp.has_focus() {
-        focus_ring(body, rect, p, 10);
-    }
-    let triggered = activated(body, &resp);
-    if resp.hovered() && !scanning {
-        body.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if triggered && !scanning {
-        action.rescan = true;
-    }
+        painter.text(
+            Pos2::new(rect.center().x, rect.center().y + 10.0),
+            Align2::CENTER_CENTER,
+            note,
+            FontId::proportional(text::META),
+            p.dim,
+        );
+        if resp.has_focus() {
+            focus_ring(ui, rect, p, 10);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if activated(ui, &resp) {
+            action.rescan = true;
+        }
+    });
 }
 
 /// 置顶状态用轻微色彩标识，所有工具保持一致的触达面积。
@@ -484,11 +524,12 @@ fn icon_button(
     ui: &mut Ui,
     rect: Rect,
     p: &Palette,
+    key: &'static str,
     tip: &str,
     paint: impl FnOnce(&egui::Painter, Pos2, Color32),
     accent: bool,
 ) -> bool {
-    let resp = ui.interact(rect, ui.scope_id().with(tip), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with(key), Sense::click());
     let t = ui
         .ctx()
         .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.07);
