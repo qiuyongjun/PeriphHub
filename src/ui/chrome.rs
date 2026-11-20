@@ -6,6 +6,9 @@ use eframe::egui::{
 use crate::theme::{alpha, heading, Palette};
 use crate::ui::widgets::{activated, focus_ring, mix, CARD_RADIUS};
 
+/// 标题栏高度。设置弹层要靠它让开标题栏，两处共用一个值。
+pub const BAR_H: f32 = 50.0;
+
 pub struct Bar<'a> {
     pub title: &'a str,
     pub subtitle: Option<&'a str>,
@@ -33,7 +36,7 @@ pub struct BarAction {
 pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
     let mut action = BarAction::default();
     let width = ui.available_width();
-    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(width, BAR_H), Sense::hover());
     // 标题栏铺满圆角卡片的整个宽度，顶部两角跟随卡片圆角，否则方角会从
     // 卡片圆弧里戳出去；最大化时卡片无圆角，标题栏也回到方角。
     let top = if cfg.maximized { 0 } else { CARD_RADIUS };
@@ -126,11 +129,7 @@ pub fn titlebar(ui: &mut Ui, p: &Palette, cfg: Bar<'_>) -> BarAction {
                     } else {
                         "切换到深色模式"
                     };
-                    let dark = p.dark;
-                    let titlebar = p.titlebar;
-                    if icon_button(ui, p, theme_tip, move |painter, rect, color| {
-                        paint_theme(painter, rect, color, dark, titlebar)
-                    }) {
+                    if icon_button(ui, p, theme_tip, paint_theme) {
                         action.toggle_theme = true;
                     }
                     if icon_button(ui, p, "切换为浮窗模式", paint_mini) {
@@ -401,22 +400,25 @@ fn icon_button(
     triggered
 }
 
-/// Sun while dark mode is active ("switch to light"), moon in light mode.
-fn paint_theme(painter: &egui::Painter, rect: Rect, color: Color32, dark: bool, bg: Color32) {
+/// 主题开关统一成“明暗对比”图形：外圈 + 左半实心。
+///
+/// 原来深色态画太阳、浅色态画月亮：太阳带八道光芒，外廓近 17px；月亮只剩
+/// 一弯，实心直径 11px。同一排 34px 按钮里两态大小差出一倍，切换时按钮像
+/// 抖了一下。换成同一枚图形切换（对比度是系统里通行的主题符号），两态永远
+/// 等大；含义由 tooltip 与图形本身共同表达。
+pub fn paint_theme(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
-    let stroke = Stroke::new(1.4, color);
-    if dark {
-        painter.circle_stroke(c, 4.6, stroke);
-        for i in 0..8 {
-            let a = i as f32 * std::f32::consts::TAU / 8.0;
-            let dir = Vec2::angled(a);
-            painter.line_segment([c + dir * 6.6, c + dir * 8.6], stroke);
-        }
-    } else {
-        // Crescent: a filled disc with a small offset disc knocked out.
-        painter.circle_filled(c, 5.4, color);
-        painter.circle_filled(c + Vec2::new(2.4, -2.4), 4.8, bg);
+    let r = 5.6;
+    let stroke = Stroke::new(1.3, color);
+    painter.circle_stroke(c, r, stroke);
+    // 左半圆：自上而下扫过左侧，再沿竖直直径收口，半圆仍是凸多边形。
+    let steps = 12;
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let a = -std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * (i as f32 / steps as f32);
+        pts.push(c + Vec2::angled(a) * (r - 0.2));
     }
+    painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
 }
 
 /// 窗口里嵌一张小卡片：表示“把这扇大窗收成桌面浮窗”。

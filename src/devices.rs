@@ -91,6 +91,7 @@ pub enum Link {
     Offline(String),
 }
 
+/// 鼠标配置页的编辑态；键盘只读，不使用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditorState {
     pub lod: u8,
@@ -273,7 +274,7 @@ fn spawn_worker(
     let busy = Arc::new(AtomicBool::new(false));
     let worker_busy = busy.clone();
     let handle = std::thread::Builder::new()
-        .name(format!("{:?}-worker", spec.kind))
+        .name(format!("{:?}-worker", spec.protocol.kind()))
         .spawn(move || real_worker(path, spec, rx, msg_tx, ctx, read_mode, worker_busy))
         .expect("启动设备采集线程");
     (tx, msg_rx, handle, busy)

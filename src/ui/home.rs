@@ -7,8 +7,8 @@ use eframe::egui::{
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::driver::{self, DeviceProfile};
 use crate::theme::{
-    battery_color, battery_level, battery_text, brand_badge, card_shadow, heading, meta, text,
-    Palette,
+    alpha, battery_color, battery_level, battery_text, brand_badge, card_shadow, heading, meta,
+    numeral, text, Palette,
 };
 use crate::ui::widgets::{
     action_link, activated, connection_chip_colored, connection_color, device_tile, focus_ring,
@@ -19,9 +19,9 @@ use crate::ui::widgets::{
 /// Height of a device card's body block; every variant pads to it so cards in
 /// the same row keep their feet on one line.
 ///
-/// 指标只剩"标签 + 数值"两行（约 45）时，这里必须跟着收：固定 60 会在数值
-/// 和分隔线之间留出一段谁也用不上的空白。
-const BODY_H: f32 = 46.0;
+/// 指标是"标签 + 数值"两行（约 45）；只读卡片是标题加最多两行说明（约 49）。
+/// 槽位按更高的一方收：两个变体都装得下，谁也不会把同排的卡片挤得不齐。
+const BODY_H: f32 = 50.0;
 /// Inner content height of every device card: header + body + rule + footer.
 const CARD_H: f32 = 158.0;
 /// Side of the letter tile in card headers. The title block must reserve the
@@ -59,7 +59,7 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager) -> HomeAction {
         .is_some_and(|c| failed.is_none_or(|f| c > f) && c.elapsed().as_secs() < SCAN_NOTICE_SECS);
 
     header(ui, p, &mut action, recently_scanned, scanning);
-    ui.add_space(16.0);
+    ui.add_space(14.0);
     overview(
         ui,
         p,
@@ -71,7 +71,7 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager) -> HomeAction {
         manager.auto_detect_enabled(),
         scanning,
     );
-    ui.add_space(20.0);
+    ui.add_space(16.0);
 
     split_row(
         ui,
@@ -88,14 +88,14 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager) -> HomeAction {
             }
         },
     );
-    ui.add_space(12.0);
+    ui.add_space(10.0);
 
     if entries.is_empty() {
         empty_state(ui, p, &mut action, manager.is_scanning());
         return action;
     }
 
-    let gap = 18.0;
+    let gap = 14.0;
     // 三列只在宽窗口启用，确保长型号和回报率在常用尺寸下完整可读。
     let min_w = 340.0;
     let avail = ui.available_width();
@@ -106,7 +106,12 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager) -> HomeAction {
     let mut order: Vec<&Entry> = entries.iter().collect();
     order.sort_by_key(|e| matches!(e.state.link, Link::Offline(_)) as u8);
 
-    for row in order.chunks(cols) {
+    // 行距只加在行与行之间：最后一行后面那一截空行会把页脚推到窗口外，
+    // 而它本身不承担任何分隔作用。
+    for (row_index, row) in order.chunks(cols).enumerate() {
+        if row_index > 0 {
+            ui.add_space(gap);
+        }
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for (i, entry) in row.iter().enumerate() {
@@ -125,7 +130,6 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager) -> HomeAction {
                 );
             }
         });
-        ui.add_space(gap);
     }
     action
 }
@@ -201,20 +205,22 @@ fn overview(
                 } else {
                     p.ok
                 };
-                status_dot(ui, color, scanning);
-                ui.add_space(2.0);
+                // 这个槽位在 split_row 里按从右往左排，先加的文字落在最右，
+                // 再加状态点就回到文字左侧——和设备卡里"点在左、文字在右"一致。
                 ui.label(meta(
                     sync_text(completed, failed, auto_detect, scanning),
                     p.dim,
                 ));
+                ui.add_space(2.0);
+                status_dot(ui, color, scanning);
             },
             |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 5.0;
-                    ui.label(heading(total.to_string(), text::HEADING, p.text));
+                    ui.label(numeral(total.to_string(), text::HEADING, p.text));
                     ui.label(meta("台设备", p.dim));
                     ui.add_space(13.0);
-                    ui.label(heading(
+                    ui.label(numeral(
                         online.to_string(),
                         text::HEADING,
                         if online > 0 { p.ok } else { p.dim },
@@ -287,11 +293,6 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
         p.card
     };
     let text_col = if offline { p.dim } else { p.text };
-    let border = if offline {
-        p.border.gamma_multiply(0.7)
-    } else {
-        p.border
-    };
 
     let card_id = ui
         .scope_id()
@@ -299,7 +300,7 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
     let mut clicked_button = false;
     let frame = egui::Frame::new()
         .fill(card_fill)
-        .stroke(Stroke::new(1.0, border))
+        .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(Margin::same(16))
         .shadow(card_shadow(p))
@@ -341,6 +342,22 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     |ui| {
                         ui.set_width(title_w);
                         ui.spacing_mut().item_spacing.y = 1.0;
+                        // 型号在上、厂家在下：用户先认“哪台设备”，厂牌是补充
+                        // 信息，字号与字重也按这个层级收（见 config 页同一顺序）。
+                        let full = entry.info.model.as_str();
+                        let title = short_model(full);
+                        let label = ui.add(
+                            // 自动的“省略时提示”会和下面手写的完整型号提示叠成
+                            // 两条 tooltip，与配置页保持同一处理。
+                            egui::Label::new(heading(title, text::SUBTITLE, text_col))
+                                .truncate()
+                                .show_tooltip_when_elided(false),
+                        );
+                        // The shortened title is a convenience; the device's
+                        // own name stays one hover away.
+                        if title != full {
+                            label.on_hover_text(full);
+                        }
                         ui.add(
                             egui::Label::new(
                                 RichText::new(entry.info.brand.to_uppercase())
@@ -350,16 +367,6 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                             )
                             .truncate(),
                         );
-                        let full = entry.info.model.as_str();
-                        let title = short_model(full);
-                        let label = ui.add(
-                            egui::Label::new(heading(title, text::SUBTITLE, text_col)).truncate(),
-                        );
-                        // The shortened title is a convenience; the device's
-                        // own name stays one hover away.
-                        if title != full {
-                            label.on_hover_text(full);
-                        }
                     },
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -367,9 +374,9 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     connection_chip_colored(ui, p, entry.info.connection, chip_color);
                 });
             });
-            ui.add_space(12.0);
+            ui.add_space(11.0);
             hairline(ui, p, 165);
-            ui.add_space(12.0);
+            ui.add_space(11.0);
 
             let body_top = ui.cursor().top();
             ui.allocate_ui_with_layout(
@@ -392,10 +399,13 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                 ui.add_space(BODY_H - used);
             }
 
-            ui.add_space(12.0);
+            ui.add_space(11.0);
             hairline(ui, p, 165);
-            ui.add_space(9.0);
+            ui.add_space(7.0);
 
+            // 页脚只有一条动作链接和一枚状态点，用 26px 行高就够；默认的
+            // interact_size 会把整行撑到 32，白白多占一截卡片高度。
+            ui.spacing_mut().interact_size.y = 26.0;
             split_row(
                 ui,
                 |ui| {
@@ -449,7 +459,8 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
         ui.ctx()
             .animate_value_with_time(card_id, if response.hovered() { 1.0 } else { 0.0 }, 0.10);
     if t > 0.001 {
-        let col = mix(p.border, p.accent, t * 0.42);
+        // 静置时无描边；悬停才浮出一圈发丝线，作为"可点"的反馈。
+        let col = alpha(mix(p.border, p.accent, 0.45), (t * 255.0) as u8);
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(CARD_RADIUS),
@@ -501,7 +512,8 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
     }
     let cols = [
         // "有线"不是读数：连接方式已经写在卡头，没读到电量就不占一列。
-        (entry.state.battery.is_some() || !wired).then_some(Col {
+        // 能力位为 false 时不显示电量列，避免一排永远读不到的 "--"。
+        (snap.caps.battery && (entry.state.battery.is_some() || !wired)).then_some(Col {
             label: "电量",
             value: battery_text,
             unit: battery_unit,
@@ -554,15 +566,25 @@ fn metrics(ui: &mut Ui, p: &Palette, entry: &Entry) {
 
 /// Devices without a vendor config interface: say so plainly instead of
 /// showing three empty metric columns that look like a bug.
+///
+/// 卡片正文槽位有限：原因说明最多渲染两行，超出自动省略号收尾，不会把
+/// 同排卡片挤得不齐。完整文案悬停可见，配置页里仍展示全文。
 fn read_only_body(ui: &mut Ui, p: &Palette, reason: Option<&str>) {
     ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.spacing_mut().item_spacing.y = 2.0;
         ui.label(RichText::new("只读设备").size(12.0).color(p.text));
-        ui.label(
-            RichText::new(reason.unwrap_or("未检测到厂商配置接口，仅显示连接状态"))
-                .size(12.0)
-                .color(p.dim),
+        let full = reason.unwrap_or("未检测到厂商配置接口，仅显示连接状态");
+        let mut job = egui::text::LayoutJob::simple(
+            full.to_owned(),
+            egui::FontId::proportional(12.0),
+            p.dim,
+            ui.available_width(),
         );
+        // 两行封顶；egui 会在第二行末尾补省略号（overflow_character）。
+        job.wrap.max_rows = 2;
+        // 自动的“省略时提示”与下面手写的全文提示会同时弹出两条，关掉自动那条。
+        let label = ui.add(egui::Label::new(job).show_tooltip_when_elided(false));
+        label.on_hover_text(full);
     });
 }
 
@@ -643,7 +665,7 @@ fn supported_summary() -> String {
     if !read_only.is_empty() {
         text.push_str(&format!("，{} 仅识别", read_only.join("、")));
     }
-    text.push_str("；其余型号暂不支持");
+    text.push_str("；其余外部 HID 设备仅显示身份与连接状态");
     text
 }
 
@@ -665,7 +687,7 @@ mod tests {
     fn summary_lists_every_supported_device_once() {
         let text = supported_summary();
         assert!(text.starts_with("可配置 "));
-        assert!(text.ends_with("；其余型号暂不支持"));
+        assert!(text.ends_with("；其余外部 HID 设备仅显示身份与连接状态"));
         for d in driver::PROFILES {
             assert!(text.contains(&display_name(d)), "缺少 {}", d.model);
         }

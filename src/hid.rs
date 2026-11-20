@@ -79,6 +79,8 @@ struct Interface {
     path: Vec<u16>,
     instance: String,
     group: String,
+    /// 挂在 ROOT/VHF/ACPI/SWD 等系统树下的接口，不是外部外设。
+    system: bool,
     vid: u16,
     pid: u16,
     product: String,
@@ -102,7 +104,7 @@ fn wide_to_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end]).trim().to_string()
 }
 
-pub fn classify_connection(instance: &str, vid: u16, pid: u16) -> ConnectionType {
+pub fn classify_connection(instance: &str, vid: u16, pid: u16, product: &str) -> ConnectionType {
     let lower = instance.to_ascii_lowercase();
     if lower.starts_with("bth") {
         ConnectionType::Bluetooth
@@ -114,11 +116,72 @@ pub fn classify_connection(instance: &str, vid: u16, pid: u16) -> ConnectionType
         } else {
             ConnectionType::Wireless24G
         }
-    } else if lower.starts_with("usb") {
-        ConnectionType::Wired
     } else {
-        ConnectionType::Unknown
+        // 未知设备不能仅凭 USB 实例路径断定有线：无线接收器也枚举成 USB。
+        // 产品串里明确写了接收器/无线才敢标 2.4G，否则老实说未知。
+        if is_receiver_product(product) || is_wireless_product(product) {
+            ConnectionType::Wireless24G
+        } else {
+            ConnectionType::Unknown
+        }
     }
+}
+
+fn is_receiver_product(product: &str) -> bool {
+    let lower = product.to_ascii_lowercase();
+    lower.contains("receiver") || lower.contains("dongle") || product.contains("接收器")
+}
+
+fn is_wireless_product(product: &str) -> bool {
+    let lower = product.to_ascii_lowercase();
+    lower.contains("wireless") || product.contains("无线")
+}
+
+const HID_USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+const HID_USAGE_MOUSE: u16 = 0x02;
+const HID_USAGE_KEYBOARD: u16 = 0x06;
+
+/// 未登记型号的形态推断：产品串优先，其次看 HID 用途页。只影响图标和
+/// 文案，不会因此启用任何驱动；已知型号仍以 `PROFILES` 的声明为准。
+fn infer_kind(product: &str, usages: &[(u16, u16)]) -> DeviceType {
+    if is_receiver_product(product) {
+        return DeviceType::Receiver;
+    }
+    if let Some(kind) = DeviceType::from_name(product) {
+        return kind;
+    }
+    // 厂商用途页 + 泛化产品名（如 "Gaming Device"）更可能是接收器/复合设备，
+    // 仅凭键盘/鼠标集合猜形态会猜错；保留未知比给错图标好。
+    if usages.iter().any(|(page, _)| *page >= 0xFF00) {
+        return DeviceType::Unknown;
+    }
+    let has = |page: u16, usage: u16| usages.contains(&(page, usage));
+    if has(HID_USAGE_PAGE_GENERIC_DESKTOP, HID_USAGE_KEYBOARD) {
+        DeviceType::Keyboard
+    } else if has(HID_USAGE_PAGE_GENERIC_DESKTOP, HID_USAGE_MOUSE) {
+        DeviceType::Mouse
+    } else {
+        DeviceType::Unknown
+    }
+}
+
+/// 未适配设备在只读卡片/配置页里展示的原因。
+const UNSUPPORTED_REASON: &str =
+    "已识别到 HID 设备，但该型号尚未适配；仅显示身份与连接状态，不会写入厂商协议。";
+
+/// 已知型号但没找到可用厂商集合时的原因。
+const NO_CHANNEL_REASON: &str =
+    "已识别到设备，但没有找到可用的厂商配置接口；仅显示身份与连接状态。";
+
+/// Windows 的虚拟/内置 HID 树（ROOT/VHF/ACPI/SWD）不是外设；列出来只会给
+/// 工作台添噪音。只过滤这几类系统总线，真实 USB/蓝牙设备仍保留。
+fn is_system_hid_group(group: &str) -> bool {
+    let group = group.to_ascii_uppercase();
+    [
+        "P:ROOT\\", "P:VHF\\", "P:ACPI\\", "P:SWD\\", "ROOT\\", "VHF\\", "ACPI\\", "SWD\\",
+    ]
+    .iter()
+    .any(|prefix| group.starts_with(prefix))
 }
 
 fn group_key(instance: &str) -> String {
@@ -133,24 +196,6 @@ fn group_key(instance: &str) -> String {
         Some(i) => lower[..i].to_string(),
         None => lower,
     }
-}
-
-/// 从设备实例 ID 里解析 `VID_xxxx&PID_yyyy`，只用于"值不值得打开句柄"的
-/// 预判。
-///
-/// 枚举时对系统里每一个 HID 接口 `CreateFile` + 读产品串是主要开销，而支持
-/// 表里只有几个 VID/PID，绝大多数接口（键盘的系统集合、触摸板、游戏手柄）
-/// 根本不需要打开。两个都解析不出来时返回 `None`，调用方保守地照旧打开：
-/// 蓝牙的实例 ID 只有 `VID&0001xxxx`（没有 PID），不能凭它下结论。
-fn instance_vid_pid(instance: &str) -> Option<(u16, u16)> {
-    let lower = instance.to_ascii_lowercase();
-    let field = |tag: &str| -> Option<u16> {
-        let start = lower.find(tag)? + tag.len();
-        u16::from_str_radix(lower.get(start..start + 4)?, 16).ok()
-    };
-    let vid = field("vid_")?;
-    let pid = field("pid_")?;
-    Some((vid, pid))
 }
 
 /// 把 `SPDRP_BASE_CONTAINERID` 返回的 REG_SZ 宽字符 GUID 转成稳定的分组键。
@@ -355,26 +400,25 @@ fn collect_interfaces() -> Vec<Interface> {
             let path_max = (needed as usize).saturating_sub(path_off) / 2;
             let path = wide_path(base.add(path_off) as *const u16, path_max);
             let instance = instance_id(set, &info);
-            // 支持表之外的接口不打开句柄：枚举的开销几乎全在这里。解析不出
-            // VID/PID 的实例路径（蓝牙等）保持旧行为，交给下面的 open 判断。
-            if instance_vid_pid(&instance)
-                .is_some_and(|(vid, pid)| driver::profile(vid, pid).is_none())
-            {
-                continue;
-            }
+            // 所有 HID 接口都要打开一次才知道 usage/产品串；扫描在后台线程，
+            // 这点开销换来未知设备也能以只读卡片出现在列表里。
             let Some((vid, pid, product, manufacturer, usage_page, usage)) = read_interface(&path)
             else {
                 continue;
             };
             // 分组优先级：ContainerId（Windows 帮我们算好的物理设备归属）
             // → 父设备实例（复合设备的几个接口父节点相同）→ 实例路径截断。
+            // 父设备树同时用来识别内置/虚拟 HID，即使它有 ContainerId。
+            let parent = parent_id(&info);
+            let system = parent.as_deref().is_some_and(is_system_hid_group);
             let group = container_id(set, &info)
-                .or_else(|| parent_id(&info))
+                .or(parent)
                 .unwrap_or_else(|| group_key(&instance));
             out.push(Interface {
                 path,
                 instance,
                 group,
+                system,
                 vid,
                 pid,
                 product,
@@ -415,6 +459,11 @@ pub fn enumerate() -> Vec<HidDevice> {
 
     let mut devices: Vec<HidDevice> = Vec::new();
     for (id, group) in groups {
+        // 内置触摸板、虚拟 HID、ACPI 设备都挂在系统树上；它们不是外设，
+        // 也不该出现在“我的设备”里。真实 USB/BTH 设备没有这些前缀。
+        if is_system_hid_group(&id) || group.iter().all(|i| i.system) {
+            continue;
+        }
         let vid = group[0].vid;
         let pid = group[0].pid;
         // A receiver speaks one protocol; find the collection that protocol
@@ -422,18 +471,38 @@ pub fn enumerate() -> Vec<HidDevice> {
         let profile = driver::profile(vid, pid);
         let spec = profile.and_then(|p| p.driver);
         let channel = spec.and_then(|s| {
-            let (page, usage) = s.kind.channel();
+            let (page, usage) = s.protocol.channel();
             group
                 .iter()
                 .find(|i| i.usage_page == page && i.usage == usage)
                 .map(|i| (s, i))
         });
         let info = channel.map(|(_, i)| i).unwrap_or(&group[0]);
-        let connection = classify_connection(&info.instance, info.vid, info.pid);
+        let connection = classify_connection(&info.instance, info.vid, info.pid, &info.product);
         let (brand, model) = identity(vid, pid, &info.product, &info.manufacturer);
-        // 能出现在列表里的设备都有 profile（见文件末尾的 retain），形态取表里的
-        // 声明；`Unknown` 只是查不到 profile 时的兜底。
-        let kind = profile.map(|p| p.kind).unwrap_or(DeviceType::Unknown);
+        // 已知型号的形态取表里的声明；未登记型号按产品串/用途页推断，
+        // 只影响图标，不会因此启用驱动。
+        let usages: Vec<(u16, u16)> = group.iter().map(|i| (i.usage_page, i.usage)).collect();
+        // 识别范围只保留键鼠：耳机、手柄、摄像头等也会以 HID 枚举出来，
+        // 但它们不在这个应用的能力范围内。已登记型号（含接收器）不受此限。
+        let keyboard_or_mouse = usages.iter().any(|(page, usage)| {
+            *page == HID_USAGE_PAGE_GENERIC_DESKTOP
+                && (*usage == HID_USAGE_MOUSE || *usage == HID_USAGE_KEYBOARD)
+        });
+        if profile.is_none() && !keyboard_or_mouse {
+            continue;
+        }
+        let kind = profile
+            .map(|p| p.kind)
+            .unwrap_or_else(|| infer_kind(&info.product, &usages));
+        let has_config = channel.is_some();
+        let reason = if has_config {
+            None
+        } else if let Some(p) = profile {
+            p.reason.or(Some(NO_CHANNEL_REASON))
+        } else {
+            Some(UNSUPPORTED_REASON)
+        };
         devices.push(HidDevice {
             id,
             path: info.path.clone(),
@@ -445,11 +514,10 @@ pub fn enumerate() -> Vec<HidDevice> {
             connection,
             driver: channel.map(|(s, _)| s),
             limits: spec.map(|s| s.limits).unwrap_or_default(),
-            reason: profile.and_then(|p| p.reason),
+            reason,
         });
     }
 
-    devices.retain(|d| d.has_config() || driver::profile(d.vid, d.pid).is_some());
     // Composite USB functions can land in different containers; fold the
     // read-only leftovers into the matching configurable device.
     let configs: Vec<(u16, u16, ConnectionType)> = devices
@@ -633,7 +701,8 @@ mod tests {
             classify_connection(
                 "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c",
                 0x24AE,
-                0x1214
+                0x1214,
+                ""
             ),
             ConnectionType::Bluetooth
         );
@@ -641,7 +710,8 @@ mod tests {
             classify_connection(
                 "BTHLEDEVICE\\{00001812-0000-1000-8000-00805f9b34fb}",
                 0x1234,
-                0x5678
+                0x5678,
+                ""
             ),
             ConnectionType::Bluetooth
         );
@@ -650,11 +720,11 @@ mod tests {
     #[test]
     fn classifies_known_receiver() {
         assert_eq!(
-            classify_connection("USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1", 0x24AE, 0x1214),
+            classify_connection("USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1", 0x24AE, 0x1214, ""),
             ConnectionType::Wireless24G
         );
         assert_eq!(
-            classify_connection("USB\\VID_3554&PID_FA09\\5&6D6F5B5&0&1", 0x3554, 0xFA09),
+            classify_connection("USB\\VID_3554&PID_FA09\\5&6D6F5B5&0&1", 0x3554, 0xFA09, ""),
             ConnectionType::Wireless24G
         );
     }
@@ -667,7 +737,8 @@ mod tests {
             classify_connection(
                 "USB\\VID_24AE&PID_4414&MI_00\\6&26AC346C&0&0000",
                 0x24AE,
-                0x4414
+                0x4414,
+                ""
             ),
             ConnectionType::Wired
         );
@@ -675,7 +746,8 @@ mod tests {
             classify_connection(
                 "USB\\VID_258A&PID_010C&MI_00\\6&32356D05&0&0000",
                 0x258A,
-                0x010C
+                0x010C,
+                ""
             ),
             ConnectionType::Wired
         );
@@ -687,16 +759,79 @@ mod tests {
         assert_eq!((brand.as_str(), model.as_str()), ("AULA", "F87"));
     }
 
+    /// 未登记型号不能仅凭 USB 实例路径就当有线：无线接收器也枚举成 USB。
     #[test]
-    fn classifies_wired_and_unknown() {
+    fn unknown_devices_are_not_assumed_wired() {
         assert_eq!(
-            classify_connection("USB\\VID_046D&PID_C52B\\6&2B0E7F1&0&1", 0x046D, 0xC52B),
-            ConnectionType::Wired
-        );
-        assert_eq!(
-            classify_connection("HID\\VID_046D&PID_C52B", 0x046D, 0xC52B),
+            classify_connection(
+                "USB\\VID_046D&PID_C52B\\6&2B0E7F1&0&1",
+                0x046D,
+                0xC52B,
+                "USB Optical Mouse"
+            ),
             ConnectionType::Unknown
         );
+        assert_eq!(
+            classify_connection(
+                "USB\\VID_046D&PID_C52B\\6&2B0E7F1&0&1",
+                0x046D,
+                0xC52B,
+                "USB Receiver"
+            ),
+            ConnectionType::Wireless24G
+        );
+        assert_eq!(
+            classify_connection(
+                "USB\\VID_046D&PID_C52B\\6&2B0E7F1&0&1",
+                0x046D,
+                0xC52B,
+                "Wireless Mouse"
+            ),
+            ConnectionType::Wireless24G
+        );
+        assert_eq!(
+            classify_connection(
+                "USB\\VID_046D&PID_C52B\\6&2B0E7F1&0&1",
+                0x046D,
+                0xC52B,
+                "无线接收器"
+            ),
+            ConnectionType::Wireless24G
+        );
+        assert_eq!(
+            classify_connection("HID\\VID_046D&PID_C52B", 0x046D, 0xC52B, ""),
+            ConnectionType::Unknown
+        );
+    }
+
+    #[test]
+    fn unknown_devices_keep_their_reported_identity() {
+        let (brand, model) = identity(0x1234, 0x5678, "Some Mouse", "Acme");
+        assert_eq!((brand.as_str(), model.as_str()), ("Acme", "Some Mouse"));
+        let (brand, model) = identity(0x1234, 0x5678, "", "");
+        assert_eq!((brand.as_str(), model.as_str()), ("未知品牌", "HID 设备"));
+    }
+
+    #[test]
+    fn infers_unknown_device_kind() {
+        assert_eq!(infer_kind("USB Receiver", &[]), DeviceType::Receiver);
+        assert_eq!(infer_kind("ACME Gaming Mouse", &[]), DeviceType::Mouse);
+        assert_eq!(infer_kind("ACME Keyboard", &[]), DeviceType::Keyboard);
+        assert_eq!(infer_kind("无线接收器", &[]), DeviceType::Receiver);
+        assert_eq!(
+            infer_kind("USB Composite Device", &[(0x01, 0x06)]),
+            DeviceType::Keyboard
+        );
+        assert_eq!(
+            infer_kind("USB Composite Device", &[(0x01, 0x02)]),
+            DeviceType::Mouse
+        );
+        // 厂商页 + 泛化名字更像接收器/复合设备，不能仅凭键盘集合猜形态。
+        assert_eq!(
+            infer_kind("Gaming Device", &[(0x01, 0x06), (0xFF00, 0x0E)]),
+            DeviceType::Unknown
+        );
+        assert_eq!(infer_kind("USB Device", &[]), DeviceType::Unknown);
     }
 
     #[test]
@@ -715,7 +850,7 @@ mod tests {
         let kind = |vid, pid| {
             driver::profile(vid, pid)
                 .and_then(|p| p.driver)
-                .map(|s| s.kind)
+                .map(|s| s.protocol.kind())
         };
         assert_eq!(kind(0x24AE, 0x1214), Some(driver::Kind::Rapoo));
         assert_eq!(kind(0x046D, 0xC53F), Some(driver::Kind::Hidpp));
@@ -749,35 +884,33 @@ mod tests {
     }
 
     #[test]
+    fn skips_system_virtual_hid_groups() {
+        assert!(is_system_hid_group("p:ROOT\\SYNHIDMINI\\0000"));
+        assert!(is_system_hid_group(
+            "p:VHF\\HID_DEVICE_SYSTEM_VHF\\1&1A590E2C&0&{BA465EFF}"
+        ));
+        assert!(is_system_hid_group("p:ACPI\\PNPC000\\1"));
+        assert!(is_system_hid_group("p:SWD\\HID\\1"));
+        assert!(!is_system_hid_group(
+            "c:{5D951AEF-E91B-5CB3-BAD7-BCD9762A0AAD}"
+        ));
+        assert!(!is_system_hid_group(
+            "p:USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1"
+        ));
+        assert!(!is_system_hid_group(
+            "p:HID\\VID_258A&PID_010C&MI_00\\7&3A75499D&0&0000"
+        ));
+        assert!(!is_system_hid_group(
+            "p:BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}"
+        ));
+    }
+
+    #[test]
     fn strips_collection_suffix_from_instance() {
         assert_eq!(
             group_key("USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1&Col02"),
             "usb\\vid_24ae&pid_1214\\5&2a1b3c4d&0&1"
         );
-    }
-
-    /// 预筛必须只在 VID/PID 都明确时下结论：蓝牙的实例路径只有厂商号，
-    /// 解析不出来就要照旧打开，否则蓝牙连接的鼠标会整个消失。
-    #[test]
-    fn parses_vid_pid_only_when_both_are_present() {
-        assert_eq!(
-            instance_vid_pid("USB\\VID_24AE&PID_1214\\5&2A1B3C4D&0&1"),
-            Some((0x24AE, 0x1214))
-        );
-        assert_eq!(
-            instance_vid_pid("USB\\VID_046D&PID_C53F&MI_02\\7&1A2B3C&0&0000"),
-            Some((0x046D, 0xC53F))
-        );
-        assert_eq!(
-            instance_vid_pid("HID\\VID_258A&PID_010C&MI_00\\7&3A75499D&0&0000"),
-            Some((0x258A, 0x010C))
-        );
-        assert_eq!(
-            instance_vid_pid("BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c"),
-            None
-        );
-        assert_eq!(instance_vid_pid("USB\\VID_24AE"), None);
-        assert_eq!(instance_vid_pid(""), None);
     }
 
     /// 复合设备的几个接口（MI_00 键盘、MI_01 厂商通道）实例路径不同，但都

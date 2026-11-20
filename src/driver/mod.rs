@@ -4,15 +4,22 @@
 //! above this module only ever sees [`Cmd`] and [`Snapshot`]. A driver is owned
 //! by one worker thread (see `devices::real_worker`), so it can hold raw HID
 //! handles and cached registers without any locking.
+//!
+//! The shared model is the **mouse** configuration domain: [`Cmd`],
+//! [`Snapshot`], [`Caps`] and [`Limits`] describe DPI, polling and sensor
+//! tuning. Keyboard profiles are read-only and never get a driver; adding
+//! keyboard lighting/keymap settings requires a separate settings model, not
+//! more fields here.
 
 pub mod hidpp;
 pub mod rapoo;
 
-pub use hidpp::Hidpp;
-pub use rapoo::Rapoo;
+pub use hidpp::{Hidpp, HidppLayout};
+pub use rapoo::{Rapoo, RapooLayout};
 
-/// Which blocks a device really has. The UI hides everything that is `false`
-/// instead of rendering switches that would do nothing on this model.
+/// Which **mouse** blocks a device really has. The UI hides everything that is
+/// `false` instead of rendering switches that would do nothing on this model.
+/// Keyboards are read-only and never reach this model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Caps {
     /// A single DPI value that can be read and written.
@@ -22,6 +29,8 @@ pub struct Caps {
     pub polling: bool,
     /// Motion sync, line/wave correction, debounce, sleep, lift-off distance.
     pub sensor: bool,
+    /// The device reports a battery percentage.
+    pub battery: bool,
 }
 
 impl Caps {
@@ -31,14 +40,17 @@ impl Caps {
         dpi_stages: true,
         polling: true,
         sensor: true,
+        battery: true,
     };
 
     /// DPI only — the fallback when a mouse's onboard profile cannot be read.
+    /// Battery is feature-derived for HID++, so the base value stays false.
     pub const MOUSE_DPI: Caps = Caps {
         dpi: true,
         dpi_stages: false,
         polling: false,
         sensor: false,
+        battery: false,
     };
 
     /// Stages and report rate, both stored in the onboard profile; no
@@ -48,9 +60,30 @@ impl Caps {
         dpi_stages: true,
         polling: true,
         sensor: false,
+        battery: true,
     };
+
+    /// Whether this capability set allows a command. The UI already hides
+    /// unsupported controls; drivers use this at the write boundary so a stale
+    /// page or a programmatic caller cannot write a field the model lacks.
+    pub fn supports(self, cmd: Cmd) -> bool {
+        match cmd {
+            Cmd::Refresh => true,
+            Cmd::Polling(_) => self.polling,
+            Cmd::Motion(_)
+            | Cmd::Line(_)
+            | Cmd::Wave(_)
+            | Cmd::Debounce(..)
+            | Cmd::Sleep(_)
+            | Cmd::Lod(_) => self.sensor,
+            Cmd::Activate(_) => self.dpi_stages,
+            Cmd::Dpi(..) => self.dpi,
+        }
+    }
 }
 
+/// 鼠标配置快照。键盘/只读设备没有驱动，不会产生快照；新增键盘设置应另建
+/// 设置模型，而不是往这里加字段。
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     /// Filled in by drivers that can ask the device for its own name; empty
@@ -74,8 +107,8 @@ pub struct Snapshot {
     pub wave_corr: bool,
 }
 
-/// Every command carries an absolute value, so a queued burst only needs its
-/// last one per field.
+/// 鼠标配置命令。每条命令都携带绝对值，所以连续微调只需要每字段的最后一条。
+/// 键盘只读，不接受这里的命令。
 #[derive(Clone, Copy, Debug)]
 pub enum Cmd {
     Refresh,
@@ -110,10 +143,10 @@ impl Cmd {
     }
 }
 
-/// 打开一个协议适配器。`spec` 里同时带着该型号的布局和取值范围，驱动
-/// 不再把型号差异写死在代码里。
+/// 打开一个协议适配器。`spec` 里同时带着该型号的协议、布局和取值范围，
+/// 驱动不再把型号差异写死在代码里。
 pub fn open(spec: DriverSpec, path: &[u16]) -> Result<Box<dyn Driver>, String> {
-    spec.kind.open(spec, path)
+    spec.protocol.open(path, spec.limits)
 }
 
 pub trait Driver: Send {
@@ -140,31 +173,76 @@ pub enum Kind {
     Hidpp,
 }
 
-/// HID++ 的板载配置布局。只有经过真机验证的型号才能写扇区；其他型号
-/// 仍可通过 feature discovery 改当前 DPI、读电量，但不碰板载配置。
+/// 具体协议适配器与它的型号布局。
 ///
-/// 只列真正验证过的布局。`DriverSpec::layout` 为 `None` 时驱动按"未验证"
-/// 处理——这不是一条死路径：同一个接收器配对其他鼠标时，运行时也会因为
-/// 型号对不上而降级到同一状态（见 `hidpp::profile_layout_supported`）。
+/// `Kind` 只描述协议族；把"用哪个驱动"和"该型号的布局"绑在同一个值里，
+/// 避免出现 `Kind::Rapoo` 配上未知布局这种运行时才发现的组合。Rapoo 必须
+/// 带经过真机验证的 [`RapooLayout`]；HID++ 的 `None` 表示板载布局未验证，
+/// 此时仍可通过 feature discovery 改当前 DPI、读电量，但不碰板载配置。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HidppLayout {
-    G304,
+pub enum Protocol {
+    Rapoo(&'static RapooLayout),
+    Hidpp(Option<&'static HidppLayout>),
 }
 
-/// 一个协议适配器需要的全部型号差异。
+impl Protocol {
+    pub fn kind(self) -> Kind {
+        match self {
+            Protocol::Rapoo(_) => Kind::Rapoo,
+            Protocol::Hidpp(_) => Kind::Hidpp,
+        }
+    }
+
+    pub fn channel(self) -> (u16, u16) {
+        self.kind().channel()
+    }
+
+    pub fn open(self, path: &[u16], limits: Limits) -> Result<Box<dyn Driver>, String> {
+        match self {
+            Protocol::Rapoo(layout) => Ok(Box::new(Rapoo::open(path, layout, limits)?)),
+            Protocol::Hidpp(layout) => Ok(Box::new(Hidpp::open(path, layout, limits)?)),
+        }
+    }
+}
+
+/// 一个鼠标协议适配器需要的全部型号差异。键盘没有 `DriverSpec`；要加键盘
+/// 配置，先建立独立的设置模型，再重新定义这条边界。
 ///
 /// `PartialEq` 用于热插拔后的对比：同一个 container id 换了身份（插线 ↔ 接收
 /// 器）时规格会变，旧 worker 必须重建而不是继续用着。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DriverSpec {
-    pub kind: Kind,
-    /// 板载扇区布局；只有 `Kind::Hidpp` 会用到，Rapoo 留 `None`。
-    pub layout: Option<HidppLayout>,
+    pub protocol: Protocol,
     pub limits: Limits,
+}
+
+/// 原始 LOD 编码 → 物理毫米的显示换算。
+///
+/// 写入仍然用原始编码；这里只回答"这个编码在界面上该显示几毫米"。G304 这
+/// 类型号不开放 LOD，对应字段不会被用到；VT1 Pro 的编码 1..11 对应
+/// 1.0..2.0 mm（0.9 + code / 10）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LodScale {
+    /// 编码 0 对应的毫米数（十分之一毫米）。
+    pub base_tenths: u16,
+    /// 每增加一个编码增加的十分之一毫米数。
+    pub step_tenths: u16,
+}
+
+impl LodScale {
+    pub const UNKNOWN: LodScale = LodScale {
+        base_tenths: 0,
+        step_tenths: 0,
+    };
+
+    pub fn tenths(self, code: u8) -> u16 {
+        self.base_tenths + code as u16 * self.step_tenths
+    }
 }
 
 /// 界面允许写入的取值范围。字段是值编码，不是物理单位；驱动和 UI
 /// 都以它为唯一边界，避免页面里再出现一套写死的 1..32 / 5..120。
+/// `lod_scale` 只负责把编码显示成物理单位，不参与写入。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub dpi: (u16, u16),
@@ -172,20 +250,41 @@ pub struct Limits {
     pub debounce: (u8, u8),
     pub sleep: (u8, u8),
     pub lod: (u8, u8),
+    pub lod_scale: LodScale,
+    /// LOD 的推荐编码范围（含端点），只用于 UI 的建议标签；`None` 表示
+    /// 这个型号不给建议。
+    pub lod_recommended: Option<(u8, u8)>,
 }
+
+/// 只读/未知设备的占位范围；不会用于可编辑页面。
+pub const UNKNOWN_LIMITS: Limits = Limits {
+    dpi: (0, 0),
+    polling: &[],
+    debounce: (0, 0),
+    sleep: (0, 0),
+    lod: (0, 0),
+    lod_scale: LodScale::UNKNOWN,
+    lod_recommended: None,
+};
 
 impl Default for Limits {
     fn default() -> Self {
-        RAPOO_LIMITS
+        UNKNOWN_LIMITS
     }
 }
 
-pub const RAPOO_LIMITS: Limits = Limits {
+pub const VT1_PRO_LIMITS: Limits = Limits {
     dpi: (100, 26000),
     polling: &[8, 4, 2, 1],
     debounce: (1, 32),
     sleep: (5, 120),
     lod: (1, 11),
+    lod_scale: LodScale {
+        base_tenths: 9,
+        step_tenths: 1,
+    },
+    // 编码 1..3 对应 1.0–1.2 mm，是 VT1 Pro 的常用抬鼠高度。
+    lod_recommended: Some((1, 3)),
 };
 
 pub const G304_LIMITS: Limits = Limits {
@@ -195,6 +294,8 @@ pub const G304_LIMITS: Limits = Limits {
     debounce: (1, 32),
     sleep: (5, 120),
     lod: (1, 11),
+    lod_scale: LodScale::UNKNOWN,
+    lod_recommended: None,
 };
 
 /// 设备形态。界面据此选图标；与协议族（`Kind`）无关，一把键盘和一个
@@ -245,6 +346,7 @@ pub struct DeviceProfile {
     /// 同一个鼠标插线和走接收器是两个不同的 PID。
     pub wired: bool,
     /// `None` = 只读设备：没有可写的厂商通道，只识别不配置。
+    /// 键盘目前一律为 `None`；配置域只覆盖鼠标（含承载鼠标的接收器）。
     pub driver: Option<DriverSpec>,
     /// 只读设备在配置页显示的原因（写给用户看的，不是给日志看的）。
     pub reason: Option<&'static str>,
@@ -259,9 +361,8 @@ pub const PROFILES: &[DeviceProfile] = &[
         kind: DeviceType::Mouse,
         wired: false,
         driver: Some(DriverSpec {
-            kind: Kind::Rapoo,
-            layout: None,
-            limits: RAPOO_LIMITS,
+            protocol: Protocol::Rapoo(&rapoo::VT1_PRO),
+            limits: VT1_PRO_LIMITS,
         }),
         reason: None,
     },
@@ -276,9 +377,8 @@ pub const PROFILES: &[DeviceProfile] = &[
         kind: DeviceType::Mouse,
         wired: true,
         driver: Some(DriverSpec {
-            kind: Kind::Rapoo,
-            layout: None,
-            limits: RAPOO_LIMITS,
+            protocol: Protocol::Rapoo(&rapoo::VT1_PRO),
+            limits: VT1_PRO_LIMITS,
         }),
         reason: None,
     },
@@ -293,8 +393,7 @@ pub const PROFILES: &[DeviceProfile] = &[
         wired: false,
         // 接收器是通用的，布局按 G304 验证；驱动会用设备名再做一次门禁。
         driver: Some(DriverSpec {
-            kind: Kind::Hidpp,
-            layout: Some(HidppLayout::G304),
+            protocol: Protocol::Hidpp(Some(&hidpp::G304)),
             limits: G304_LIMITS,
         }),
         reason: None,
@@ -310,7 +409,9 @@ pub const PROFILES: &[DeviceProfile] = &[
         // compared it to another vendor's protocol, which told nobody anything
         // about the device in their hand.
         driver: None,
-        reason: Some("能识别到这把键盘，但灯效、按键映射要按厂商私有帧读写，本版本还没接入。"),
+        // 文案写"这台设备"而不是分析某个具体型号：面板认不出、协议没接入
+        // 就照实说，用户手里的可能只是尚未适配的型号。
+        reason: Some("已识别到这台键盘，但它的配置协议尚未适配；灯效、按键等参数暂时无法读写，仅显示连接状态。"),
     },
     DeviceProfile {
         vid: 0x25A7,
@@ -321,8 +422,7 @@ pub const PROFILES: &[DeviceProfile] = &[
         wired: false,
         driver: None,
         reason: Some(
-            "这个 2.4G 接收器只暴露一个可写的命令字节，没有任何应答通道，也没有输出端点，\
-             因此只能识别设备，读不到也无法修改键盘参数。",
+            "已识别到这台键盘，但它所在的接收器通道是单向的：读不到设备参数，也无法下发配置，仅显示连接状态。",
         ),
     },
     // 键盘插线后的身份：接收器是 3554:FA09，线连走的是键盘自己的控制器
@@ -342,9 +442,7 @@ pub const PROFILES: &[DeviceProfile] = &[
         wired: true,
         driver: None,
         reason: Some(
-            "有线模式下键盘换成 BY Tech 的通用控制器，自报的名字只有「Gaming Keyboard」，\
-             认不出具体型号；它只有 feature 报表，读出来的是固件镜像流，没有可写路径。\
-             2.4G 接收器目前也仍是只读，改灯效/按键还得等有线协议摸清。",
+            "设备以通用控制器模式接入，未上报具体型号，也没有发现可写的配置通道；仅显示连接状态。",
         ),
     },
 ];
@@ -355,18 +453,11 @@ pub fn profile(vid: u16, pid: u16) -> Option<&'static DeviceProfile> {
 }
 
 impl Kind {
-    /// The HID collection the driver has to open.
+    /// The HID collection the protocol family lives on.
     pub fn channel(self) -> (u16, u16) {
         match self {
             Kind::Rapoo => (0xFF00, 0x000E),
             Kind::Hidpp => (0xFF00, 0x0002),
-        }
-    }
-
-    pub fn open(self, spec: DriverSpec, path: &[u16]) -> Result<Box<dyn Driver>, String> {
-        match self {
-            Kind::Rapoo => Ok(Box::new(Rapoo::open(path, spec.limits)?)),
-            Kind::Hidpp => Ok(Box::new(Hidpp::open(path, spec.layout, spec.limits)?)),
         }
     }
 }
@@ -395,17 +486,50 @@ mod tests {
     fn profiles_carry_driver_spec_and_limits() {
         let rapoo = profile(0x24AE, 0x1214).expect("VT1 Pro profile");
         let spec = rapoo.driver.expect("writable");
-        assert_eq!(spec.kind, Kind::Rapoo);
+        assert_eq!(spec.protocol.kind(), Kind::Rapoo);
+        let Protocol::Rapoo(layout) = spec.protocol else {
+            panic!("VT1 Pro 必须带 Rapoo 布局");
+        };
+        assert_eq!(layout.model, "VT1 Pro");
+        assert!(layout.supports(0x24AE, 0x1214));
+        assert!(layout.supports(0x24AE, 0x4414));
         assert_eq!(spec.limits.dpi, (100, 26000));
         assert_eq!(spec.limits.polling, &[8, 4, 2, 1]);
+        assert_eq!(
+            spec.limits.lod_scale,
+            LodScale {
+                base_tenths: 9,
+                step_tenths: 1
+            }
+        );
+        assert_eq!(spec.limits.lod_recommended, Some((1, 3)));
 
         let logitech = profile(0x046D, 0xC53F).expect("Lightspeed profile");
         let spec = logitech.driver.expect("writable");
-        assert_eq!(spec.kind, Kind::Hidpp);
-        assert_eq!(spec.layout, Some(HidppLayout::G304));
+        assert_eq!(spec.protocol, Protocol::Hidpp(Some(&hidpp::G304)));
         assert_eq!(spec.limits.dpi, (200, 12000));
 
         assert!(profile(0x25A7, 0xFA70).is_some_and(|p| p.driver.is_none()));
+    }
+
+    /// 配置域目前只覆盖鼠标：带驱动的 profile 只能是鼠标，或以接收器身份
+    /// 承载鼠标的设备；键盘必须保持只读并说明原因。要加键盘灯效/改键，先
+    /// 建立独立的设置模型，再改这条不变量。
+    #[test]
+    fn keyboard_profiles_stay_read_only() {
+        for p in PROFILES {
+            if p.driver.is_some() {
+                assert!(
+                    matches!(p.kind, DeviceType::Mouse | DeviceType::Receiver),
+                    "{} 带驱动但不是鼠标/接收器；配置域只覆盖鼠标",
+                    p.model
+                );
+            }
+            if p.kind == DeviceType::Keyboard {
+                assert!(p.driver.is_none(), "{} 是键盘，必须保持只读", p.model);
+                assert!(p.reason.is_some(), "{} 只读但没写原因", p.model);
+            }
+        }
     }
 
     /// 每台设备都要有明确的形态，首页图标不能退化成“未知设备”。
@@ -440,8 +564,46 @@ mod tests {
         assert!(!wireless.wired);
         assert!(wired.wired);
         assert_eq!((wireless.brand, wireless.model), (wired.brand, wired.model));
-        assert!(wired.driver.is_some_and(|s| s.kind == Kind::Rapoo));
-        assert_eq!(wired.driver.map(|s| s.limits), Some(RAPOO_LIMITS));
+        assert!(wired
+            .driver
+            .is_some_and(|s| s.protocol.kind() == Kind::Rapoo));
+        assert_eq!(wired.driver.map(|s| s.limits), Some(VT1_PRO_LIMITS));
+    }
+
+    /// LOD 的物理单位换算是型号数据：VT1 Pro 的编码 1..11 是 1.0..2.0 mm。
+    /// UI 只格式化，不再自己写 0.9 + code / 10。
+    #[test]
+    fn lod_scale_maps_the_model_codes() {
+        let scale = VT1_PRO_LIMITS.lod_scale;
+        assert_eq!(scale.tenths(0), 9);
+        assert_eq!(scale.tenths(1), 10);
+        assert_eq!(scale.tenths(11), 20);
+        assert_eq!(UNKNOWN_LIMITS.lod_scale.tenths(5), 0);
+        assert_eq!(Limits::default(), UNKNOWN_LIMITS);
+    }
+
+    /// 能力位必须和命令一一对应：UI 隐藏只是第一层，驱动在写入边界还要
+    /// 挡住能力集不允许的命令。
+    #[test]
+    fn caps_gate_the_commands_they_claim() {
+        assert!(Caps::MOUSE_FULL.supports(Cmd::Polling(1)));
+        assert!(Caps::MOUSE_FULL.supports(Cmd::Motion(true)));
+        assert!(Caps::MOUSE_FULL.supports(Cmd::Lod(2)));
+        assert!(Caps::MOUSE_FULL.supports(Cmd::Dpi(0, 800)));
+        assert!(Caps::MOUSE_FULL.supports(Cmd::Activate(1)));
+
+        assert!(Caps::MOUSE_STAGES.supports(Cmd::Dpi(0, 800)));
+        assert!(Caps::MOUSE_STAGES.supports(Cmd::Activate(1)));
+        assert!(Caps::MOUSE_STAGES.supports(Cmd::Polling(1)));
+        assert!(!Caps::MOUSE_STAGES.supports(Cmd::Motion(true)));
+        assert!(!Caps::MOUSE_STAGES.supports(Cmd::Lod(2)));
+
+        assert!(Caps::MOUSE_DPI.supports(Cmd::Dpi(0, 800)));
+        assert!(!Caps::MOUSE_DPI.supports(Cmd::Activate(1)));
+        assert!(!Caps::MOUSE_DPI.supports(Cmd::Polling(1)));
+        assert!(!Caps::MOUSE_DPI.supports(Cmd::Motion(true)));
+
+        assert!(Caps::MOUSE_DPI.supports(Cmd::Refresh));
     }
 
     /// 只有在名字里明确写了形态时才改判，接收器自己报的名字保持原样。
@@ -468,6 +630,9 @@ mod tests {
         assert!(!Caps::MOUSE_DPI.dpi_stages);
         assert!(!Caps::MOUSE_DPI.polling);
         assert!(!Caps::MOUSE_DPI.sensor);
+        assert!(!Caps::MOUSE_DPI.battery);
         assert!(Caps::MOUSE_FULL.sensor);
+        assert!(Caps::MOUSE_FULL.battery);
+        assert!(Caps::MOUSE_STAGES.battery);
     };
 }

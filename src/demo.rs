@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::devices::{Cmd, DeviceId, DeviceInfo, Snapshot};
-use crate::driver::{Caps, DeviceType, Limits};
+use crate::driver::{Caps, DeviceType, VT1_PRO_LIMITS};
 use crate::hid::ConnectionType;
 
 pub struct DemoDevice {
@@ -18,7 +18,7 @@ fn info(n: u8, brand: &str, model: &str, connection: ConnectionType) -> DeviceIn
         kind: DeviceType::Mouse,
         connection,
         has_config: true,
-        limits: Limits::default(),
+        limits: VT1_PRO_LIMITS,
         reason: None,
     }
 }
@@ -46,8 +46,8 @@ fn snapshot(
         stage_count: dpi.len() as u8,
         stage_active: active,
         dpi: dpi.to_vec(),
-        dpi_min: 100,
-        dpi_max: 26000,
+        dpi_min: VT1_PRO_LIMITS.dpi.0,
+        dpi_max: VT1_PRO_LIMITS.dpi.1,
         debounce_press: debounce.0,
         debounce_release: debounce.1,
         sleep_min,

@@ -13,7 +13,9 @@
 //!   stages and the report rate, i.e. everything that survives a power cycle.
 //!   Writing it means recomputing the sector's CRC16, see `write_sector`.
 //!
-//! Raw bytes, CRCs and the experiments behind them: `docs/logitech-g304.md`.
+//! The verified G304 sector layout lives in [`G304`]; other models use `None`
+//! until their layout has been checked on real hardware. Raw bytes, CRCs and
+//! the experiments behind them: `docs/logitech-g304.md`.
 
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -28,7 +30,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
-use super::{Caps, Cmd, Driver, HidppLayout, Limits, Snapshot};
+use super::{Caps, Cmd, Driver, Limits, Snapshot};
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
@@ -67,19 +69,75 @@ pub const DPI_MAX: u16 = 12000;
 const GENERIC_DPI_MIN: u16 = 100;
 const GENERIC_DPI_MAX: u16 = 26000;
 
-/// Onboard sectors are 255 bytes here (`info` reports 0x00FF), with a CRC16 in
-/// the last two bytes. The device rejects a 16-byte read starting at 240, so
-/// the tail has to be read at 239 and shifted.
-const SECTOR_LEN: usize = 255;
-const CRC_AT: usize = SECTOR_LEN - 2;
-/// 尾部那次读取的起点。设备拒绝从 240 起读，所以从 239 开始、丢掉重复的
-/// 第一个字节（见 `sector_read_offsets`）。
-const TAIL_READ_AT: usize = 239;
-/// Profile sector offsets (little endian), verified against the live sector.
-const P_REPORT_RATE: usize = 0;
-const P_DEFAULT_INDEX: usize = 1;
-const P_DPI: usize = 3;
-const STAGES: usize = 5;
+/// 一个经过真机验证的 HID++ 板载 profile 布局。
+///
+/// HID++ 的 feature 发现、报文、CRC 和分块传输是协议层；这里只放某型号
+/// 扇区的结构：长度、尾读规则、profile 字段偏移、档位数、名称匹配和能力。
+/// 未验证型号用 `None`，只能改当前 DPI，不碰扇区。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HidppLayout {
+    /// 验证时的型号名，用于日志和"布局不匹配"的提示。
+    pub model: &'static str,
+    /// 设备自报名字里必须包含的片段（不区分大小写）。
+    pub name_contains: &'static str,
+    pub sector_len: usize,
+    /// 尾部那次读取的起点。G304 拒绝从 240 起读，所以从 239 开始。
+    pub tail_read_at: usize,
+    /// 尾读开头有多少字节与上一块重复，读取时丢掉。
+    pub tail_overlap: usize,
+    /// 扇区读取的块大小（每次 `0x50` 读这么多载荷）。
+    pub read_chunk: usize,
+    /// 扇区写入的块大小（每次 `0x70` 写这么多载荷）。
+    pub write_chunk: usize,
+    /// Profile sector offsets (little endian), verified against the live sector.
+    pub report_rate_at: usize,
+    pub default_index_at: usize,
+    pub dpi_at: usize,
+    pub stages: usize,
+    /// Blocks this model actually exposes with this layout.
+    pub caps: Caps,
+}
+
+impl HidppLayout {
+    pub fn supports_name(&self, name: &str) -> bool {
+        name.to_ascii_lowercase()
+            .contains(&self.name_contains.to_ascii_lowercase())
+    }
+}
+
+/// G304 的板载布局。2026-10-31 在真机上验证：扇区 255 字节（`info` 报
+/// `0x00FF`），末尾两字节 CRC16；设备拒绝从 240 起读，尾部从 239 读并
+/// 丢掉重复的第一个字节。见 `docs/logitech-g304.md`。
+pub const G304: HidppLayout = HidppLayout {
+    model: "G304",
+    name_contains: "g304",
+    sector_len: 255,
+    tail_read_at: 239,
+    tail_overlap: 1,
+    read_chunk: 16,
+    write_chunk: 16,
+    report_rate_at: 0,
+    default_index_at: 1,
+    dpi_at: 3,
+    stages: 5,
+    caps: Caps::MOUSE_STAGES,
+};
+
+/// 把布局声明的能力和这次 feature discovery 的结果合起来。
+///
+/// 布局描述"这个型号理论上有什么"，feature 描述"这台设备实际应答了什么"；
+/// 两者都成立才在界面上开放对应控件。未验证布局按 DPI-only 处理，电池始终
+/// 由 `0x1000` 是否出现决定。
+fn caps_for(layout: Option<&HidppLayout>, has_dpi: bool, has_battery: bool) -> Caps {
+    let base = layout.map(|l| l.caps).unwrap_or(Caps::MOUSE_DPI);
+    Caps {
+        dpi: base.dpi && has_dpi,
+        dpi_stages: base.dpi_stages && has_dpi,
+        polling: base.polling,
+        sensor: base.sensor,
+        battery: has_battery,
+    }
+}
 
 #[repr(C)]
 struct Overlapped {
@@ -119,9 +177,9 @@ pub struct Hidpp {
     f_onboard: Option<u8>,
     /// Sector holding the active profile, from the control sector's first entry.
     profile_sector: Option<u16>,
-    /// 板载扇区布局是否与 G304 实测一致。接收器可以配对其他鼠标，而
-    /// 扇区偏移/CRC 是 G304 专有的，未验证的型号只能改当前 DPI。
-    profile_ok: bool,
+    /// 已验证的板载布局。接收器可以配对其他鼠标，而扇区偏移/CRC 是型号
+    /// 专有的；`None` 表示未验证，只能改当前 DPI，不碰扇区。
+    layout: Option<&'static HidppLayout>,
     limits: Limits,
     /// Last profile read: DPI stages, report rate, default index. Kept so a
     /// burst of edits does not re-read the whole sector per command.
@@ -148,7 +206,7 @@ pub struct Hidpp {
 impl Hidpp {
     pub fn open(
         path: &[u16],
-        layout: Option<HidppLayout>,
+        layout: Option<&'static HidppLayout>,
         limits: Limits,
     ) -> Result<Hidpp, String> {
         let mut p = path.to_vec();
@@ -180,7 +238,7 @@ impl Hidpp {
                 f_dpi: None,
                 f_onboard: None,
                 profile_sector: None,
-                profile_ok: false,
+                layout: None,
                 limits,
                 stages: Vec::new(),
                 default_index: 0,
@@ -198,23 +256,23 @@ impl Hidpp {
             if let Some(fi) = dev.f_name {
                 dev.name = dev.read_name(fi);
             }
-            // 只有 profile 声明已验证、型号和扇区大小都对得上才允许写板载
-            // 配置。`None`（未验证布局）仍可改当前 DPI，但不碰扇区。
-            dev.profile_ok = match layout {
-                Some(HidppLayout::G304) => {
-                    profile_layout_supported(&dev.name)
-                        && dev.onboard_sector_size() == Some(SECTOR_LEN as u16)
-                }
-                None => false,
-            };
-            dev.profile_sector = dev.find_profile_sector();
-            if dev.profile_ok {
-                dev.load_profile().ok();
+            // 只有布局存在、型号名匹配、扇区大小一致，并且真的找到了一个
+            // 启用的 profile 扇区，才允许写板载配置。`None`（未验证布局）
+            // 仍可改当前 DPI，但不碰扇区。
+            let verified = layout.filter(|l| {
+                l.supports_name(&dev.name) && dev.onboard_sector_size() == Some(l.sector_len as u16)
+            });
+            let profile_sector = verified.and_then(|l| dev.find_profile_sector(l));
+            let verified = verified.filter(|_| profile_sector.is_some());
+            dev.layout = verified;
+            dev.profile_sector = profile_sector;
+            if let Some(l) = verified {
+                dev.load_profile(l).ok();
             } else {
                 // 未验证型号没有可信的传感器范围；当前 DPI 不是持久配置，
                 // 给一个宽范围，让读取到的值仍能在编辑器里显示和微调。
                 dev.limits.dpi = (GENERIC_DPI_MIN, GENERIC_DPI_MAX);
-                if dev.f_onboard.is_some() && dev.profile_sector.is_some() {
+                if dev.f_onboard.is_some() {
                     crate::log::line(
                         "WARN",
                         &format!(
@@ -443,9 +501,9 @@ impl Hidpp {
 
     /// Reads the control sector and returns the sector of the first enabled
     /// profile. The table is `sector(2, BE) + enabled + pad`, ended by 0xFFFF.
-    fn find_profile_sector(&mut self) -> Option<u16> {
+    fn find_profile_sector(&mut self, layout: &HidppLayout) -> Option<u16> {
         let fi = self.f_onboard?;
-        let ctrl = self.read_sector(fi, 0).ok()?;
+        let ctrl = self.read_sector(layout, fi, 0).ok()?;
         for entry in ctrl.chunks(4) {
             if entry.len() < 4 || entry[0] == 0xFF {
                 break;
@@ -457,12 +515,19 @@ impl Hidpp {
         None
     }
 
-    /// One 255-byte sector: 16-byte reads up to 239, then a read at 239 whose
-    /// first byte repeats 239 — the device refuses to start a read at 240.
-    fn read_sector(&mut self, fi: u8, sector: u16) -> Result<Vec<u8>, String> {
-        let mut out = Vec::with_capacity(SECTOR_LEN);
-        for off in sector_read_offsets() {
-            let timeout = if off == TAIL_READ_AT {
+    /// One sector: `read_chunk`-byte reads, then a tail read at
+    /// `tail_read_at` whose first `tail_overlap` bytes repeat the previous
+    /// block. The G304 refuses to start a read at 240, hence 239 + overlap 1.
+    fn read_sector(
+        &mut self,
+        layout: &HidppLayout,
+        fi: u8,
+        sector: u16,
+    ) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(layout.sector_len);
+        for off in sector_read_offsets(layout) {
+            let tail = off == layout.tail_read_at;
+            let timeout = if tail {
                 "读取配置扇区尾部超时"
             } else {
                 "读取配置扇区超时"
@@ -474,21 +539,29 @@ impl Hidpp {
                     &[hi(sector), lo(sector), hi(off as u16), lo(off as u16)],
                 )?
                 .ok_or_else(|| timeout.to_string())?;
-            // 尾读从 239 开始，它的第一个字节已经在上一块里了。
-            let from = if off == TAIL_READ_AT { 5 } else { 4 };
-            let short = if off == TAIL_READ_AT {
+            // 尾读开头与上一块重叠的字节已经在 `out` 里了。
+            let from = if tail { 4 + layout.tail_overlap } else { 4 };
+            let short = if tail {
                 "配置扇区尾部应答过短"
             } else {
                 "配置扇区应答过短"
             };
             out.extend_from_slice(r.get(from..REPORT_LEN).ok_or(short)?);
         }
+        debug_assert_eq!(out.len(), layout.sector_len);
         Ok(out)
     }
 
-    /// startWrite → 16-byte blocks → commit. The sector is only accepted when
-    /// its CRC16 (big endian, last two bytes) covers everything before it.
-    fn write_sector(&mut self, fi: u8, sector: u16, data: &[u8]) -> Result<(), String> {
+    /// startWrite → `write_chunk`-byte blocks → commit. The sector is only
+    /// accepted when its CRC16 (big endian, last two bytes) covers everything
+    /// before it.
+    fn write_sector(
+        &mut self,
+        layout: &HidppLayout,
+        fi: u8,
+        sector: u16,
+        data: &[u8],
+    ) -> Result<(), String> {
         let n = data.len();
         if n == 0 {
             return Err("扇区数据为空".into());
@@ -496,10 +569,10 @@ impl Hidpp {
         let start = [hi(sector), lo(sector), 0, 0, hi(n as u16), lo(n as u16)];
         self.call(fi, 6, &start)?
             .ok_or_else(|| "开始写扇区失败".to_string())?;
-        // 末块可以短于 16 字节（255 = 15×16 + 15，实测被设备接受）。切块
+        // 末块可以短于块大小（255 = 15×16 + 15，实测被设备接受）。切块
         // 规则在 `block_ranges` 里单独钉死：以前的循环条件写成 `o < n - 1`，
         // 在 n % 16 == 1 时会把最后一个字节整个漏掉。
-        for chunk in block_ranges(n) {
+        for chunk in block_ranges(n, layout.write_chunk) {
             self.call(fi, 7, &data[chunk])?
                 .ok_or_else(|| "写入配置块失败".to_string())?;
         }
@@ -508,13 +581,13 @@ impl Hidpp {
         Ok(())
     }
 
-    fn load_profile(&mut self) -> Result<(), String> {
+    fn load_profile(&mut self, layout: &HidppLayout) -> Result<(), String> {
         let (fi, sector) = match (self.f_onboard, self.profile_sector) {
             (Some(fi), Some(s)) => (fi, s),
             _ => return Err("设备没有板载配置".into()),
         };
-        let data = self.read_sector(fi, sector)?;
-        let profile = parse_profile(&data);
+        let data = self.read_sector(layout, fi, sector)?;
+        let profile = parse_profile(&data, layout);
         self.default_index = profile.default_index;
         self.polling_ms = profile.polling_ms;
         self.stages = profile.stages;
@@ -523,7 +596,7 @@ impl Hidpp {
 
     /// Reads the sector, lets `edit` change it, and writes it back only when
     /// something actually differs — every write costs an erase cycle.
-    fn update_profile<F>(&mut self, edit: F) -> Result<(), String>
+    fn update_profile<F>(&mut self, layout: &HidppLayout, edit: F) -> Result<(), String>
     where
         F: FnOnce(&mut [u8]) -> bool,
     {
@@ -531,7 +604,7 @@ impl Hidpp {
             (Some(fi), Some(s)) => (fi, s),
             _ => return Err("设备没有板载配置".into()),
         };
-        let mut data = self.read_sector(fi, sector)?;
+        let mut data = self.read_sector(layout, fi, sector)?;
         // 写入是整扇区覆盖：读回的数据一旦损坏，重算 CRC 只会把它“洗白”，
         // 再把坏数据连同其他字段一起写进设备。所以先验证原 CRC，不匹配就
         // 拒绝这次写入。
@@ -542,7 +615,7 @@ impl Hidpp {
         // 提交整扇区会让固件按扇区里的默认档位重新加载传感器；用户刚切到、
         // 还没落盘的档位必须一起写进去，否则这次提交（例如改回报率）会把
         // 实时 DPI 顶回旧档位，界面却还显示新档位。
-        let carried = carry_pending_stage(&mut data, self.pending_default);
+        let carried = carry_pending_stage(&mut data, self.pending_default, layout.default_index_at);
         if carried.is_some() {
             changed = true;
         }
@@ -550,7 +623,7 @@ impl Hidpp {
             return Ok(());
         }
         stamp_crc(&mut data);
-        self.write_sector(fi, sector, &data)?;
+        self.write_sector(layout, fi, sector, &data)?;
         if let Some(idx) = carried {
             self.default_index = idx;
             self.pending_default = None;
@@ -563,13 +636,12 @@ impl Hidpp {
     /// 只在"下一次周期读取"时调用，而不是每次点档位都调：写一次意味着读回
     /// 255 字节 + 擦写 + 重算 CRC + commit，而连续切档是查看行为的常态。
     /// 代价是断电前最后几次切换可能没落盘，设备会回到旧档位——运行态不受影响。
-    fn flush_default_stage(&mut self) -> Result<(), String> {
+    fn flush_default_stage(&mut self, layout: &HidppLayout) -> Result<(), String> {
         let Some(idx) = self.pending_default else {
             return Ok(());
         };
-        let (Some(_), true, Some(_)) = (self.f_onboard, self.profile_ok, self.profile_sector)
-        else {
-            // 没有可写的板载配置（或布局未验证）：档位只存在于固件运行态。
+        let (Some(_), Some(_)) = (self.f_onboard, self.profile_sector) else {
+            // 没有可写的板载配置：档位只存在于固件运行态。
             self.pending_default = None;
             return Ok(());
         };
@@ -577,11 +649,11 @@ impl Hidpp {
             self.pending_default = None;
             return Ok(());
         }
-        self.update_profile(|data| {
-            if data[P_DEFAULT_INDEX] == idx {
+        self.update_profile(layout, |data| {
+            if data[layout.default_index_at] == idx {
                 return false;
             }
-            data[P_DEFAULT_INDEX] = idx;
+            data[layout.default_index_at] = idx;
             true
         })?;
         self.default_index = idx;
@@ -592,16 +664,24 @@ impl Hidpp {
     /// 落盘失败只记一笔日志：设备本身仍然是好的，这次会话也照常用，只是
     /// 重启后档位回到旧值——这比把设备判成离线温和得多。
     fn settle_default_stage(&mut self) {
-        if let Err(e) = self.flush_default_stage() {
+        let Some(layout) = self.layout else {
+            self.pending_default = None;
+            return;
+        };
+        if let Err(e) = self.flush_default_stage(layout) {
             crate::log::line("WARN", &format!("保存默认档位失败：{e}"));
             self.pending_default = None;
         }
     }
 
+    fn current_caps(&self) -> Caps {
+        caps_for(self.layout, self.f_dpi.is_some(), self.f_battery.is_some())
+    }
+
     fn set_current_dpi(&mut self, value: u16) -> Result<(), String> {
-        let Some(fi) = self.f_dpi else {
-            return Ok(());
-        };
+        let fi = self
+            .f_dpi
+            .ok_or_else(|| "该设备不支持调整 DPI".to_string())?;
         let b = value.to_be_bytes();
         // X and Y are separate fields; write both so a device that really
         // splits the axes cannot end up with mismatched halves.
@@ -612,12 +692,6 @@ impl Hidpp {
             .ok_or_else(|| "设置 DPI 无应答".to_string())?;
         Ok(())
     }
-}
-
-/// 只有 G304 的板载扇区布局经过真机验证；同一接收器配对其他鼠标时
-/// 不能按这套偏移写入。
-fn profile_layout_supported(name: &str) -> bool {
-    name.to_ascii_lowercase().contains("g304")
 }
 
 /// 一帧长报文：`11 devIdx feature (func<<4|swid) params…`。
@@ -635,52 +709,59 @@ fn build_frame(dev_idx: u8, feature: u8, func: u8, params: &[u8]) -> [u8; REPORT
     f
 }
 
-/// 扇区读取的起始偏移：0..240 每 16 字节一次，再补一次 239。设备拒绝从
-/// 240 起读，尾部 15 字节靠与上一块重叠一个字节取回。
-fn sector_read_offsets() -> impl Iterator<Item = usize> {
-    (0..240).step_by(16).chain(std::iter::once(TAIL_READ_AT))
+/// 扇区读取的起始偏移：从 0 开始每 `read_chunk` 字节一次，再补一次尾读。
+/// G304 拒绝从 240 起读，尾部 15 字节靠与上一块重叠一个字节取回。
+fn sector_read_offsets(layout: &HidppLayout) -> impl Iterator<Item = usize> {
+    (0..=layout.tail_read_at)
+        .step_by(layout.read_chunk)
+        .chain(std::iter::once(layout.tail_read_at))
 }
 
-/// 写扇区时的 16 字节分块（末块可短）。
+/// 写扇区时的分块（末块可短）。
 ///
 /// 单独抽出来是因为边界条件曾经写错过：`o < n - 1` 在 `n % 16 == 1` 时会
 /// 漏掉最后一个字节。现在有测试直接钉住 1 / 16 / 17 / 255 这几种长度。
-fn block_ranges(n: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
-    (0..n).step_by(16).map(move |o| o..(o + 16).min(n))
+fn block_ranges(n: usize, chunk: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..n).step_by(chunk).map(move |o| o..(o + chunk).min(n))
 }
 
 /// 重算并写入扇区尾部的 CRC16（大端）。
 fn stamp_crc(data: &mut [u8]) {
-    let crc = crc16(&data[..CRC_AT]);
-    data[CRC_AT..SECTOR_LEN].copy_from_slice(&crc.to_be_bytes());
+    let crc_at = data.len() - 2;
+    let crc = crc16(&data[..crc_at]);
+    data[crc_at..].copy_from_slice(&crc.to_be_bytes());
 }
 
 /// 整扇区提交会让固件按扇区里的默认档位重载传感器。把待落盘的档位并进
 /// 这次要提交的数据，避免无关修改（如回报率）把它顶回旧档位。
 /// 返回实际并入扇区的档位；扇区里已经是该档位时返回 `None`。
-fn carry_pending_stage(data: &mut [u8], pending: Option<u8>) -> Option<u8> {
+fn carry_pending_stage(
+    data: &mut [u8],
+    pending: Option<u8>,
+    default_index_at: usize,
+) -> Option<u8> {
     let idx = pending?;
-    if data[P_DEFAULT_INDEX] == idx {
+    if data[default_index_at] == idx {
         return None;
     }
-    data[P_DEFAULT_INDEX] = idx;
+    data[default_index_at] = idx;
     Some(idx)
 }
 
-/// 从 255 字节的 profile 扇区里解出可编辑字段。
+/// 从 profile 扇区里解出可编辑字段。
 struct Profile {
     stages: Vec<u16>,
     default_index: u8,
     polling_ms: u8,
 }
 
-fn parse_profile(data: &[u8]) -> Profile {
-    debug_assert_eq!(data.len(), SECTOR_LEN);
-    let mut stages = Vec::with_capacity(STAGES);
-    for i in 0..STAGES {
+fn parse_profile(data: &[u8], layout: &HidppLayout) -> Profile {
+    debug_assert_eq!(data.len(), layout.sector_len);
+    let mut stages = Vec::with_capacity(layout.stages);
+    for i in 0..layout.stages {
         stages.push(u16::from_le_bytes([
-            data[P_DPI + i * 2],
-            data[P_DPI + i * 2 + 1],
+            data[layout.dpi_at + i * 2],
+            data[layout.dpi_at + i * 2 + 1],
         ]));
     }
     // A trailing 0 means "that stage is not configured".
@@ -689,9 +770,9 @@ fn parse_profile(data: &[u8]) -> Profile {
     }
     Profile {
         stages,
-        default_index: data[P_DEFAULT_INDEX],
+        default_index: data[layout.default_index_at],
         // 0 会让 snapshot 里 `1000 / polling_ms` 除零。
-        polling_ms: data[P_REPORT_RATE].max(1),
+        polling_ms: data[layout.report_rate_at].max(1),
     }
 }
 
@@ -706,7 +787,8 @@ fn lo(v: u16) -> u8 {
 /// 扇区最后两字节（大端）必须覆盖前面的全部内容。读回的数据用这个判定，
 /// 写回前不通过就不碰设备。
 fn sector_crc_valid(data: &[u8]) -> bool {
-    data[CRC_AT..SECTOR_LEN] == crc16(&data[..CRC_AT]).to_be_bytes()
+    let crc_at = data.len() - 2;
+    data[crc_at..] == crc16(&data[..crc_at]).to_be_bytes()
 }
 
 /// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), the one Logitech's sectors
@@ -772,8 +854,9 @@ impl Driver for Hidpp {
         // 先把待落的默认档位写掉，再读扇区：这样下面读到的 index、当前 DPI
         // 都是同一次写入之后的状态，不会一会儿新一会儿旧。
         self.settle_default_stage();
-        if self.profile_ok && self.f_onboard.is_some() && self.profile_sector.is_some() {
-            self.load_profile()?;
+        let caps = self.current_caps();
+        if let Some(layout) = self.layout {
+            self.load_profile(layout)?;
         }
         let current = match self.f_dpi {
             Some(fi) => self.read_dpi(fi)?,
@@ -802,11 +885,7 @@ impl Driver for Hidpp {
 
         Ok(Snapshot {
             model: self.name.clone(),
-            caps: if self.profile_ok && self.profile_sector.is_some() {
-                Caps::MOUSE_STAGES
-            } else {
-                Caps::MOUSE_DPI
-            },
+            caps,
             polling_ms: self.polling_ms,
             lod: 0,
             motion: false,
@@ -841,19 +920,25 @@ impl Driver for Hidpp {
         match cmd {
             Cmd::Refresh => Ok(()),
             Cmd::Dpi(stage, v) => {
+                if self.f_dpi.is_none() {
+                    return Err("该设备不支持调整 DPI".into());
+                }
                 let v = v.clamp(self.limits.dpi.0, self.limits.dpi.1);
                 let idx = stage as usize;
-                if self.profile_ok && self.profile_sector.is_some() {
+                if let Some(layout) = self.layout {
                     // `stage` comes from outside the driver; this is the
                     // protocol boundary, so reject an out-of-range index
                     // here instead of indexing past the sector (which
                     // would panic the collection thread).
-                    if idx >= STAGES {
-                        return Err(format!("dpi stage {stage} out of range (0..{STAGES})"));
+                    if idx >= layout.stages {
+                        return Err(format!(
+                            "dpi stage {stage} out of range (0..{})",
+                            layout.stages
+                        ));
                     }
                     let b = v.to_le_bytes();
-                    let at = P_DPI + idx * 2;
-                    self.update_profile(|data| {
+                    let at = layout.dpi_at + idx * 2;
+                    self.update_profile(layout, |data| {
                         if data[at] == b[0] && data[at + 1] == b[1] {
                             return false;
                         }
@@ -898,17 +983,17 @@ impl Driver for Hidpp {
                 Ok(())
             }
             Cmd::Polling(ms) => {
-                if !self.profile_ok || self.profile_sector.is_none() {
+                let Some(layout) = self.layout else {
                     return Err("该设备不支持调整回报率".into());
-                }
+                };
                 if !self.limits.polling.contains(&ms) {
                     return Err("该型号不支持这个回报率".into());
                 }
-                self.update_profile(|data| {
-                    if data[P_REPORT_RATE] == ms {
+                self.update_profile(layout, |data| {
+                    if data[layout.report_rate_at] == ms {
                         return false;
                     }
-                    data[P_REPORT_RATE] = ms;
+                    data[layout.report_rate_at] = ms;
                     true
                 })?;
                 self.polling_ms = ms;
@@ -937,7 +1022,7 @@ mod tests {
     /// then the CRC the device stored.
     fn shipped_sector() -> Vec<u8> {
         let mut sector = vec![0x00, 0x01, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00];
-        sector.resize(CRC_AT, 0xFF);
+        sector.resize(G304.sector_len - 2, 0xFF);
         sector.extend_from_slice(&[0x58, 0x7C]);
         sector
     }
@@ -946,7 +1031,8 @@ mod tests {
     fn crc_matches_the_sector_the_device_ships_with() {
         // Reproducing the stored value proves the polynomial, the init value
         // and the byte order used by `write_sector`.
-        let crc = crc16(&shipped_sector()[..CRC_AT]);
+        let sector = shipped_sector();
+        let crc = crc16(&sector[..sector.len() - 2]);
         assert_eq!(crc, 0x587C);
         assert_eq!(crc.to_be_bytes(), [0x58, 0x7C]);
     }
@@ -958,11 +1044,12 @@ mod tests {
         assert!(sector_crc_valid(&good));
 
         let mut flipped = good.clone();
-        flipped[P_DPI] ^= 0x01;
+        flipped[G304.dpi_at] ^= 0x01;
         assert!(!sector_crc_valid(&flipped));
 
+        let crc_at = good.len() - 2;
         let mut swapped = good;
-        swapped.swap(CRC_AT, CRC_AT + 1);
+        swapped.swap(crc_at, crc_at + 1);
         assert!(!sector_crc_valid(&swapped));
     }
 
@@ -980,15 +1067,69 @@ mod tests {
         assert_eq!(3200u16.clamp(DPI_MIN, DPI_MAX), 3200);
     }
 
-    /// 接收器是通用的：只有 G304 的扇区布局验证过，其他型号必须降级。
+    /// 能力位必须同时受布局和 feature discovery 约束，不能因为“是鼠标”
+    /// 就假设有 DPI/电量。没有 0x2201 时 `dpi=false`，UI 不会再放一个
+    /// 写了也没效果的编辑框。
     #[test]
-    fn profile_layout_gate_accepts_only_verified_model() {
-        assert!(profile_layout_supported(
-            "G304 Lightspeed Wireless Gaming Mouse"
-        ));
-        assert!(profile_layout_supported("g304 lightspeed"));
-        assert!(!profile_layout_supported("G502 HERO"));
-        assert!(!profile_layout_supported(""));
+    fn caps_follow_feature_discovery() {
+        let none = caps_for(None, false, false);
+        assert!(!none.dpi);
+        assert!(!none.dpi_stages);
+        assert!(!none.polling);
+        assert!(!none.sensor);
+        assert!(!none.battery);
+
+        let dpi_only = caps_for(None, true, true);
+        assert!(dpi_only.dpi);
+        assert!(!dpi_only.dpi_stages);
+        assert!(!dpi_only.polling);
+        assert!(dpi_only.battery);
+
+        let full = caps_for(Some(&G304), true, true);
+        assert_eq!(full, G304.caps);
+        assert!(full.battery);
+
+        let no_battery = caps_for(Some(&G304), true, false);
+        assert!(no_battery.dpi_stages);
+        assert!(!no_battery.battery);
+
+        let no_dpi = caps_for(Some(&G304), false, true);
+        assert!(!no_dpi.dpi);
+        assert!(!no_dpi.dpi_stages);
+        assert!(no_dpi.polling);
+    }
+
+    /// 接收器是通用的：只有 G304 的扇区布局验证过，其他型号必须降级。
+    /// 同时钉住布局内部自洽，避免偏移/长度改错后测试仍然通过。
+    #[test]
+    fn g304_layout_is_internally_consistent() {
+        let l = &G304;
+        assert_eq!(l.model, "G304");
+        assert!(l.supports_name("G304 Lightspeed Wireless Gaming Mouse"));
+        assert!(l.supports_name("g304 lightspeed"));
+        assert!(!l.supports_name("G502 HERO"));
+        assert!(!l.supports_name(""));
+        // 名称匹配对两边都不区分大小写，避免布局作者写成大写后静默失效。
+        let mut upper = *l;
+        upper.name_contains = "G304";
+        assert!(upper.supports_name("g304 lightspeed"));
+
+        assert!(l.sector_len > 2);
+        assert!(l.tail_read_at < l.sector_len);
+        // 尾读起点不能落在整块边界上：否则块序列与补尾重复读同一段，
+        // 扇区长度会错，而 release 下没有 debug_assert 兜底。
+        assert!(!l.tail_read_at.is_multiple_of(l.read_chunk));
+        assert!(l.report_rate_at < l.sector_len);
+        assert!(l.default_index_at < l.sector_len);
+        assert!(l.dpi_at + l.stages * 2 <= l.sector_len);
+        assert!(l.tail_overlap < REPORT_LEN - 4);
+        assert!(l.read_chunk > 0);
+        assert!(l.write_chunk > 0);
+        assert_eq!(l.caps, Caps::MOUSE_STAGES);
+        // 与真机扇区一致的边界：255 = 15×16 + 15。
+        assert_eq!(l.sector_len, 255);
+        assert_eq!(l.tail_read_at, 239);
+        assert_eq!(l.stages, 5);
     }
 
     /// 报文头：`11 devIdx feature (func<<4 | swid)`，参数写在 `[4..20]`，
@@ -1009,7 +1150,11 @@ mod tests {
     /// 的循环条件会在 n % 16 == 1 时漏掉最后一个字节。
     #[test]
     fn block_ranges_never_drop_the_tail() {
-        let lens = |n: usize| block_ranges(n).map(|r| r.len()).collect::<Vec<_>>();
+        let lens = |n: usize| {
+            block_ranges(n, G304.write_chunk)
+                .map(|r| r.len())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(lens(0), Vec::<usize>::new());
         assert_eq!(lens(1), vec![1]);
         assert_eq!(lens(16), vec![16]);
@@ -1017,47 +1162,53 @@ mod tests {
         let mut full = vec![16; 15];
         full.push(15);
         assert_eq!(lens(255), full);
-        assert_eq!(block_ranges(255).map(|r| r.end).max(), Some(SECTOR_LEN));
+        assert_eq!(
+            block_ranges(255, G304.write_chunk).map(|r| r.end).max(),
+            Some(G304.sector_len)
+        );
     }
 
     /// 扇区读取必须完整覆盖 255 字节：0..240 每 16 字节一次，再在 239 补
     /// 一次尾读（设备拒绝从 240 起读）。
     #[test]
     fn sector_reads_cover_the_whole_sector() {
-        let head: Vec<usize> = (0..240).step_by(16).collect();
-        let offsets: Vec<usize> = sector_read_offsets().collect();
+        let head: Vec<usize> = (0..=G304.tail_read_at).step_by(G304.read_chunk).collect();
+        let offsets: Vec<usize> = sector_read_offsets(&G304).collect();
         assert_eq!(offsets.len(), head.len() + 1);
         assert_eq!(&offsets[..head.len()], head.as_slice());
-        assert_eq!(offsets[head.len()], TAIL_READ_AT);
+        assert_eq!(offsets[head.len()], G304.tail_read_at);
         // 前 15 次各 16 字节，尾读从 239 起 15 字节（239 与上一块重复）。
-        assert_eq!(head.len() * 16 + (REPORT_LEN - 5), SECTOR_LEN);
+        assert_eq!(
+            head.len() * G304.read_chunk + (REPORT_LEN - 4 - G304.tail_overlap),
+            G304.sector_len
+        );
     }
 
     /// profile 扇区的字段偏移：回报率、默认档位、五个小端 DPI 槽。
     #[test]
     fn parses_profile_fields_from_the_sector() {
-        let mut sector = vec![0u8; SECTOR_LEN];
-        sector[P_REPORT_RATE] = 4;
-        sector[P_DEFAULT_INDEX] = 2;
+        let mut sector = vec![0u8; G304.sector_len];
+        sector[G304.report_rate_at] = 4;
+        sector[G304.default_index_at] = 2;
         for (i, v) in [400u16, 800, 1600, 0, 0].into_iter().enumerate() {
-            let at = P_DPI + i * 2;
+            let at = G304.dpi_at + i * 2;
             sector[at..at + 2].copy_from_slice(&v.to_le_bytes());
         }
-        let p = parse_profile(&sector);
+        let p = parse_profile(&sector, &G304);
         assert_eq!(p.stages, vec![400, 800, 1600]);
         assert_eq!(p.default_index, 2);
         assert_eq!(p.polling_ms, 4);
 
         // 回报率为 0 时退化到 1 ms，UI 才不会除零。
-        sector[P_REPORT_RATE] = 0;
-        assert_eq!(parse_profile(&sector).polling_ms, 1);
+        sector[G304.report_rate_at] = 0;
+        assert_eq!(parse_profile(&sector, &G304).polling_ms, 1);
     }
 
     /// 写完 CRC 之后，改过的扇区必须重新通过校验。
     #[test]
     fn stamping_the_crc_makes_a_modified_sector_valid() {
         let mut sector = shipped_sector();
-        sector[P_DPI] ^= 0x11;
+        sector[G304.dpi_at] ^= 0x11;
         assert!(!sector_crc_valid(&sector));
         stamp_crc(&mut sector);
         assert!(sector_crc_valid(&sector));
@@ -1068,11 +1219,20 @@ mod tests {
     #[test]
     fn pending_stage_travels_with_any_sector_write() {
         let mut sector = shipped_sector();
-        assert_eq!(sector[P_DEFAULT_INDEX], 1);
-        assert_eq!(carry_pending_stage(&mut sector, Some(2)), Some(2));
-        assert_eq!(sector[P_DEFAULT_INDEX], 2);
+        assert_eq!(sector[G304.default_index_at], 1);
+        assert_eq!(
+            carry_pending_stage(&mut sector, Some(2), G304.default_index_at),
+            Some(2)
+        );
+        assert_eq!(sector[G304.default_index_at], 2);
         // 扇区里已经是这一档：不算改动，也不重复记账。
-        assert_eq!(carry_pending_stage(&mut sector, Some(2)), None);
-        assert_eq!(carry_pending_stage(&mut sector, None), None);
+        assert_eq!(
+            carry_pending_stage(&mut sector, Some(2), G304.default_index_at),
+            None
+        );
+        assert_eq!(
+            carry_pending_stage(&mut sector, None, G304.default_index_at),
+            None
+        );
     }
 }

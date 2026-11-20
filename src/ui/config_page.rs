@@ -1,13 +1,18 @@
 //! The device configuration page. It is a route inside the main window, not a
 //! separate viewport, so the titlebar keeps its back affordance and the user
 //! never loses the device list.
+//!
+//! 这是鼠标配置页。键盘目前是只读设备，只会显示“只读设备”提示，不会进入
+//! 下面的设置卡；新增键盘灯效/改键应另建设置模型，而不是扩展 `Snapshot`。
 
 use eframe::egui::{self, Align, Layout, RichText, Stroke, Ui, Vec2};
 
 use crate::devices::{Cmd, DeviceId, DeviceInfo, DeviceState, EditorState, Link, Snapshot};
-use crate::driver::Limits;
+use crate::driver::{Limits, LodScale};
 use crate::sysinput;
-use crate::theme::{alpha, battery_color, battery_level, heading, meta, micro, text, Palette};
+use crate::theme::{
+    alpha, battery_color, battery_level, heading, meta, micro, numeral, text, Palette,
+};
 use crate::ui::widgets::{
     battery_bar, card, chip, chip_small, connection_chip, connection_color, device_tile, divider,
     dpi_chip, link_action, paint_refresh, primary_button, section_heading, shadow_card, split_row,
@@ -172,17 +177,43 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
                 38.0,
             );
             ui.add_space(10.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.label(
-                    RichText::new(info.brand.to_uppercase())
-                        .size(11.0)
-                        .extra_letter_spacing(0.6)
-                        .color(p.subtle),
-                );
-                ui.add(egui::Label::new(heading(&info.model, text::SUBTITLE, p.text)).truncate())
+            // 连接标签在本行之后才布局，必须先预留它的宽度：否则长型号会把
+            // 整行占满，标签被挤出卡片范围并与型号文字叠在一起。
+            let chip_w = ui
+                .painter()
+                .layout_no_wrap(
+                    info.connection.label().to_owned(),
+                    egui::FontId::proportional(text::MICRO),
+                    p.text,
+                )
+                .size()
+                .x
+                + 18.0;
+            let title_w = (ui.available_width() - chip_w - 10.0).max(60.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(title_w, 38.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(title_w);
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    // 与首页卡片同序：型号在上、厂家在下。
+                    // egui 0.37 的 Label 对省略文本会自动弹一条完整文本提示，
+                    // 与下面显式的 on_hover_text 叠加会同时出现两条同样的
+                    // tooltip；这里关掉自动提示，只保留手写的那条。
+                    ui.add(
+                        egui::Label::new(heading(&info.model, text::SUBTITLE, p.text))
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    )
                     .on_hover_text(&info.model);
-            });
+                    ui.label(
+                        RichText::new(info.brand.to_uppercase())
+                            .size(11.0)
+                            .extra_letter_spacing(0.6)
+                            .color(p.subtle),
+                    );
+                },
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 connection_chip(ui, p, info.connection);
             });
@@ -194,7 +225,8 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
         // "有线"不是电量读数：连接方式已经在身份行和标题栏里写明了，
         // 这里没有百分比就不摆电量区，避免把状态词当成数值展示。
         let wired = info.connection.is_wired();
-        let show_battery = state.battery.is_some() || !wired;
+        // 能力位说没有电量，就不摆一列永远读不到的 "--"。
+        let show_battery = snap.caps.battery && (state.battery.is_some() || !wired);
         ui.add_space(if show_battery { 14.0 } else { 10.0 });
 
         if show_battery {
@@ -215,7 +247,7 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
                         ui.label(micro("%", p.dim));
                         ui.add_space(2.0);
                     }
-                    ui.label(heading(value, text::METRIC, color));
+                    ui.label(numeral(value, text::METRIC, color));
                 });
             });
             ui.add_space(7.0);
@@ -229,22 +261,30 @@ fn status_card(ui: &mut Ui, p: &Palette, info: &DeviceInfo, state: &DeviceState,
 
         let hz = 1000 / snap.polling_ms.max(1) as u32;
         if snap.caps.polling {
-            status_row(ui, p, "回报率", &format!("{hz} Hz"));
+            status_row(ui, p, "回报率", &hz.to_string(), "Hz");
         }
         if snap.caps.dpi {
             let active = snap.stage_active as usize;
             let current = snap.dpi.get(active).copied().unwrap_or(0);
-            status_row(ui, p, "当前 DPI", &current.to_string());
+            status_row(ui, p, "当前 DPI", &current.to_string(), "");
         }
     });
 }
 
 /// 只读状态行：标签靠左、数值靠右，读起来像一张规格表。
-fn status_row(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
+///
+/// 单位单独用微标签排版，和首页卡片的指标列保持同一套“数值大、单位小”
+/// 的关系；整串交给数字字族时，单位会跟着数字一起变粗变高。
+fn status_row(ui: &mut Ui, p: &Palette, label: &str, value: &str, unit: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).size(12.0).color(p.dim));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).size(13.0).strong().color(p.text));
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if !unit.is_empty() {
+                ui.label(micro(unit, p.dim));
+                ui.add_space(3.0);
+            }
+            ui.label(numeral(value, 15.0, p.text));
         });
     });
     ui.add_space(7.0);
@@ -462,10 +502,8 @@ fn dpi_input(ui: &mut Ui, p: &Palette, stage: u8, current: u16, min: u16, max: u
         draft.seen = current;
     }
 
-    // 尺寸对齐上方的档位标签（62×32），而不是做成一个 92×30 的输入框：
-    // 这是"当前档位的数值，可以直接改写"，不是一个独立表单字段。字号也跟着
-    // 档位数字走（展示字族 14），不再用 16 号正文——它比周围的标签大两圈，
-    // 会把整行视觉重心拉到一个次要控件上。
+    // 比上方档位标签（62×32）略宽，5 位 DPI 数字不贴边；但仍不做成 92px
+    // 的独立表单字段。字号跟档位数字走（展示字族 14），不用 16 号正文。
     let response = egui::Frame::new()
         .fill(p.inset)
         .stroke(Stroke::new(
@@ -481,7 +519,7 @@ fn dpi_input(ui: &mut Ui, p: &Palette, stage: u8, current: u16, min: u16, max: u
             ui.add(
                 egui::TextEdit::singleline(&mut draft.text)
                     .id(id)
-                    .desired_width(46.0)
+                    .desired_width(64.0)
                     .char_limit(5)
                     .font(crate::theme::heading_font(14.0))
                     .align(egui::Align2::CENTER_CENTER)
@@ -590,7 +628,16 @@ fn limited_card(ui: &mut Ui, p: &Palette, snap: &Snapshot) {
         );
         // `surface` 把垂直间距清零了，能力行之间要显式留白。
         ui.add_space(6.0);
-        row(ui, "电量", true, "每 20 秒读一次");
+        row(
+            ui,
+            "电量",
+            snap.caps.battery,
+            if snap.caps.battery {
+                "后台定期读取"
+            } else {
+                "固件未上报"
+            },
+        );
         ui.add_space(6.0);
         row(ui, "回报率", snap.caps.polling, "固件固定，不可调");
         ui.add_space(6.0);
@@ -662,11 +709,11 @@ fn settings_card(
                 p,
                 "按下防抖",
                 "按下瞬间的过滤时长，用来挡掉触点抖动造成的误触双击",
-                "8 ms",
-                &format!(
-                    "{} ms",
-                    ed.deb_press.clamp(limits.debounce.0, limits.debounce.1)
-                ),
+                "常用 8 ms",
+                &ed.deb_press
+                    .clamp(limits.debounce.0, limits.debounce.1)
+                    .to_string(),
+                "ms",
                 |m, c| {
                     let base = ed.deb_press.clamp(limits.debounce.0, limits.debounce.1);
                     if m {
@@ -687,11 +734,11 @@ fn settings_card(
                 p,
                 "抬起防抖",
                 "松开瞬间的过滤时长；调得太大会让连点跟不上手速",
-                "8 ms",
-                &format!(
-                    "{} ms",
-                    ed.deb_release.clamp(limits.debounce.0, limits.debounce.1)
-                ),
+                "常用 8 ms",
+                &ed.deb_release
+                    .clamp(limits.debounce.0, limits.debounce.1)
+                    .to_string(),
+                "ms",
                 |m, c| {
                     let base = ed.deb_release.clamp(limits.debounce.0, limits.debounce.1);
                     if m {
@@ -712,11 +759,11 @@ fn settings_card(
                 p,
                 "休眠等待",
                 "闲置多久后进入休眠省电，唤醒要再点一下或晃一下鼠标；有线连接时不休眠",
-                "10 分钟",
-                &format!(
-                    "{} 分钟",
-                    ed.sleep_min.clamp(limits.sleep.0, limits.sleep.1)
-                ),
+                "常用 10 分钟",
+                &ed.sleep_min
+                    .clamp(limits.sleep.0, limits.sleep.1)
+                    .to_string(),
+                "分钟",
                 |m, c| {
                     let base = ed.sleep_min.clamp(limits.sleep.0, limits.sleep.1);
                     if m {
@@ -729,13 +776,21 @@ fn settings_card(
                     }
                 },
             );
+            let lod_rec = limits
+                .lod_recommended
+                .map(|range| lod_range_text(range, limits.lod_scale))
+                .unwrap_or_default();
+            // "1.0 mm" / "—"：拆成数值与单位两段，单位和数字各用各的字族。
+            let lod = lod_text(ed.lod.clamp(limits.lod.0, limits.lod.1), limits.lod_scale);
+            let (lod_value, lod_unit) = lod.split_once(' ').unwrap_or((lod.as_str(), ""));
             stepper_row(
                 ui,
                 p,
                 "静默高度 LOD",
                 "鼠标离开桌面多少毫米后停止追踪。越低，抬鼠归位后指针越不容易漂",
-                "1.0–1.2 mm",
-                &lod_text(ed.lod.clamp(limits.lod.0, limits.lod.1)),
+                &lod_rec,
+                lod_value,
+                lod_unit,
                 |m, c| {
                     let base = ed.lod.clamp(limits.lod.0, limits.lod.1);
                     if m {
@@ -820,7 +875,8 @@ pub fn system_card(ui: &mut Ui, p: &Palette) {
             "指针速度",
             "等于 Windows 鼠标设置里的滑块（1–20），10 是默认。和 DPI 是两回事：DPI 决定灵敏度，这个只是系统倍率",
             "10",
-            &format!("{speed} / 20"),
+            &speed.to_string(),
+            "/ 20",
             |m, c| {
                 if m {
                     next_speed =
@@ -842,13 +898,17 @@ pub fn system_card(ui: &mut Ui, p: &Palette) {
         let page = lines == sysinput::WHEEL_PAGESCROLL;
         ui.add_enabled_ui(!page, |ui| {
             let mut next_lines: Option<u32> = None;
+            // "3 行" / "整屏"：同样是数值与单位分开，中文单位不进数字字族。
+            let wheel = sysinput::wheel_label(lines);
+            let (wheel_value, wheel_unit) = wheel.split_once(' ').unwrap_or((wheel.as_str(), ""));
             stepper_row(
                 ui,
                 p,
                 "滚轮行数",
                 "滚一格滚多少行；网页和表格里 3 行最常见，调大滚得更快",
                 "3 行",
-                &sysinput::wheel_label(lines),
+                wheel_value,
+                wheel_unit,
                 |m, c| {
                     if m {
                         next_lines = Some(lines.saturating_sub(1).max(1));
@@ -911,9 +971,25 @@ pub fn system_card(ui: &mut Ui, p: &Palette) {
     }
 }
 
-fn lod_text(code: u8) -> String {
-    let mm = 0.9 + code as f32 / 10.0;
+fn lod_text(code: u8, scale: LodScale) -> String {
+    if scale == LodScale::UNKNOWN {
+        return "—".into();
+    }
+    let mm = scale.tenths(code) as f32 / 10.0;
     format!("{mm:.1} mm")
+}
+
+/// LOD 推荐区间的展示文本，例如 VT1 Pro 的编码 1..3 → "1.0–1.2 mm"。
+fn lod_range_text(range: (u8, u8), scale: LodScale) -> String {
+    if scale == LodScale::UNKNOWN {
+        return String::new();
+    }
+    let (lo, hi) = (scale.tenths(range.0), scale.tenths(range.1));
+    if lo == hi {
+        format!("{:.1} mm", lo as f32 / 10.0)
+    } else {
+        format!("{:.1}–{:.1} mm", lo as f32 / 10.0, hi as f32 / 10.0)
+    }
 }
 
 #[derive(Default)]
@@ -927,12 +1003,7 @@ pub struct MissingAction {
 pub fn missing(ui: &mut Ui, p: &Palette) -> MissingAction {
     let mut action = MissingAction::default();
     card(ui, p, |ui| {
-        ui.label(
-            RichText::new("设备已移除")
-                .size(16.0)
-                .strong()
-                .color(p.text),
-        );
+        ui.label(heading("设备已移除", text::SUBTITLE, p.text));
         ui.add_space(3.0);
         ui.label(
             RichText::new("该设备已断开或拔出，当前没有可读取的配置。")
@@ -1038,4 +1109,31 @@ pub fn toast_overlay(ui: &Ui, p: &Palette, title: &str, body: &str, alpha: f32) 
         body_gal,
         p.text,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lod_text_uses_the_model_scale() {
+        let scale = LodScale {
+            base_tenths: 9,
+            step_tenths: 1,
+        };
+        assert_eq!(lod_text(1, scale), "1.0 mm");
+        assert_eq!(lod_text(11, scale), "2.0 mm");
+        assert_eq!(lod_text(1, LodScale::UNKNOWN), "—");
+    }
+
+    #[test]
+    fn lod_recommendation_formats_from_the_model_scale() {
+        let scale = LodScale {
+            base_tenths: 9,
+            step_tenths: 1,
+        };
+        assert_eq!(lod_range_text((1, 3), scale), "1.0–1.2 mm");
+        assert_eq!(lod_range_text((2, 2), scale), "1.1 mm");
+        assert_eq!(lod_range_text((1, 3), LodScale::UNKNOWN), "");
+    }
 }

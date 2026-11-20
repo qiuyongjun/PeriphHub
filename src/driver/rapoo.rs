@@ -1,8 +1,11 @@
-//! Rapoo VT1 Pro (24AE:1214).
+//! Rapoo vendor protocol: 32-byte `0xBA` reports over the vendor collection
+//! `0xFF00/0x0E`: `A5 A4` = read, `A5 A5` = write, `A5 A3` = commit,
+//! `A5 AA` = battery.
 //!
-//! 32-byte `0xBA` reports over the vendor collection `0xFF00/0x0E`:
-//! `A5 A4` = read, `A5 A5` = write, `A5 A3` = commit, `A5 AA` = battery.
-//! Addresses are EEPROM offsets; see `docs/protocol.md`.
+//! Frame format, timing and 4-byte-aligned read-modify-write are protocol-level
+//! behavior. EEPROM addresses, flag bits, stage limits, battery reply flags and
+//! capabilities are model data and live in [`RapooLayout`]; only layouts
+//! verified on real hardware belong in `PROFILES`. See `docs/protocol.md`.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -23,26 +26,88 @@ use super::{Caps, Cmd, Driver, Limits, Snapshot};
 
 const RID: u8 = 0xBA;
 
-const A_POLL: u32 = 0x0880;
-const A_LOD: u32 = 0x0884;
-const A_DPI_X: u32 = 0x0888;
-const A_STAGE_ACTIVE: u32 = 0x0898;
-const A_DPI_Y: u32 = 0x08C8;
-const A_DEB_PRESS: u32 = 0x08C0;
-const A_FLAGS: u32 = 0x08C3;
+/// 一个经过真机验证的 Rapoo 型号的 EEPROM 布局与能力。
+///
+/// 帧构造、时序和 4 字节对齐读-改-写属于协议层，留在这个模块里；这里只放
+/// "哪个地址、哪个字节、这台设备有哪些能力"这类型号数据。新增型号必须先在
+/// 真机上验证，再新建一个 layout；复用别的型号的 layout，就是往未知的 EEPROM
+/// 单元里写数据。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RapooLayout {
+    /// 验证时的型号名，用于日志和"布局不匹配"的错误信息。
+    pub model: &'static str,
+    /// 允许使用这套布局的 VID/PID。驱动打开句柄后会先校验，再读写任何数据。
+    pub supported_ids: &'static [(u16, u16)],
+    pub poll_addr: u32,
+    pub lod_addr: u32,
+    pub dpi_x_addr: u32,
+    pub dpi_y_addr: u32,
+    pub active_stage_addr: u32,
+    /// 防抖、休眠与修正标志共用的 4 字节块。
+    pub debounce_addr: u32,
+    /// 标志字节在 [`Self::debounce_addr`] 块内的偏移。
+    pub flags_offset: usize,
+    /// 档位数在 `dpi_x` 读块中的偏移。
+    pub stage_count_at: usize,
+    /// 当前档位在 `dpi_x` 读块中的偏移。
+    pub active_stage_at: usize,
+    /// `dpi_x` / `dpi_y` 各读多少字节（含档位数与当前档位）。
+    pub dpi_read_len: usize,
+    pub max_stages: u8,
+    /// `0xAA` 电量应答里已知的连接 flag。
+    pub battery_link_flags: &'static [u8],
+    pub debounce_press_at: usize,
+    pub debounce_release_at: usize,
+    pub sleep_at: usize,
+    /// 修正标志位；置位表示关闭。
+    pub line_flag: u8,
+    pub wave_flag: u8,
+    /// 该型号真正开放的能力块。
+    pub caps: Caps,
+}
 
-/// 档位上限。`0x0888`/`0x08C8` 各是 14 字节 = 7 档，档位数本身存在紧邻的
-/// `0x0896`（`0x0888 + 14`）。以前这里写 10：真读到大于 8 的档位数时，第 8/9
-/// 档的"DPI"会取自档位数与当前档位这两个寄存器，`Cmd::Dpi` 还会反过来把 DPI
-/// 写进它们。设备现在是 7 档，但这条约束必须是结构性的。
-const MAX_STAGES: u8 = 7;
+impl RapooLayout {
+    pub fn supports(&self, vid: u16, pid: u16) -> bool {
+        self.supported_ids.contains(&(vid, pid))
+    }
+}
+
+/// VT1 Pro 的布局。2026-11-09 在有线（`24AE:4414`）和接收器（`24AE:1214`）
+/// 两种接法下实测，两者寄存器布局一致，见 `docs/protocol.md`。
+pub const VT1_PRO: RapooLayout = RapooLayout {
+    model: "VT1 Pro",
+    supported_ids: &[(0x24AE, 0x1214), (0x24AE, 0x4414)],
+    poll_addr: 0x0880,
+    lod_addr: 0x0884,
+    dpi_x_addr: 0x0888,
+    dpi_y_addr: 0x08C8,
+    active_stage_addr: 0x0898,
+    debounce_addr: 0x08C0,
+    flags_offset: 3,
+    stage_count_at: 14,
+    active_stage_at: 16,
+    dpi_read_len: 24,
+    max_stages: 7,
+    battery_link_flags: &[1, 2],
+    debounce_press_at: 0,
+    debounce_release_at: 1,
+    sleep_at: 2,
+    line_flag: 0x01,
+    wave_flag: 0x02,
+    caps: Caps::MOUSE_FULL,
+};
 
 /// `0x0896` 的原始值（档位数 − 1）→ 实际档位数。
 ///
+/// `max` 是该型号 DPI 表的容量：`0x0888`/`0x08C8` 各 14 字节 = 7 档，档位数
+/// 本身存在紧邻的 `0x0896`。以前这里写死 10：真读到大于 8 的档位数时，第 8/9
+/// 档的"DPI"会取自档位数与当前档位这两个寄存器，`Cmd::Dpi` 还会反过来把 DPI
+/// 写进它们。设备现在是 7 档，但这条约束必须是结构性的。
+///
 /// 用 `saturating_add`：坏帧里这个字节是 0xFF 时，`+ 1` 在 debug 下会 panic，
 /// 直接把采集线程打死（虽然能被自愈逻辑重建，但没必要）。
-fn stages_from_raw(raw: u8) -> u8 {
-    raw.saturating_add(1).min(MAX_STAGES)
+fn stages_from_raw(raw: u8, max: u8) -> u8 {
+    raw.saturating_add(1).min(max)
 }
 
 /// `0xAA` 应答 `[2]` 是百分比；不是百分比的字节一律当成"这一轮没有读数"。
@@ -54,14 +119,14 @@ fn battery_percent(raw: u8) -> Option<u8> {
     (raw <= 100).then_some(raw)
 }
 
-/// 一条应答算不算有效的电量读数：`[1]` 必须是已知的连接 flag（2.4G = 1、
-/// 插线 = 2），`[2]` 必须是百分比。
+/// 一条应答算不算有效的电量读数：`[1]` 必须是该型号已知的连接 flag，
+/// `[2]` 必须是百分比。
 ///
 /// 只校验 `[2]` 挡不住旧应答回放：提交应答 `01 7d 00…` 的 `[2]` 是 0，
-/// 被当电量就是 0%；`[2] ≤ 100` 的读应答回放同样会放行。flag 不是 1/2
-/// 的帧一律不算电量。
-fn battery_reply(resp: &[u8; 32]) -> Option<u8> {
-    if !matches!(resp[1], 1 | 2) {
+/// 被当电量就是 0%；`[2] ≤ 100` 的读应答回放同样会放行。flag 不在型号
+/// 白名单里的帧一律不算电量。
+fn battery_reply(resp: &[u8; 32], layout: &RapooLayout) -> Option<u8> {
+    if !layout.battery_link_flags.contains(&resp[1]) {
         return None;
     }
     battery_percent(resp[2])
@@ -142,6 +207,7 @@ fn aligned_blocks(addr: u32, len: usize) -> impl Iterator<Item = (u32, usize, us
 
 pub struct Rapoo {
     handle: HANDLE,
+    layout: &'static RapooLayout,
     /// Last response the device handed us; its repeat is what a stale read
     /// returns after a command the device swallowed.
     last: Cell<[u8; 32]>,
@@ -154,7 +220,11 @@ pub struct Rapoo {
 }
 
 impl Rapoo {
-    pub fn open(path: &[u16], limits: Limits) -> Result<Rapoo, String> {
+    pub fn open(
+        path: &[u16],
+        layout: &'static RapooLayout,
+        limits: Limits,
+    ) -> Result<Rapoo, String> {
         let mut path = path.to_vec();
         if path.last() != Some(&0) {
             path.push(0);
@@ -175,8 +245,26 @@ impl Rapoo {
                     std::io::Error::last_os_error()
                 ));
             }
+            // 布局是按型号验证的。VID/PID 不在白名单里就拒绝打开，避免把
+            // VT1 Pro 的地址写到另一款鼠标的 EEPROM 上。这只能挡住"未验证的
+            // PID 复用了 VT1 布局"；同一个接收器换鼠标时协议还没有可靠的
+            // 型号名可查（0xB0 接收器信息未细究），那一层仍要靠真机确认。
+            let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
+            attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
+            if HidD_GetAttributes(h, &mut attr) == 0 {
+                CloseHandle(h);
+                return Err("读取设备标识失败".into());
+            }
+            if !layout.supports(attr.VendorID, attr.ProductID) {
+                CloseHandle(h);
+                return Err(format!(
+                    "{} 的寄存器布局未覆盖该设备（{:04X}:{:04X}）",
+                    layout.model, attr.VendorID, attr.ProductID
+                ));
+            }
             Ok(Rapoo {
                 handle: h,
+                layout,
                 last: Cell::new([0u8; 32]),
                 last_read: Cell::new(None),
                 bad_battery: Cell::new(None),
@@ -289,11 +377,11 @@ impl Rapoo {
     fn battery_level(&self) -> Result<Option<u8>, String> {
         let f = battery_frame();
         let mut r = self.xfer(&f)?;
-        if battery_reply(&r).is_none() {
+        if battery_reply(&r, self.layout).is_none() {
             sleep(Duration::from_millis(200));
             r = self.xfer(&f)?;
         }
-        match battery_reply(&r) {
+        match battery_reply(&r, self.layout) {
             Some(p) => {
                 self.bad_battery.set(None);
                 Ok(Some(p))
@@ -317,13 +405,15 @@ impl Rapoo {
     }
 
     fn set_flag(&self, bit: u8, disabled: bool) -> Result<(), String> {
-        let mut b = self.read(A_FLAGS - 3, 4)?;
+        let addr = self.layout.debounce_addr;
+        let idx = self.layout.flags_offset;
+        let mut b = self.read(addr, 4)?;
         if disabled {
-            b[3] |= bit;
+            b[idx] |= bit;
         } else {
-            b[3] &= !bit;
+            b[idx] &= !bit;
         }
-        self.write_commit(A_FLAGS - 3, &b)
+        self.write_commit(addr, &b)
     }
 
     /// One re-read per changed block after a burst, never a full snapshot:
@@ -331,32 +421,33 @@ impl Rapoo {
     fn patch(&self, change: Change, s: &mut Snapshot) -> Result<(), String> {
         match change {
             Change::Poll => {
-                let b = self.read(A_POLL, 4)?;
+                let b = self.read(self.layout.poll_addr, 4)?;
                 s.polling_ms = b[0];
             }
             Change::Lm => {
-                let b = self.read(A_LOD, 4)?;
+                let b = self.read(self.layout.lod_addr, 4)?;
                 s.lod = b[0];
                 s.motion = b[1] != 0;
             }
             Change::Deb => {
                 // 与 snapshot 一样读 4 字节：同一地址的读取长度必须固定，
                 // 否则内容不变的合法应答会被判成过期（见 `is_fresh`）。
-                let b = self.read(A_DEB_PRESS, 4)?;
-                s.debounce_press = b[0];
-                s.debounce_release = b[1];
-                s.sleep_min = b[2];
-                s.line_corr = b[3] & 0x01 == 0;
-                s.wave_corr = b[3] & 0x02 == 0;
+                let b = self.read(self.layout.debounce_addr, 4)?;
+                s.debounce_press = b[self.layout.debounce_press_at];
+                s.debounce_release = b[self.layout.debounce_release_at];
+                s.sleep_min = b[self.layout.sleep_at];
+                let flags = b[self.layout.flags_offset];
+                s.line_corr = flags & self.layout.line_flag == 0;
+                s.wave_corr = flags & self.layout.wave_flag == 0;
             }
             Change::Active => {
-                let b = self.read(A_STAGE_ACTIVE, 4)?;
+                let b = self.read(self.layout.active_stage_addr, 4)?;
                 s.stage_active = b[0].min(s.stage_count.saturating_sub(1));
             }
             Change::Dpi(i) => {
                 // 读整块而不是 2 字节：`write_field` 的读-改-写也读这个块，
                 // 同址同长（4）重复读取才能被 `is_fresh` 当成合法应答。
-                let addr = A_DPI_X + i as u32 * 2;
+                let addr = self.layout.dpi_x_addr + i as u32 * 2;
                 let block = addr & !3;
                 let off = (addr - block) as usize;
                 let b = self.read(block, 4)?;
@@ -393,13 +484,13 @@ enum Change {
 
 impl Driver for Rapoo {
     fn snapshot(&mut self) -> Result<Snapshot, String> {
-        let p = self.read(A_POLL, 4)?;
-        let lm = self.read(A_LOD, 4)?;
-        let d = self.read(A_DEB_PRESS, 4)?;
-        let x = self.read(A_DPI_X, 24)?;
-        let y = self.read(A_DPI_Y, 24)?;
+        let p = self.read(self.layout.poll_addr, 4)?;
+        let lm = self.read(self.layout.lod_addr, 4)?;
+        let d = self.read(self.layout.debounce_addr, 4)?;
+        let x = self.read(self.layout.dpi_x_addr, self.layout.dpi_read_len)?;
+        let y = self.read(self.layout.dpi_y_addr, self.layout.dpi_read_len)?;
 
-        let stage_count = stages_from_raw(x[14]);
+        let stage_count = stages_from_raw(x[self.layout.stage_count_at], self.layout.max_stages);
         let mut dpi = Vec::with_capacity(stage_count as usize);
         for i in 0..stage_count as usize {
             dpi.push(u16::from_le_bytes([x[i * 2], x[i * 2 + 1]]));
@@ -416,79 +507,90 @@ impl Driver for Rapoo {
 
         Ok(Snapshot {
             model: String::new(),
-            caps: Caps::MOUSE_FULL,
+            caps: self.layout.caps,
             polling_ms: p[0],
             lod: lm[0],
             motion: lm[1] != 0,
             stage_count,
-            stage_active: x[16].min(stage_count.saturating_sub(1)),
+            stage_active: x[self.layout.active_stage_at].min(stage_count.saturating_sub(1)),
             dpi,
             dpi_min: self.limits.dpi.0,
             dpi_max: self.limits.dpi.1,
-            debounce_press: d[0],
-            debounce_release: d[1],
-            sleep_min: d[2],
-            line_corr: d[3] & 0x01 == 0,
-            wave_corr: d[3] & 0x02 == 0,
+            debounce_press: d[self.layout.debounce_press_at],
+            debounce_release: d[self.layout.debounce_release_at],
+            sleep_min: d[self.layout.sleep_at],
+            line_corr: d[self.layout.flags_offset] & self.layout.line_flag == 0,
+            wave_corr: d[self.layout.flags_offset] & self.layout.wave_flag == 0,
         })
     }
 
     fn battery(&mut self) -> Result<Option<u8>, String> {
+        if !self.layout.caps.battery {
+            return Ok(None);
+        }
         self.battery_level()
     }
 
     fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<(), String> {
+        if !self.layout.caps.supports(cmd) {
+            return Err("该设备不支持这个设置".into());
+        }
         let change = match cmd {
             Cmd::Refresh => return Ok(()),
             Cmd::Polling(ms) => {
                 if !self.limits.polling.contains(&ms) {
                     return Err(format!("不支持的回报率档位：{ms} ms"));
                 }
-                let mut b = self.read(A_POLL, 4)?;
+                let mut b = self.read(self.layout.poll_addr, 4)?;
                 b[0] = ms;
-                self.write_commit(A_POLL, &b)?;
+                self.write_commit(self.layout.poll_addr, &b)?;
                 Change::Poll
             }
             Cmd::Motion(on) => {
-                let mut b = self.read(A_LOD, 4)?;
+                let mut b = self.read(self.layout.lod_addr, 4)?;
                 b[1] = on as u8;
-                self.write_commit(A_LOD, &b)?;
+                self.write_commit(self.layout.lod_addr, &b)?;
                 Change::Lm
             }
             Cmd::Lod(v) => {
                 let v = v.clamp(self.limits.lod.0, self.limits.lod.1);
-                let mut b = self.read(A_LOD, 4)?;
+                let mut b = self.read(self.layout.lod_addr, 4)?;
                 b[0] = v;
-                self.write_commit(A_LOD, &b)?;
+                self.write_commit(self.layout.lod_addr, &b)?;
                 Change::Lm
             }
             Cmd::Line(on) => {
-                self.set_flag(0x01, !on)?;
+                self.set_flag(self.layout.line_flag, !on)?;
                 Change::Deb
             }
             Cmd::Wave(on) => {
-                self.set_flag(0x02, !on)?;
+                self.set_flag(self.layout.wave_flag, !on)?;
                 Change::Deb
             }
             Cmd::Debounce(v, press) => {
                 let v = v.clamp(self.limits.debounce.0, self.limits.debounce.1);
-                let mut b = self.read(A_DEB_PRESS, 4)?;
-                b[if press { 0 } else { 1 }] = v;
-                self.write_commit(A_DEB_PRESS, &b)?;
+                let idx = if press {
+                    self.layout.debounce_press_at
+                } else {
+                    self.layout.debounce_release_at
+                };
+                let mut b = self.read(self.layout.debounce_addr, 4)?;
+                b[idx] = v;
+                self.write_commit(self.layout.debounce_addr, &b)?;
                 Change::Deb
             }
             Cmd::Sleep(m) => {
                 let m = m.clamp(self.limits.sleep.0, self.limits.sleep.1);
-                let mut b = self.read(A_DEB_PRESS, 4)?;
-                b[2] = m;
-                self.write_commit(A_DEB_PRESS, &b)?;
+                let mut b = self.read(self.layout.debounce_addr, 4)?;
+                b[self.layout.sleep_at] = m;
+                self.write_commit(self.layout.debounce_addr, &b)?;
                 Change::Deb
             }
             Cmd::Activate(i) => {
                 let i = i.min(snap.stage_count.saturating_sub(1));
-                let mut b = self.read(A_STAGE_ACTIVE, 4)?;
+                let mut b = self.read(self.layout.active_stage_addr, 4)?;
                 b[0] = i;
-                self.write_commit(A_STAGE_ACTIVE, &b)?;
+                self.write_commit(self.layout.active_stage_addr, &b)?;
                 Change::Active
             }
             Cmd::Dpi(stage, value) => {
@@ -496,14 +598,14 @@ impl Driver for Rapoo {
                 // index would read-modify-write unrelated cells. Reject it
                 // here at the protocol boundary rather than trusting the
                 // caller to pass a stage the device actually has.
-                let count = snap.stage_count.clamp(1, MAX_STAGES) as u32;
+                let count = snap.stage_count.clamp(1, self.layout.max_stages) as u32;
                 if stage as u32 >= count {
                     return Err(format!("dpi stage {stage} out of range (0..{count})"));
                 }
                 let value = value.clamp(self.limits.dpi.0, self.limits.dpi.1);
                 let bytes = value.to_le_bytes();
-                self.write_field(A_DPI_X + stage as u32 * 2, &bytes)?;
-                self.write_field(A_DPI_Y + stage as u32 * 2, &bytes)?;
+                self.write_field(self.layout.dpi_x_addr + stage as u32 * 2, &bytes)?;
+                self.write_field(self.layout.dpi_y_addr + stage as u32 * 2, &bytes)?;
                 self.commit()?;
                 Change::Dpi(stage)
             }
@@ -524,15 +626,41 @@ impl Driver for Rapoo {
 mod tests {
     use super::*;
 
-    /// 7 档是协议上限（DPI X/Y 各 14 字节）。再大就意味着"档位数"那个字节
-    /// 其实是第 8 档的 DPI 低字节，读会读错、写会写坏别的寄存器。
+    /// 7 档是 VT1 Pro 的协议上限（DPI X/Y 各 14 字节）。再大就意味着
+    /// "档位数"那个字节其实是第 8 档的 DPI 低字节，读会读错、写会写坏
+    /// 别的寄存器；上限来自 layout，而不是驱动里的常量。
     #[test]
     fn stage_count_never_exceeds_the_dpi_table() {
-        assert_eq!(stages_from_raw(0), 1);
-        assert_eq!(stages_from_raw(6), 7);
-        assert_eq!(stages_from_raw(7), 7);
+        let max = VT1_PRO.max_stages;
+        assert_eq!(stages_from_raw(0, max), 1);
+        assert_eq!(stages_from_raw(6, max), 7);
+        assert_eq!(stages_from_raw(7, max), 7);
         // 坏帧：debug 下也不能 panic。
-        assert_eq!(stages_from_raw(0xFF), 7);
+        assert_eq!(stages_from_raw(0xFF, max), 7);
+    }
+
+    /// 布局里的地址/偏移必须自洽：索引越界会让采集线程 panic，地址错位会
+    /// 把无关的 EEPROM 单元当成 DPI/防抖写入。新增型号时先让这条测试通过。
+    #[test]
+    fn vt1_layout_is_internally_consistent() {
+        let l = &VT1_PRO;
+        assert_eq!(l.model, "VT1 Pro");
+        assert!(l.supports(0x24AE, 0x1214));
+        assert!(l.supports(0x24AE, 0x4414));
+        assert!(
+            !l.supports(0x24AE, 0x1230),
+            "未验证的 PID 不能复用 VT1 布局"
+        );
+
+        assert!(l.stage_count_at < l.dpi_read_len);
+        assert!(l.active_stage_at < l.dpi_read_len);
+        assert!(l.max_stages >= 1);
+        assert!((l.max_stages as usize) * 2 <= l.dpi_read_len);
+        assert!(l.flags_offset < 4);
+        assert!(l.debounce_press_at < 4);
+        assert!(l.debounce_release_at < 4);
+        assert!(l.sleep_at < 4);
+        assert_eq!(l.debounce_addr + l.flags_offset as u32, 0x08C3);
     }
 
     /// 开机后第一帧 0xAA 应答的 `[2]` 是 0x7F，界面曾经显示成 127%。
@@ -554,18 +682,18 @@ mod tests {
         r[0] = 1;
         r[1] = 2;
         r[2] = 71;
-        assert_eq!(battery_reply(&r), Some(71));
+        assert_eq!(battery_reply(&r, &VT1_PRO), Some(71));
         r[1] = 1;
         r[2] = 0;
-        assert_eq!(battery_reply(&r), Some(0));
+        assert_eq!(battery_reply(&r, &VT1_PRO), Some(0));
         // 提交应答 01 7d 00… 被回放。
         r[1] = 0x7d;
         r[2] = 0;
-        assert_eq!(battery_reply(&r), None);
+        assert_eq!(battery_reply(&r, &VT1_PRO), None);
         // flag 对但百分比超范围。
         r[1] = 2;
         r[2] = 0x7F;
-        assert_eq!(battery_reply(&r), None);
+        assert_eq!(battery_reply(&r, &VT1_PRO), None);
     }
 
     /// 帧头是协议契约：`BA A5 op`，地址小端写在 `[4..8]`，长度写在 `[3]`。

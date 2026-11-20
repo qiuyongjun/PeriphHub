@@ -88,7 +88,7 @@ PERIPHHUB_DEMO=1 cargo run
 cargo build --release
 ```
 
-产物：`target\release\PeriphHub.exe`（单文件，无安装包，拷到别的机器即可双击；依赖系统 VC++ 运行库，
+产物：`target\release\PeriphHub.exe`（单文件 GUI，拷到别的机器即可双击；依赖系统 VC++ 运行库，
 极老的系统若提示缺 `VCRUNTIME140.dll`，装一次微软 VC++ 运行库即可）。
 
 - 生成的是 **无控制台窗口** 的 GUI 程序。
@@ -97,7 +97,7 @@ cargo build --release
 - `Cargo.toml` 里 release 配置为 `opt-level = "s"` + `lto = true` + `codegen-units = 1`，
   体积小但**编译慢**（本机实测冷编译约 2 分 50 秒，产物约 11 MB），改代码后频繁调试建议先用 `cargo build`。
 
-正式发布走便携 zip：
+正式发布生成便携 zip；本机装有 Inno Setup 6.5+ 时额外生成安装包：
 
 ```powershell
 pwsh scripts/package.ps1              # 构建并打包到 dist\
@@ -105,7 +105,9 @@ pwsh scripts/package.ps1 -SkipBuild  # 复用已有的 release 构建
 ```
 
 `dist\` 下会生成 `PeriphHub-v<版本>-win-x64.zip`（exe、README、LICENSE、本文件）和
-`SHA256SUMS.txt`。推送 `v*` tag 后，`.github/workflows/release.yml` 会在 Windows runner 上
+`SHA256SUMS.txt`；检测到 Inno Setup 6.5+（`ISCC.exe`）时还会生成
+`PeriphHub-v<版本>-win-x64-setup.exe` 并一并计入校验和，否则只出便携版。
+推送 `v*` tag 后，`.github/workflows/release.yml` 会在 Windows runner 上
 运行 `cargo test`、执行同一个打包脚本，并自动创建 GitHub Release 附加 zip 和校验和。
 **tag 必须与 `Cargo.toml` 的 `version` 一致**（如 `v0.2.0` ↔ `0.2.0`），否则工作流直接失败。
 
@@ -218,13 +220,21 @@ cargo test
 | RK98（含 2.4G 接收器） | `25A7:FA70` | 只读：能识别设备，但连电量都读不到 |
 | 键盘插线时的控制器 | `258A:010C` | 只读：F87/RK98 用线连接后都以 BY Tech 这个通用控制器出现，设备自报的名字只有 `Gaming Keyboard`，认不出具体型号；只有 feature 报表、没有应答通道，协议未破解（见 `docs/aula-f87.md` §9） |
 
+表外的外部 HID 设备现在也会出现在列表里，但只有只读卡片：没有驱动、不会打开厂商命令通道，
+卡片和配置页会标注"未适配"。连接方式只在产品串明确写了接收器 / 无线时才标 2.4G，否则显示"未知"。
+`ROOT\` / `VHF\` / `ACPI\` / `SWD\` 树下的内置触摸板、虚拟 HID 等系统设备会被过滤，不占工作台位置。
+
+配置页目前只覆盖鼠标域：DPI、回报率、传感器参数、系统指针。键盘只读，不提供灯效/按键映射；
+新增键盘配置需要单独的设置模型，不要复用 `Snapshot` / `Cmd` 这套鼠标字段。
+
 插线不是"同一个设备换条线"这么简单：鼠标在有线模式下换成另一个 PID（`0x4414`），
 键盘换成 BY Tech 的通用控制器（`258A:010C`）。设备表里用 `DeviceProfile::wired` 区分这两种形态，
-`hid::classify_connection` 按表判定连接方式——只看实例路径的话，接收器和插线设备都是 `USB\` 开头，
-分不出来。
+`hid::classify_connection` 先按表判定连接方式；表外设备按产品串里的接收器 / 无线关键词推断，
+没有证据就标"未知"——只看实例路径的话，接收器和插线设备都是 `USB\` 开头，分不出来。
 
 两套协议分别放在 `src/driver/` 下：`rapoo.rs`（32 字节 `0xBA` 帧，EEPROM 读写）、
-`hidpp.rs`（罗技 HID++ 2.0，20 字节 `0x11` 帧）。只读设备没有驱动，只在 `driver::PROFILES` 总表里登记（`driver` 字段为 `None`）。
+`hidpp.rs`（罗技 HID++ 2.0，20 字节 `0x11` 帧）。`PROFILES` 里登记的是已验证型号（含只读型号）；
+表外设备没有驱动，作为未适配设备只读列出。
 
 为什么后两台只读：
 
@@ -334,7 +344,7 @@ DPI `+100 → 还原` 往返。正常不会留下持久改动；还原失败会�
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | 拔掉键盘后卡片还在、还写着"有线" | 旧版本只在启动和手动重扫时枚举设备；只读设备没有采集线程，拔线不会有任何东西发现它消失 | 现在已改为监听插拔通知，0.5 秒内自动下架；若仍复现，按 `F5` 并看日志里有没有"订阅设备插拔通知失败" |
-| 首页空白，一台设备都没有 | 接收器没插好 / 设备在蓝牙或关机状态 / 设备不在 `driver::SUPPORTED` 总表里且没有 `0xFF00:0x0E` 通道 | 确认 2.4G 接收器在位、设备已开机；点"重新扫描"；用 `cargo run --example probe` 看系统到底枚举到了什么 |
+| 首页空白，一台设备都没有 | 系统没有枚举到任何 HID 接口；接收器没插好、设备在蓝牙或关机状态 | 确认 2.4G 接收器在位、设备已开机；点"重新扫描"；用 `cargo run --example probe` 看系统到底枚举到了什么。表外型号不会导致首页空白，它们会以只读卡片出现 |
 | 卡片一直"正在连接"，随后变"设备离线" | 设备休眠、被厂商驱动独占、或应答超时 | 动一下鼠标/敲一下键盘唤醒；关掉官方驱动和同类面板；变为设备离线后点"查看离线原因"检查详情 |
 | 改了参数过几秒又弹回原值 | 读到的是上一条应答（设备被吞命令时会重复回旧数据） | 先确认没有别的程序在轮询同一设备；正常情况下面板已做了"应答去重 + 40 ms 稳定期 + 15 ms 命令间隔 + 超时重发"，若仍复现，用 `f87_battery`/`probe` 观察真机应答 |
 | 提示"打开设备失败（… os error 32）" | 设备被其它程序以独占方式打开（共享模式冲突） | 退出官方驱动 / 其它外设工具后重新扫描 |

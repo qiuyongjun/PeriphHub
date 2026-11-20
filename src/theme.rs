@@ -35,53 +35,56 @@ pub struct Palette {
     pub close_hover: Color32,
 }
 
-/// 冷调中性色让深色界面更有层次，浅色辅助文字保持足够对比度；冰蓝只用于可操作处。
+/// 瓷白工作室：暖中性瓷白 / 墨青灰底，深青只用于可操作处；层次交给表面色差与
+/// 柔投影，而不是描边。浅色是这套材质的主场，深色保持同一族色相。
 pub const DARK: Palette = Palette {
     dark: true,
-    bg: Color32::from_rgb(12, 14, 18),
-    card: Color32::from_rgb(20, 23, 29),
-    card_top: Color32::from_rgb(20, 23, 29),
-    card_hover: Color32::from_rgb(26, 30, 38),
-    inset: Color32::from_rgb(16, 18, 23),
-    track: Color32::from_rgb(48, 53, 63),
-    text: Color32::from_rgb(241, 244, 248),
-    dim: Color32::from_rgb(158, 166, 179),
-    subtle: Color32::from_rgb(137, 146, 160),
-    accent: Color32::from_rgb(129, 167, 255),
-    accent_hover: Color32::from_rgb(174, 199, 255),
-    on_accent: Color32::from_rgb(11, 18, 32),
-    border: Color32::from_rgb(45, 50, 60),
-    chip_bg: Color32::from_rgb(27, 31, 39),
-    titlebar: Color32::from_rgb(15, 17, 22),
-    ok: Color32::from_rgb(119, 190, 155),
-    warn: Color32::from_rgb(218, 181, 108),
-    danger: Color32::from_rgb(220, 137, 145),
-    info: Color32::from_rgb(154, 173, 214),
+    bg: Color32::from_rgb(20, 22, 21),
+    card: Color32::from_rgb(28, 31, 30),
+    card_top: Color32::from_rgb(28, 31, 30),
+    card_hover: Color32::from_rgb(35, 39, 38),
+    inset: Color32::from_rgb(16, 18, 17),
+    track: Color32::from_rgb(51, 58, 56),
+    text: Color32::from_rgb(237, 238, 236),
+    dim: Color32::from_rgb(157, 163, 161),
+    subtle: Color32::from_rgb(118, 124, 122),
+    accent: Color32::from_rgb(79, 194, 174),
+    accent_hover: Color32::from_rgb(122, 220, 203),
+    on_accent: Color32::from_rgb(8, 32, 28),
+    border: Color32::from_rgb(46, 51, 50),
+    chip_bg: Color32::from_rgb(35, 39, 38),
+    titlebar: Color32::from_rgb(25, 28, 27),
+    ok: Color32::from_rgb(111, 191, 135),
+    warn: Color32::from_rgb(214, 176, 84),
+    danger: Color32::from_rgb(224, 122, 114),
+    info: Color32::from_rgb(143, 176, 201),
     close_hover: Color32::from_rgb(180, 70, 80),
 };
 
 pub const LIGHT: Palette = Palette {
     dark: false,
-    bg: Color32::from_rgb(246, 248, 251),
+    bg: Color32::from_rgb(246, 245, 242),
     card: Color32::from_rgb(255, 255, 255),
     card_top: Color32::from_rgb(255, 255, 255),
-    card_hover: Color32::from_rgb(248, 250, 253),
-    inset: Color32::from_rgb(242, 245, 249),
-    track: Color32::from_rgb(218, 224, 232),
-    text: Color32::from_rgb(25, 32, 44),
-    dim: Color32::from_rgb(93, 104, 120),
-    subtle: Color32::from_rgb(95, 105, 120),
-    accent: Color32::from_rgb(55, 102, 235),
-    accent_hover: Color32::from_rgb(39, 82, 201),
+    card_hover: Color32::from_rgb(251, 250, 248),
+    inset: Color32::from_rgb(236, 234, 228),
+    track: Color32::from_rgb(224, 221, 213),
+    text: Color32::from_rgb(28, 30, 29),
+    dim: Color32::from_rgb(106, 106, 102),
+    // 11px 的品牌行、标题栏副标题和页脚都吃这一档。原来的 145 在瓷白底上
+    // 只有约 2.9:1，放大镜下像没对齐的灰雾；压到 129 后仍有层级差，又能读清。
+    subtle: Color32::from_rgb(129, 128, 122),
+    accent: Color32::from_rgb(14, 110, 98),
+    accent_hover: Color32::from_rgb(10, 87, 78),
     on_accent: Color32::from_rgb(255, 255, 255),
-    border: Color32::from_rgb(226, 231, 238),
-    chip_bg: Color32::from_rgb(242, 245, 249),
-    titlebar: Color32::from_rgb(250, 252, 254),
-    ok: Color32::from_rgb(31, 118, 82),
-    warn: Color32::from_rgb(134, 95, 23),
-    danger: Color32::from_rgb(176, 65, 77),
-    info: Color32::from_rgb(85, 105, 153),
-    close_hover: Color32::from_rgb(214, 75, 87),
+    border: Color32::from_rgb(227, 224, 216),
+    chip_bg: Color32::from_rgb(241, 239, 234),
+    titlebar: Color32::from_rgb(252, 251, 249),
+    ok: Color32::from_rgb(44, 122, 75),
+    warn: Color32::from_rgb(154, 107, 16),
+    danger: Color32::from_rgb(178, 58, 52),
+    info: Color32::from_rgb(63, 98, 133),
+    close_hover: Color32::from_rgb(192, 69, 63),
 };
 
 /// Same colour with a different alpha, for washes and tinted surfaces.
@@ -102,14 +105,14 @@ pub fn palette(mode: ThemeMode) -> &'static Palette {
 /// 明确职责——新增字号前先问它属于哪一档，别再插 12.5。
 pub mod text {
     /// 页面主标题
-    pub const TITLE: f32 = 24.0;
+    pub const TITLE: f32 = 30.0;
     /// 页内标题、统计数字
-    pub const HEADING: f32 = 20.0;
+    pub const HEADING: f32 = 22.0;
     /// 设备名、卡片主标题
-    pub const SUBTITLE: f32 = 16.0;
+    pub const SUBTITLE: f32 = 17.0;
     /// 卡片内的指标数值（DPI / 回报率 / 电量）：比标题小一档，比正文大，
     /// 固定值——不按列宽自适应，否则并排三个数字会是三种字号。
-    pub const METRIC: f32 = 18.0;
+    pub const METRIC: f32 = 22.0;
     /// 正文、控件标签
     pub const BODY: f32 = 13.0;
     /// 次要说明、辅助句子
@@ -122,10 +125,12 @@ pub mod text {
 /// 6/7/8/9 之间各写各的，同一行里"加号按钮"和旁边的档位标签圆角不一样，
 /// 放大看就是一排毛边。
 pub mod ctl {
-    /// 标准控件圆角（标签、按钮、图标按钮）
-    pub const RADIUS: u8 = 8;
+    /// 标准控件圆角（按钮、输入框、图标按钮）
+    pub const RADIUS: u8 = 10;
     /// 小控件圆角（步进按钮、行内小标签）
-    pub const RADIUS_SM: u8 = 7;
+    pub const RADIUS_SM: u8 = 8;
+    /// 胶囊圆角（档位、连接标签、计数 pill）：取控件高度的一半
+    pub const PILL: u8 = 16;
     /// 标准控件高度
     pub const H: f32 = 32.0;
     /// 次要小控件高度
@@ -192,6 +197,23 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(FontFamily::Name("display".into()), display);
+    // 数值字面：Segoe UI Light 的真实细字面。瓷白材质的大数字靠字号与字重
+    // 对比取胜，不靠加粗；缺字面时回退展示字族，不会掉回默认常规体。
+    let mut numeral = fonts
+        .families
+        .get(&FontFamily::Name("display".into()))
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(bytes) = std::fs::read(dir.join("segoeuil.ttf")) {
+        fonts.font_data.insert(
+            "numeral-latin".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        numeral.insert(0, "numeral-latin".to_owned());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name("numeral".into()), numeral);
     ctx.set_fonts(fonts);
 }
 
@@ -205,9 +227,13 @@ pub fn heading(text: impl Into<String>, size: f32, color: Color32) -> RichText {
     RichText::new(text).font(heading_font(size)).color(color)
 }
 
-/// 正文：控件标签、可读句子。语义入口，避免调用方散落裸字号。
-pub fn body(text: impl Into<String>, color: Color32) -> RichText {
-    RichText::new(text).size(text::BODY).color(color)
+/// 大数字（指标、概览计数、电量环）：真实细字面 + 调用方给的语义色。
+pub fn numeral_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("numeral".into()))
+}
+
+pub fn numeral(text: impl Into<String>, size: f32, color: Color32) -> RichText {
+    RichText::new(text).font(numeral_font(size)).color(color)
 }
 
 /// 次要说明：跟随在标题下方或卡片脚注里的解释性文字。
@@ -248,13 +274,13 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     });
 }
 
-/// 卡片以细描边为主、柔和投影为辅，悬浮层级清晰但不显得厚重。
+/// 卡片去掉描边后靠这层柔投影浮起：大而淡，光来自上方，不显厚重。
 pub fn card_shadow(p: &Palette) -> egui::Shadow {
     egui::Shadow {
-        offset: [0, 3],
-        blur: 10,
+        offset: [0, 6],
+        blur: 22,
         spread: 0,
-        color: Color32::from_black_alpha(if p.dark { 30 } else { 12 }),
+        color: Color32::from_black_alpha(if p.dark { 70 } else { 14 }),
     }
 }
 
@@ -276,19 +302,19 @@ fn visuals(p: &Palette) -> egui::Visuals {
     v.widgets.inactive.weak_bg_fill = p.chip_bg;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);
-    v.widgets.inactive.corner_radius = CornerRadius::same(8);
+    v.widgets.inactive.corner_radius = CornerRadius::same(ctl::RADIUS);
     v.widgets.hovered.bg_fill = p.card_hover;
     v.widgets.hovered.weak_bg_fill = p.card_hover;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, alpha(p.accent, 130));
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
-    v.widgets.hovered.corner_radius = CornerRadius::same(8);
+    v.widgets.hovered.corner_radius = CornerRadius::same(ctl::RADIUS);
     v.widgets.active.bg_fill = p.track;
     v.widgets.active.weak_bg_fill = p.track;
     v.widgets.active.bg_stroke = Stroke::new(1.0, alpha(p.accent, 190));
     v.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
-    v.widgets.active.corner_radius = CornerRadius::same(8);
-    v.menu_corner_radius = CornerRadius::same(10);
-    v.window_corner_radius = CornerRadius::same(12);
+    v.widgets.active.corner_radius = CornerRadius::same(ctl::RADIUS);
+    v.menu_corner_radius = CornerRadius::same(12);
+    v.window_corner_radius = CornerRadius::same(16);
     v.window_stroke = Stroke::new(1.0, p.border);
     v.popup_shadow = egui::Shadow {
         offset: [0, 4],

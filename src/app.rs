@@ -38,6 +38,11 @@ const MAIN_MAX: f32 = 16384.0;
 /// Gap between the widget and the screen edge when it first appears.
 const MINI_MARGIN: f32 = 24.0;
 
+/// 设置弹层的内容宽度、内边距，以及顶端位置（让开标题栏）。
+const SETTINGS_W: f32 = 380.0;
+const SETTINGS_PAD: i8 = 22;
+const SETTINGS_TOP: f32 = mini::SHADOW_PAD + chrome::BAR_H + 8.0;
+
 /// What the main window is showing. Configuration used to open a second
 /// viewport; keeping it as a route means one window, one titlebar, and a back
 /// path that is always on screen.
@@ -299,7 +304,8 @@ impl Panel {
     }
 
     fn mini_height(&self) -> f32 {
-        mini::height(self.manager.list().len())
+        // 浮窗只列在线设备，高度跟着在线数量走，而不是设备总数。
+        mini::height(mini::online_only(self.manager.list()).len())
     }
 
     /// Where the main window should sit: last time's spot if it is still on
@@ -699,19 +705,25 @@ impl Panel {
         }
         let p = theme::palette(self.cfg.theme);
         let mut close = false;
+        let viewport_h = ctx.input(|i| i.viewport().inner_rect.map_or(720.0, |rect| rect.height()));
+        // 弹层必须一次给出确定高度：egui 的 Window 默认按 420 高起版，里面的
+        // ScrollArea 只在既有高度里滚动，面板就会永远停在 420，下方内容被裁掉
+        // 且滚不到头。这里按"标题栏以下到卡片底边"的空间定高，滚动区填满剩余。
+        let panel_h = (viewport_h - SETTINGS_TOP - mini::SHADOW_PAD - 12.0).clamp(340.0, 620.0);
         egui::Window::new("设置")
             // egui's own title bar paints a grey band that fights the card
             // styling, so the popover gets a hand-drawn header instead.
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
-            .anchor(Align2::RIGHT_TOP, [-20.0, 58.0])
+            .anchor(Align2::RIGHT_TOP, [-(mini::SHADOW_PAD + 8.0), SETTINGS_TOP])
+            .fixed_size(vec2(SETTINGS_W + 2.0 * SETTINGS_PAD as f32, panel_h))
             .frame(
                 egui::Frame::new()
                     .fill(p.card_top)
                     .stroke(Stroke::new(1.0, theme::alpha(p.border, 170)))
                     .corner_radius(CornerRadius::same(CARD_RADIUS))
-                    .inner_margin(Margin::same(22))
+                    .inner_margin(Margin::same(SETTINGS_PAD))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 6],
                         blur: 20,
@@ -720,7 +732,7 @@ impl Panel {
                     }),
             )
             .show(ctx, |ui| {
-                ui.set_width(380.0);
+                ui.set_width(SETTINGS_W);
                 split_row(
                     ui,
                     |ui| {
@@ -731,12 +743,8 @@ impl Panel {
                     |ui| {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(theme::heading("设置", 16.0, p.text));
-                            ui.label(
-                                RichText::new("外观、应用行为与 Windows 指针")
-                                    .size(12.0)
-                                    .color(p.dim),
-                            );
+                            ui.label(theme::heading("设置", theme::text::SUBTITLE, p.text));
+                            ui.label(theme::meta("外观、应用行为与 Windows 指针", p.dim));
                         });
                     },
                 );
@@ -744,18 +752,13 @@ impl Panel {
                 divider(ui, p);
                 ui.add_space(12.0);
 
-                // 标题、关闭按钮与外边距约占 168pt；留出这些固定开销后再滚动，
-                // 避免小窗口下弹层底边被裁或触发生成位置约束抖动。
-                const SETTINGS_CHROME_H: f32 = 168.0;
-                let viewport_h =
-                    ctx.input(|i| i.viewport().inner_rect.map_or(720.0, |rect| rect.height()));
-                let max_h = (viewport_h - SETTINGS_CHROME_H).clamp(280.0, 560.0);
+                // 标题、关闭按钮与外边距由固定尺寸的弹层让出，滚动区直接填满
+                // 剩余高度；auto_shrink 关掉纵向收缩，否则内容不足时会留白。
                 let scanning = self.manager.is_scanning();
                 let device_count = self.manager.list().len();
                 egui::ScrollArea::vertical()
                     .id_salt("settings-scroll")
-                    .max_height(max_h)
-                    .auto_shrink([false, true])
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         section_heading(ui, p, "外观", "选择更适合当前环境的界面主题");
@@ -1222,7 +1225,7 @@ impl Panel {
                                     |ui| {
                                         ui.label(
                                             RichText::new("关闭窗口后收起为桌面浮窗")
-                                                .size(11.0)
+                                                .size(12.0)
                                                 .color(p.subtle),
                                         );
                                     },
@@ -1231,7 +1234,7 @@ impl Panel {
                                             RichText::new(
                                                 "PeriphHub · 2.4G / 蓝牙 / 有线外设统一管理",
                                             )
-                                            .size(11.0)
+                                            .size(12.0)
                                             .color(p.subtle),
                                         );
                                     },

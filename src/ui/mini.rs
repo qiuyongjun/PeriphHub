@@ -13,7 +13,7 @@ use eframe::egui::{
 
 use crate::devices::{DeviceId, DeviceManager, Entry, Link};
 use crate::theme::{alpha, battery_color, battery_level, heading_font, paint_brand, text, Palette};
-use crate::ui::chrome::paint_gear;
+use crate::ui::chrome::{paint_gear, paint_theme};
 use crate::ui::widgets::{
     activated, connection_color, focus_ring, mix, paint_device_glyph, shadow_card, short_model,
     CARD_RADIUS,
@@ -65,16 +65,53 @@ pub fn height(devices: usize) -> f32 {
     HEAD_H + LIST_GAP + rows * ROW_H + 10.0
 }
 
+/// 浮窗是状态窗，不是设备清单：只列当前在线的设备。离线与连接中的设备
+/// 只在主界面出现，那里才有完整的身份、原因与数量概览。
+pub fn is_visible(link: &Link) -> bool {
+    matches!(link, Link::Online)
+}
+
+pub fn online_only(entries: &[Entry]) -> Vec<&Entry> {
+    entries
+        .iter()
+        .filter(|e| is_visible(&e.state.link))
+        .collect()
+}
+
+/// 标题下的状态词：只说状态，不报任何设备数量（数量是主界面的职责）。
+pub fn status_word(online: usize, connecting: usize, total: usize, scanning: bool) -> &'static str {
+    if scanning {
+        "正在扫描…"
+    } else if total == 0 {
+        "无设备"
+    } else if online > 0 {
+        "设备在线"
+    } else if connecting > 0 {
+        "正在连接"
+    } else {
+        "设备离线"
+    }
+}
+
+/// 状态点颜色：扫描/连接中用警示色，在线用成功色，其余退回次级色。
+fn status_color(p: &Palette, online: usize, connecting: usize, scanning: bool) -> Color32 {
+    if scanning || connecting > 0 {
+        p.warn
+    } else if online > 0 {
+        p.ok
+    } else {
+        p.dim
+    }
+}
+
 /// 紧凑浮窗用双行身份和设备图标保持可读性；设置入口不再依赖主界面。
 pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager, pinned: bool) -> MiniAction {
     let mut action = MiniAction::default();
     let window = ui.ctx().content_rect();
     let card = window.shrink(SHADOW_PAD);
     let entries = manager.list();
-    let online = entries
-        .iter()
-        .filter(|e| matches!(e.state.link, Link::Online))
-        .count();
+    let visible = online_only(entries);
+    let online = visible.len();
     let connecting = entries
         .iter()
         .filter(|e| matches!(e.state.link, Link::Connecting))
@@ -99,14 +136,13 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager, pinned: bool) -> 
         p,
         &mut action,
         pinned,
-        online,
-        connecting,
-        entries.len(),
+        status_word(online, connecting, entries.len(), manager.is_scanning()),
+        status_color(p, online, connecting, manager.is_scanning()),
     );
     body.add_space(LIST_GAP);
 
-    let list_h = entries.len().clamp(1, MAX_ROWS) as f32 * ROW_H;
-    if entries.is_empty() {
+    let list_h = visible.len().clamp(1, MAX_ROWS) as f32 * ROW_H;
+    if visible.is_empty() {
         // 完成/失败反馈只展示最新一次结果；失败会覆盖旧的“已更新”。
         let completed = manager.last_scan_completed();
         let failed = manager.last_scan_failed();
@@ -123,20 +159,21 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager, pinned: bool) -> 
             recently_scanned,
             scan_failed,
             manager.is_scanning(),
+            !entries.is_empty(),
             list_h,
         );
-    } else if entries.len() > MAX_ROWS {
+    } else if visible.len() > MAX_ROWS {
         egui::ScrollArea::vertical()
             .max_height(list_h)
             .auto_shrink([false, false])
             .show(&mut body, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for entry in entries {
+                for entry in visible {
                     row(ui, p, entry, &mut action);
                 }
             });
     } else {
-        for entry in entries {
+        for entry in visible {
             row(&mut body, p, entry, &mut action);
         }
     }
@@ -155,15 +192,14 @@ fn paint_card(ui: &Ui, p: &Palette, card: Rect) {
         .rect_filled(card.shrink(0.5), CornerRadius::same(CARD_RADIUS), p.card);
 }
 
-/// 标题与在线摘要分成两行，避免状态文字覆盖右侧工具按钮。
+/// 标题与状态词分成两行，避免状态文字覆盖右侧工具按钮。
 fn header(
     body: &mut Ui,
     p: &Palette,
     action: &mut MiniAction,
     pinned: bool,
-    online: usize,
-    connecting: usize,
-    total: usize,
+    summary: &str,
+    dot_color: Color32,
 ) {
     let width = body.available_width();
     let (rect, _) = body.allocate_exact_size(Vec2::new(width, HEAD_H), Sense::hover());
@@ -212,21 +248,22 @@ fn header(
     ) {
         action.toggle_pin = true;
     }
-    // Same sun/moon glyph as the titlebar, so the control reads identically on
-    // both surfaces. The crescent knocks itself out with the card colour.
+    // Same contrast glyph as the titlebar, so the control reads identically on
+    // both surfaces and keeps one optical size in either theme.
     let theme_tip = if p.dark {
         "切换到浅色模式"
     } else {
         "切换到深色模式"
     };
-    let (dark, card) = (p.dark, p.card);
     if icon_button(
         body,
         slots[3],
         p,
         "theme",
         theme_tip,
-        move |painter, c, color| paint_theme(painter, c, color, dark, card),
+        |painter, c, color| {
+            paint_theme(painter, Rect::from_center_size(c, Vec2::splat(16.0)), color)
+        },
         false,
     ) {
         action.toggle_theme = true;
@@ -246,7 +283,7 @@ fn header(
         action.open_settings = true;
     }
 
-    // Monogram, name, and the one number that matters.
+    // Monogram, name, and a plain status word — counts belong to the main window.
     let badge = Rect::from_min_size(
         Pos2::new(rect.left() + 2.0, rect.center().y - 13.0),
         Vec2::splat(26.0),
@@ -261,18 +298,6 @@ fn header(
         heading_font(13.0),
         p.text,
     );
-    let (dot_color, summary, summary_color) = if total == 0 {
-        (p.dim, "无设备".to_string(), p.dim)
-    } else {
-        let status = if online > 0 {
-            p.ok
-        } else if connecting > 0 {
-            p.warn
-        } else {
-            p.dim
-        };
-        (status, format!("{online}/{total} 在线"), p.dim)
-    };
     let dot_c = Pos2::new(title_pos.x + 2.6, rect.top() + 33.0);
     painter.circle_filled(dot_c, 2.6, dot_color);
     painter.text(
@@ -280,7 +305,7 @@ fn header(
         Align2::LEFT_CENTER,
         summary,
         FontId::proportional(11.0),
-        summary_color,
+        p.dim,
     );
     painter.line_segment(
         [
@@ -290,11 +315,11 @@ fn header(
         Stroke::new(1.0, p.border),
     );
 
-    // Drag strip: everything left of the buttons. Registered after them so a
-    // click on a button still wins.
+    // 拖拽热区止于最左侧按钮（settings = slots[4]）之前。它注册在按钮之后，
+    // 重叠区域内后注册的交互胜出，所以热区一旦盖住按钮，按钮就再也点不动了。
     let drag = Rect::from_min_max(
         rect.left_top(),
-        Pos2::new(slots[3].left() - 4.0, rect.bottom()),
+        Pos2::new(slots[4].left() - 4.0, rect.bottom()),
     );
     let resp = body.interact(
         drag,
@@ -337,22 +362,23 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         Pos2::new(rect.left() + 2.0, rect.center().y - 16.0),
         Vec2::splat(32.0),
     );
-    painter.rect_filled(tile, CornerRadius::same(9), p.chip_bg);
-    painter.rect_stroke(
-        tile,
-        CornerRadius::same(9),
-        Stroke::new(1.0, alpha(tint, if offline { 24 } else { 52 })),
-        StrokeKind::Inside,
-    );
+    painter.rect_filled(tile, CornerRadius::same(10), p.chip_bg);
 
     let wired = entry.info.connection.is_wired();
-    let level = battery_level(entry.state.battery, wired);
+    // 能力位说没有电量就不显示读数，哪怕采集线程刚好留下过旧值。
+    let battery = entry
+        .state
+        .snap
+        .as_ref()
+        .filter(|s| s.caps.battery)
+        .and(entry.state.battery);
+    let level = battery_level(battery, wired);
     // 右侧这一列是电量读数；没有读数就留空。连接方式已经写在左侧注释里，
     // 再放一个"有线/在线"会和百分比抢同一列，也重复了信息。
     let (value, value_color, metric) = match &entry.state.link {
         Link::Offline(_) => ("离线".to_string(), p.danger, false),
         Link::Connecting => ("连接中".to_string(), p.warn, false),
-        Link::Online => match entry.state.battery {
+        Link::Online => match battery {
             Some(b) => (format!("{}%", b.min(100)), battery_color(level, p), true),
             None => (String::new(), p.dim, false),
         },
@@ -416,7 +442,7 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         ),
     };
     let note_color = p.dim;
-    let has_gauge = matches!(entry.state.link, Link::Online) && entry.state.battery.is_some();
+    let has_gauge = matches!(entry.state.link, Link::Online) && battery.is_some();
     let note = ellipsize(
         painter,
         &note,
@@ -431,7 +457,7 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
         note_color,
     );
     if has_gauge {
-        if let Some(battery) = entry.state.battery {
+        if let Some(battery) = battery {
             let gauge = Rect::from_min_size(
                 Pos2::new(rect.right() - 44.0, rect.top() + 36.0),
                 Vec2::new(34.0, 3.0),
@@ -465,6 +491,7 @@ fn empty_row(
     recently_scanned: bool,
     scan_failed: bool,
     scanning: bool,
+    has_devices: bool,
     height: f32,
 ) {
     // 禁用态交给 egui：不会进 Tab，也不会响应回车/空格；不再画一个看起来
@@ -484,10 +511,13 @@ fn empty_row(
             );
         }
         // 后台首轮扫描期间不能报"未发现设备"：那是结论，不是过程。
+        // 有设备但都不在线时，浮窗不列离线设备，只说明去向。
         let (title, note) = if scanning {
             ("正在扫描…", "正在检测已连接的外设")
         } else if scan_failed {
             ("上次扫描失败", "检查设备后点击重新扫描")
+        } else if has_devices {
+            ("没有在线设备", "离线设备请在主界面查看")
         } else if recently_scanned {
             ("仍未发现设备", "检查接收器或数据线后重新扫描")
         } else {
@@ -567,79 +597,45 @@ fn paint_close(painter: &egui::Painter, c: Pos2, color: Color32) {
     }
 }
 
-/// Arrow leaving a frame: "open the big window".
+/// 主界面就是一扇窗：外框加顶部标题栏。原来的“箭头钻出方框”在 14px 下
+/// 只剩几根短线，既像退出又像外链，看不出是打开主窗口。
 fn paint_open(painter: &egui::Painter, c: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.3, color);
-    painter.rect_stroke(
-        Rect::from_min_max(
-            Pos2::new(c.x - 5.0, c.y - 1.0),
-            Pos2::new(c.x + 1.0, c.y + 5.0),
-        ),
-        CornerRadius::same(1),
-        stroke,
-        StrokeKind::Inside,
-    );
+    let stroke = Stroke::new(1.25, color);
+    let body = Rect::from_center_size(c, Vec2::new(13.0, 11.0));
+    painter.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Inside);
+    let bar_y = body.top() + 3.4;
     painter.line_segment(
         [
-            Pos2::new(c.x - 1.0, c.y + 1.0),
-            Pos2::new(c.x + 5.0, c.y - 5.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(c.x + 5.0, c.y - 5.0),
-            Pos2::new(c.x + 1.4, c.y - 5.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(c.x + 5.0, c.y - 5.0),
-            Pos2::new(c.x + 5.0, c.y - 1.4),
+            Pos2::new(body.left() + 1.0, bar_y),
+            Pos2::new(body.right() - 1.0, bar_y),
         ],
         stroke,
     );
 }
 
-/// Two stacked rectangles, the top one filled: "this window stays above the
-/// others". A literal pushpin at 12 px reads as a funnel, so it is not used.
+/// 置顶：向上箭头 + 顶部横线。
+///
+/// 原来的图钉由帽檐、钉身和细针三段组成，缩到 14px 只剩一个"T"形，
+/// 顶上的帽檐和钉身糊在一起，更容易被读成漏斗或帐篷。箭头到顶线是
+/// 系统里通行的"固定在最前"符号，只有两条实线和三根短线，小尺寸下
+/// 每一笔都还认得出来；图钉的语义由 tooltip 补充。
 fn paint_pin(painter: &egui::Painter, c: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.2, color);
-    painter.rect_filled(
-        Rect::from_min_max(
-            Pos2::new(c.x - 5.4, c.y - 5.0),
-            Pos2::new(c.x + 1.6, c.y + 2.0),
-        ),
-        CornerRadius::same(1),
-        color,
+    // 顶线略粗：它承担"到顶"那一半语义，粗细差让箭头不至于和它连成一把伞。
+    painter.line_segment(
+        [
+            Pos2::new(c.x - 4.9, c.y - 5.5),
+            Pos2::new(c.x + 4.9, c.y - 5.5),
+        ],
+        Stroke::new(1.6, color),
     );
-    painter.rect_stroke(
-        Rect::from_min_max(
-            Pos2::new(c.x - 1.4, c.y - 1.0),
-            Pos2::new(c.x + 5.4, c.y + 5.0),
-        ),
-        CornerRadius::same(1),
-        stroke,
-        StrokeKind::Inside,
-    );
-}
-
-/// Sun while dark mode is active ("switch to light"), moon in light mode.
-/// Scaled-down copy of the titlebar glyph so both toggles read as one control.
-fn paint_theme(painter: &egui::Painter, c: Pos2, color: Color32, dark: bool, bg: Color32) {
     let stroke = Stroke::new(1.3, color);
-    if dark {
-        painter.circle_stroke(c, 3.4, stroke);
-        for i in 0..8 {
-            let dir = Vec2::angled(i as f32 * std::f32::consts::TAU / 8.0);
-            painter.line_segment([c + dir * 5.0, c + dir * 6.4], stroke);
-        }
-    } else {
-        // Crescent: a filled disc with a small offset disc knocked out.
-        painter.circle_filled(c, 4.0, color);
-        painter.circle_filled(c + Vec2::new(1.8, -1.8), 3.6, bg);
-    }
+    painter.line_segment(
+        [Pos2::new(c.x, c.y - 2.4), Pos2::new(c.x, c.y + 5.5)],
+        stroke,
+    );
+    let tip = Pos2::new(c.x, c.y - 2.4);
+    painter.line_segment([Pos2::new(c.x - 2.9, c.y + 0.3), tip], stroke);
+    painter.line_segment([tip, Pos2::new(c.x + 2.9, c.y + 0.3)], stroke);
 }
 
 /// Truncate with an ellipsis rather than clipping mid-glyph. Only runs when
@@ -663,4 +659,43 @@ fn ellipsize(painter: &egui::Painter, text: &str, font: FontId, max_w: f32) -> S
         return "…".into();
     }
     text.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mini_lists_only_online_devices() {
+        assert!(is_visible(&Link::Online));
+        assert!(!is_visible(&Link::Connecting));
+    }
+
+    #[test]
+    fn status_word_never_reports_counts() {
+        for word in [
+            status_word(4, 0, 4, false),
+            status_word(0, 0, 4, false),
+            status_word(0, 2, 4, false),
+            status_word(0, 0, 0, false),
+            status_word(0, 0, 0, true),
+        ] {
+            assert!(
+                !word.chars().any(|c| c.is_ascii_digit()),
+                "浮窗状态词不该带数量：{word}"
+            );
+        }
+        assert_eq!(status_word(3, 0, 5, false), "设备在线");
+        assert_eq!(status_word(0, 0, 5, false), "设备离线");
+        assert_eq!(status_word(0, 1, 5, false), "正在连接");
+        assert_eq!(status_word(0, 0, 0, false), "无设备");
+        assert_eq!(status_word(0, 0, 3, true), "正在扫描…");
+    }
+
+    #[test]
+    fn height_follows_visible_rows() {
+        assert_eq!(height(0), height(1));
+        assert!(height(3) > height(2));
+        assert_eq!(height(9), height(MAX_ROWS));
+    }
 }
