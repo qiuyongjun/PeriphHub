@@ -58,9 +58,13 @@ pub fn view(
                 ui.label(heading("设备配置", text::HEADING, p.text));
                 ui.add_space(3.0);
                 ui.label(
-                    RichText::new("更改即时写入设备，无需手动保存")
-                        .size(12.0)
-                        .color(p.dim),
+                    RichText::new(if state.writing {
+                        "正在写入设备…"
+                    } else {
+                        "更改即时写入设备，无需手动保存"
+                    })
+                    .size(12.0)
+                    .color(p.dim),
                 );
             });
         },

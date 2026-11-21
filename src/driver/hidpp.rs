@@ -17,41 +17,14 @@
 //! until their layout has been checked on real hardware. Raw bytes, CRCs and
 //! the experiments behind them: `docs/logitech-g304.md`.
 
-use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HidD_GetAttributes, HidD_SetOutputReport, HIDD_ATTRIBUTES,
-};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
-
+use super::transport::{HidTransport, OverlappedHid};
 use super::{Caps, Cmd, Driver, Limits, Snapshot};
 
-#[link(name = "kernel32", kind = "raw-dylib")]
-extern "system" {
-    fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut Overlapped) -> i32;
-    fn CreateEventW(attr: *mut c_void, manual: i32, initial: i32, name: *const u16) -> HANDLE;
-    fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
-    fn GetOverlappedResult(h: HANDLE, ov: *mut Overlapped, transferred: *mut u32, wait: i32)
-        -> i32;
-    fn CancelIo(h: HANDLE) -> i32;
-    fn GetLastError() -> u32;
-}
-
-const ERROR_IO_PENDING: u32 = 997;
-const ERROR_IO_INCOMPLETE: u32 = 996;
-const ERROR_OPERATION_ABORTED: u32 = 995;
 const REPORT_LEN: usize = 20;
 const SW_ID: u8 = 0x0A;
 const TIMEOUT_MS: u32 = 600;
-/// 取消一次挂起的读取后，最多再等这么久让它真正完成。等不到就放弃这次
-/// 读取并泄漏那一小块堆内存，避免内核稍后写回已释放的栈变量。
-const CANCEL_WAIT_MS: u32 = 250;
 
 /// Feature ids this driver knows. The index is resolved at open time: a device
 /// reports a feature as "not present" by answering with index 0.
@@ -139,35 +112,8 @@ fn caps_for(layout: Option<&HidppLayout>, has_dpi: bool, has_battery: bool) -> C
     }
 }
 
-#[repr(C)]
-struct Overlapped {
-    internal: usize,
-    internal_high: usize,
-    offset: u32,
-    offset_high: u32,
-    h_event: HANDLE,
-}
-
-/// 一次 overlapped 读取需要的缓冲区和事件。放在堆上，超时取消后即使内核
-/// 稍后才完成，也不会写到已经退栈的内存；最坏情况下故意泄漏这一块。
-///
-/// 事件必须每次读取独占：共用一个事件时，上一次被放弃的读取稍后完成会把
-/// 事件置位，新读取的等待被提前唤醒，`GetOverlappedResult` 却报
-/// `ERROR_IO_INCOMPLETE`，此时释放缓冲就是释放后使用。
-struct PendingRead {
-    ov: Overlapped,
-    buf: [u8; REPORT_LEN],
-    event: HANDLE,
-}
-
-impl Drop for PendingRead {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.event) };
-    }
-}
-
 pub struct Hidpp {
-    handle: HANDLE,
+    io: Box<dyn HidTransport>,
     dev_idx: u8,
     name: String,
     /// Feature indexes, resolved once. `None` = the device does not have it.
@@ -189,18 +135,12 @@ pub struct Hidpp {
     /// 用户刚切到、还没落盘的档位。切档本身立刻作用于传感器，落盘攒到下一次
     /// 周期读取时做一次（见 `flush_default_stage`）。
     pending_default: Option<u8>,
+    /// 扇区已写成功、但提交后的实时 DPI 没恢复回去时的目标值。
+    ///
+    /// 留到下一次周期轮询补偿，不在失败路径里重试：设备休眠或超时时，反复
+    /// 读写只会把采集线程卡死在这一个错误上。
+    pending_restore: Option<u16>,
     polling_ms: u8,
-    /// 取消超时后仍未完成的读取。
-    ///
-    /// `ReadFile` 的缓冲区必须活到内核真正写完为止；以前这里用
-    /// `mem::forget`，超时一次就永久漏一帧。挂在驱动上以后，泄漏的上限变成
-    /// "本驱动实例"——驱动重建（设备重插、线程自愈）时一起释放。Drop 里会
-    /// 再等一次取消完成，等不到才真的放弃。
-    ///
-    /// Box 不能换成 `Vec<PendingRead>`：内核持有 `ov` / `buf` 的地址，
-    /// Vec 扩容搬移元素会让这些指针失效。
-    #[allow(clippy::vec_box)]
-    abandoned: Vec<Box<PendingRead>>,
 }
 
 impl Hidpp {
@@ -209,147 +149,77 @@ impl Hidpp {
         layout: Option<&'static HidppLayout>,
         limits: Limits,
     ) -> Result<Hidpp, String> {
-        let mut p = path.to_vec();
-        if p.last() != Some(&0) {
-            p.push(0);
-        }
-        unsafe {
-            let handle = CreateFileW(
-                p.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                std::ptr::null_mut(),
-            );
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(format!(
-                    "打开接收器失败（错误码 {}）",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            let mut dev = Hidpp {
-                handle,
-                dev_idx: 0,
-                name: String::new(),
-                f_name: None,
-                f_battery: None,
-                f_dpi: None,
-                f_onboard: None,
-                profile_sector: None,
-                layout: None,
-                limits,
-                stages: Vec::new(),
-                default_index: 0,
-                pending_default: None,
-                polling_ms: 1,
-                abandoned: Vec::new(),
-            };
-            dev.dev_idx = dev
-                .find_device()
-                .ok_or_else(|| "接收器上没有设备应答（鼠标可能已关机或休眠）".to_string())?;
-            dev.f_name = dev.feature(F_DEVICE_NAME);
-            dev.f_battery = dev.feature(F_BATTERY_LEVEL_STATUS);
-            dev.f_dpi = dev.feature(F_ADJUSTABLE_DPI);
-            dev.f_onboard = dev.feature(F_ONBOARD_PROFILES);
-            if let Some(fi) = dev.f_name {
-                dev.name = dev.read_name(fi);
-            }
-            // 只有布局存在、型号名匹配、扇区大小一致，并且真的找到了一个
-            // 启用的 profile 扇区，才允许写板载配置。`None`（未验证布局）
-            // 仍可改当前 DPI，但不碰扇区。
-            let verified = layout.filter(|l| {
-                l.supports_name(&dev.name) && dev.onboard_sector_size() == Some(l.sector_len as u16)
-            });
-            let profile_sector = verified.and_then(|l| dev.find_profile_sector(l));
-            let verified = verified.filter(|_| profile_sector.is_some());
-            dev.layout = verified;
-            dev.profile_sector = profile_sector;
-            if let Some(l) = verified {
-                dev.load_profile(l).ok();
-            } else {
-                // 未验证型号没有可信的传感器范围；当前 DPI 不是持久配置，
-                // 给一个宽范围，让读取到的值仍能在编辑器里显示和微调。
-                dev.limits.dpi = (GENERIC_DPI_MIN, GENERIC_DPI_MAX);
-                if dev.f_onboard.is_some() {
-                    crate::log::line(
-                        "WARN",
-                        &format!(
-                            "{} 的板载配置布局未验证，已限制为仅修改当前 DPI",
-                            if dev.name.is_empty() {
-                                "未知型号"
-                            } else {
-                                &dev.name
-                            }
-                        ),
-                    );
-                }
-            }
-            Ok(dev)
-        }
+        Self::with_transport(
+            Box::new(OverlappedHid::open(path, REPORT_LEN)?),
+            layout,
+            limits,
+        )
     }
 
-    /// One overlapped read, bounded by `ms`.
-    ///
-    /// 超时这一路不能"取消完就返回"：`CancelIo` 只是请求取消，内核仍可能
-    /// 稍后才完成这次读。读取缓冲在堆上（`PendingRead`），取消后用有界
-    /// 等待确认结束；等不到就把这块缓冲挂到 `self.abandoned`，由 `Drop`
-    /// 再确认一次——既不会 use-after-free，也不会让采集线程永久卡住。
-    /// 每次读取用自己的事件，旧请求迟到的完成不会唤醒新请求的等待。
-    fn read_frame(&mut self, ms: u32) -> Result<Option<Vec<u8>>, String> {
-        unsafe {
-            let event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
-            if event.is_null() {
-                return Err("创建读取事件失败".into());
-            }
-            let mut pending = Box::new(PendingRead {
-                ov: Overlapped {
-                    internal: 0,
-                    internal_high: 0,
-                    offset: 0,
-                    offset_high: 0,
-                    h_event: event,
-                },
-                buf: [0u8; REPORT_LEN],
-                event,
-            });
-            let mut read = 0u32;
-            let ok = ReadFile(
-                self.handle,
-                pending.buf.as_mut_ptr() as *mut c_void,
-                REPORT_LEN as u32,
-                &mut read,
-                &mut pending.ov,
-            );
-            let taken =
-                |read: u32, buf: &[u8; REPORT_LEN]| buf[..(read as usize).min(REPORT_LEN)].to_vec();
-            if ok != 0 {
-                return Ok(Some(taken(read, &pending.buf)));
-            }
-            if GetLastError() != ERROR_IO_PENDING {
-                return Err("读取应答失败".into());
-            }
-            if WaitForSingleObject(event, ms) == 0 {
-                if GetOverlappedResult(self.handle, &mut pending.ov, &mut read, 0) == 0 {
-                    return Err("读取应答失败".into());
-                }
-                return Ok(Some(taken(read, &pending.buf)));
-            }
-            // 超时：请求取消，但只等有限时间。等不到就放弃这块缓冲。
-            CancelIo(self.handle);
-            if WaitForSingleObject(event, CANCEL_WAIT_MS) != 0 {
-                self.abandoned.push(pending);
-                return Err("取消读取请求超时".into());
-            }
-            if GetOverlappedResult(self.handle, &mut pending.ov, &mut read, 0) != 0 {
-                return Ok(Some(taken(read, &pending.buf)));
-            }
-            if GetLastError() != ERROR_OPERATION_ABORTED {
-                return Err("读取应答失败".into());
-            }
-            Ok(None)
+    /// 用任意传输实现构造驱动：生产走 `open`，测试注入假实现。
+    fn with_transport(
+        io: Box<dyn HidTransport>,
+        layout: Option<&'static HidppLayout>,
+        limits: Limits,
+    ) -> Result<Hidpp, String> {
+        let mut dev = Hidpp {
+            io,
+            dev_idx: 0,
+            name: String::new(),
+            f_name: None,
+            f_battery: None,
+            f_dpi: None,
+            f_onboard: None,
+            profile_sector: None,
+            layout: None,
+            limits,
+            stages: Vec::new(),
+            default_index: 0,
+            pending_default: None,
+            pending_restore: None,
+            polling_ms: 1,
+        };
+        dev.dev_idx = dev
+            .find_device()
+            .ok_or_else(|| "接收器上没有设备应答（鼠标可能已关机或休眠）".to_string())?;
+        dev.f_name = dev.feature(F_DEVICE_NAME);
+        dev.f_battery = dev.feature(F_BATTERY_LEVEL_STATUS);
+        dev.f_dpi = dev.feature(F_ADJUSTABLE_DPI);
+        dev.f_onboard = dev.feature(F_ONBOARD_PROFILES);
+        if let Some(fi) = dev.f_name {
+            dev.name = dev.read_name(fi);
         }
+        // 只有布局存在、型号名匹配、扇区大小一致，并且真的找到了一个
+        // 启用的 profile 扇区，才允许写板载配置。`None`（未验证布局）
+        // 仍可改当前 DPI，但不碰扇区。
+        let verified = layout.filter(|l| {
+            l.supports_name(&dev.name) && dev.onboard_sector_size() == Some(l.sector_len as u16)
+        });
+        let profile_sector = verified.and_then(|l| dev.find_profile_sector(l));
+        let verified = verified.filter(|_| profile_sector.is_some());
+        dev.layout = verified;
+        dev.profile_sector = profile_sector;
+        if let Some(l) = verified {
+            dev.load_profile(l).ok();
+        } else {
+            // 未验证型号没有可信的传感器范围；当前 DPI 不是持久配置，
+            // 给一个宽范围，让读取到的值仍能在编辑器里显示和微调。
+            dev.limits.dpi = (GENERIC_DPI_MIN, GENERIC_DPI_MAX);
+            if dev.f_onboard.is_some() {
+                crate::log::line(
+                    "WARN",
+                    &format!(
+                        "{} 的板载配置布局未验证，已限制为仅修改当前 DPI",
+                        if dev.name.is_empty() {
+                            "未知型号"
+                        } else {
+                            &dev.name
+                        }
+                    ),
+                );
+            }
+        }
+        Ok(dev)
     }
 
     /// Sends one request and waits for the answer with the same header.
@@ -359,16 +229,7 @@ impl Hidpp {
         want_feature: u8,
         ms: u32,
     ) -> Result<Option<Vec<u8>>, String> {
-        unsafe {
-            if HidD_SetOutputReport(
-                self.handle,
-                frame.as_ptr() as *const c_void,
-                REPORT_LEN as u32,
-            ) == 0
-            {
-                return Err("发送命令失败".into());
-            }
-        }
+        self.io.send(frame)?;
         let budget = Duration::from_millis(ms as u64);
         let start = Instant::now();
         loop {
@@ -378,7 +239,7 @@ impl Hidpp {
             if left.is_zero() {
                 break;
             }
-            let Some(buf) = self.read_frame(left.as_millis().max(1) as u32)? else {
+            let Some(buf) = self.io.recv(left)? else {
                 break;
             };
             // Errors carry feature index 0xFF; everything else echoes the
@@ -622,11 +483,76 @@ impl Hidpp {
         if !changed {
             return Ok(());
         }
+        // 上一次提交只写成功、DPI 没恢复时，先补完再叠加新的扇区写入；
+        // 否则这次会以错误的实时值为基准，把错误状态固化下来。
+        self.settle_pending_restore();
+        if self.pending_restore.is_some() {
+            return Err("上一次写入后的 DPI 尚未恢复，请稍后重试".into());
+        }
+        // 物理按键切档不经过 pending_default；提交整扇区会让固件按旧默认
+        // 档位重载传感器。先记下实时 DPI，写完放回去，否则改回报率这类
+        // 无关修改会顺带把用户刚切的档位顶掉。
+        //
+        // 读不到实时 DPI 就不知道这次提交会不会改掉传感器：宁可拒绝写入，
+        // 也不能在运行态未知的情况下提交扇区还报成功。
+        let live = match self.f_dpi {
+            Some(fi) => Some(self.read_dpi(fi)?),
+            None => None,
+        };
         stamp_crc(&mut data);
         self.write_sector(layout, fi, sector, &data)?;
         if let Some(idx) = carried {
             self.default_index = idx;
             self.pending_default = None;
+        }
+        if let Some(live) = live {
+            if let Err(e) = self.restore_live_dpi(live) {
+                // 扇区已经写进去了，不能回报“完全成功”；留下目标值交给
+                // 下一次轮询补偿，同时把部分成功告诉调用方纠正界面。
+                self.pending_restore = Some(live);
+                return Err(format!("配置已写入，但恢复 DPI 失败：{e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 补偿上一次“扇区已写、DPI 未恢复”的提交。
+    ///
+    /// 只在周期轮询里重试，不在失败路径里循环。设备休眠时读不到就保留目标，
+    /// 等下一次唤醒；恢复成功或确认已经是目标值就清掉。
+    fn settle_pending_restore(&mut self) {
+        let Some(target) = self.pending_restore else {
+            return;
+        };
+        let Some(fi) = self.f_dpi else {
+            self.pending_restore = None;
+            return;
+        };
+        match self.read_dpi(fi) {
+            // 上次其实恢复成功了，只是回读失败。
+            Ok(now) if now == target => self.pending_restore = None,
+            Ok(_) => {
+                if self.set_current_dpi(target).is_ok() && self.read_dpi(fi).ok() == Some(target) {
+                    self.pending_restore = None;
+                }
+            }
+            // 设备暂不可达：保留目标，下一次轮询再试。
+            Err(_) => {}
+        }
+    }
+
+    /// 提交扇区后把传感器放回提交前的实时值，并回读确认。
+    fn restore_live_dpi(&mut self, live: u16) -> Result<(), String> {
+        let Some(fi) = self.f_dpi else {
+            return Ok(());
+        };
+        if self.read_dpi(fi)? == live {
+            return Ok(());
+        }
+        self.set_current_dpi(live)?;
+        let now = self.read_dpi(fi)?;
+        if now != live {
+            return Err(format!("回读 DPI 为 {now}，期望 {live}"));
         }
         Ok(())
     }
@@ -672,6 +598,15 @@ impl Hidpp {
             crate::log::line("WARN", &format!("保存默认档位失败：{e}"));
             self.pending_default = None;
         }
+    }
+
+    /// 退出路径的严格版本：错误交给调用方记录，不在这里吞掉。
+    fn flush_default_stage_checked(&mut self) -> Result<(), String> {
+        let Some(layout) = self.layout else {
+            self.pending_default = None;
+            return Ok(());
+        };
+        self.flush_default_stage(layout)
     }
 
     fn current_caps(&self) -> Caps {
@@ -808,51 +743,11 @@ pub fn crc16(data: &[u8]) -> u16 {
     crc
 }
 
-// Same as the Rapoo driver: one worker thread owns both handles.
-unsafe impl Send for Hidpp {}
-
-impl Drop for Hidpp {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.abandoned.is_empty() {
-                // 这些读取已经取消过但没等到完成；关句柄前再确认一次，
-                // 免得内核在缓冲释放之后才写回。CancelIo 只取消本线程的
-                // 挂起 I/O，而驱动一直活在自己的采集线程上。
-                CancelIo(self.handle);
-                // 每次读取有独立事件，但仍要逐个 OVERLAPPED 查是否真的
-                // 结束：事件没等到只说明期限内没完成，不能据此释放缓冲。
-                // 总等待时长有上限，退出的响应时间不能被它拖住。
-                let deadline = Instant::now() + Duration::from_millis(CANCEL_WAIT_MS as u64);
-                let mut stalled = Vec::new();
-                for mut p in self.abandoned.drain(..) {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if !left.is_zero() {
-                        WaitForSingleObject(p.event, left.as_millis().max(1) as u32);
-                    }
-                    let mut n = 0u32;
-                    if GetOverlappedResult(self.handle, &mut p.ov, &mut n, 0) == 0
-                        && GetLastError() == ERROR_IO_INCOMPLETE
-                    {
-                        stalled.push(p);
-                    }
-                    // 已完成（含被取消）的缓冲随 p 一起释放，事件由
-                    // `PendingRead::drop` 关闭。
-                }
-                if !stalled.is_empty() {
-                    // 极端情况：宁可漏掉这块堆内存和它的事件，也不能让
-                    // 内核写到已释放的地址上。
-                    std::mem::forget(stalled);
-                }
-            }
-            CloseHandle(self.handle);
-        }
-    }
-}
-
 impl Driver for Hidpp {
     fn snapshot(&mut self) -> Result<Snapshot, String> {
-        // 先把待落的默认档位写掉，再读扇区：这样下面读到的 index、当前 DPI
-        // 都是同一次写入之后的状态，不会一会儿新一会儿旧。
+        // 先补完上一次没恢复的 DPI，再把待落默认档位写掉：这样下面读到的
+        // index、当前 DPI 都是同一次写入之后的状态，不会一会儿新一会儿旧。
+        self.settle_pending_restore();
         self.settle_default_stage();
         let caps = self.current_caps();
         if let Some(layout) = self.layout {
@@ -904,7 +799,8 @@ impl Driver for Hidpp {
 
     fn battery(&mut self) -> Result<Option<u8>, String> {
         // 浮窗模式下全量读是停掉的，电量这条 20 秒的心跳就成了唯一会定期
-        // 经过驱动的地方——待落的档位放在这里补写，不用再拉一次全量。
+        // 经过驱动的地方——待落的档位和没恢复的 DPI 都在这里补。
+        self.settle_pending_restore();
         self.settle_default_stage();
         let Some(fi) = self.f_battery else {
             return Ok(None);
@@ -978,6 +874,9 @@ impl Driver for Hidpp {
                 // 传感器立刻跟手，扇区留到下一次周期读取时写一次，那之后读到
                 // 的当前 DPI 就是刚写进去的这一档。
                 self.set_current_dpi(v)?;
+                // 用户明确切档后，新的传感器值优先：上一次没恢复成功的旧
+                // DPI 目标若还留着，下一轮轮询会把它改回去，等于吞掉这次选择。
+                self.pending_restore = None;
                 self.pending_default = Some(idx as u8);
                 snap.stage_active = idx as u8;
                 Ok(())
@@ -1006,11 +905,17 @@ impl Driver for Hidpp {
     }
 
     fn link_alive(&self) -> bool {
-        unsafe {
-            let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
-            attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
-            HidD_GetAttributes(self.handle, &mut attr) != 0
+        self.io.alive()
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        // 退出前能补的先补：没恢复的 DPI 会挡住后续扇区提交，必须排在
+        // 待落档位之前。
+        self.settle_pending_restore();
+        if self.pending_restore.is_some() {
+            return Err("DPI 尚未恢复，默认档位未提交".into());
         }
+        self.flush_default_stage_checked()
     }
 }
 
@@ -1234,5 +1139,279 @@ mod tests {
             carry_pending_stage(&mut sector, None, G304.default_index_at),
             None
         );
+    }
+
+    // ---- 可靠写入的假设备 -------------------------------------------------
+
+    use super::super::transport::HidTransport;
+    use crate::driver::G304_LIMITS;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct FakeDevice {
+        dev_idx: u8,
+        f_dpi: u8,
+        f_onboard: u8,
+        sector: Vec<u8>,
+        dpi: u16,
+        dpi_read_timeout: bool,
+        dpi_set_fails: bool,
+        fail_start_write: bool,
+        reload_on_commit: bool,
+        write_buf: Vec<u8>,
+        sector_writes: usize,
+        sent: Vec<Vec<u8>>,
+        replies: VecDeque<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeIo(Arc<Mutex<FakeDevice>>);
+
+    impl FakeIo {
+        fn new(sector: Vec<u8>, dpi: u16) -> (Self, Arc<Mutex<FakeDevice>>) {
+            let state = Arc::new(Mutex::new(FakeDevice {
+                dev_idx: 1,
+                f_dpi: 3,
+                f_onboard: 7,
+                sector,
+                dpi,
+                dpi_read_timeout: false,
+                dpi_set_fails: false,
+                fail_start_write: false,
+                reload_on_commit: true,
+                write_buf: Vec::new(),
+                sector_writes: 0,
+                sent: Vec::new(),
+                replies: VecDeque::new(),
+            }));
+            (Self(state.clone()), state)
+        }
+    }
+
+    impl HidTransport for FakeIo {
+        fn send(&mut self, report: &[u8]) -> Result<(), String> {
+            let mut dev = self.0.lock().unwrap();
+            dev.sent.push(report.to_vec());
+            let feature = report[2];
+            let func = report[3] >> 4;
+            let mut reply = vec![0u8; REPORT_LEN];
+            reply[0] = 0x11;
+            reply[1] = dev.dev_idx;
+            reply[2] = feature;
+            reply[3] = report[3];
+
+            if feature == dev.f_onboard {
+                match func {
+                    // 读扇区块
+                    5 => {
+                        let off = u16::from_be_bytes([report[6], report[7]]) as usize;
+                        if off < dev.sector.len() {
+                            let end = (off + G304.read_chunk).min(dev.sector.len());
+                            reply[4..4 + (end - off)].copy_from_slice(&dev.sector[off..end]);
+                        }
+                        dev.replies.push_back(reply);
+                    }
+                    // startWrite
+                    6 => {
+                        if !dev.fail_start_write {
+                            dev.write_buf.clear();
+                            dev.replies.push_back(reply);
+                        }
+                    }
+                    // writeChunk
+                    7 => {
+                        dev.write_buf.extend_from_slice(&report[4..]);
+                        dev.replies.push_back(reply);
+                    }
+                    // commit：固件按扇区里的默认档位重载传感器
+                    8 => {
+                        let n = dev.sector.len().min(dev.write_buf.len());
+                        let written = dev.write_buf[..n].to_vec();
+                        dev.sector[..n].copy_from_slice(&written);
+                        dev.sector_writes += 1;
+                        if dev.reload_on_commit {
+                            let idx = dev.sector[G304.default_index_at] as usize;
+                            let at = G304.dpi_at + idx * 2;
+                            dev.dpi = u16::from_le_bytes([dev.sector[at], dev.sector[at + 1]]);
+                        }
+                        dev.replies.push_back(reply);
+                    }
+                    _ => dev.replies.push_back(reply),
+                }
+            } else if feature == dev.f_dpi {
+                match func {
+                    2 => {
+                        if !dev.dpi_read_timeout {
+                            let b = dev.dpi.to_be_bytes();
+                            reply[5..7].copy_from_slice(&b);
+                            dev.replies.push_back(reply);
+                        }
+                    }
+                    3 => {
+                        if !dev.dpi_set_fails {
+                            // 参数布局是 [axis, hi, lo, hi, lo]。
+                            dev.dpi = u16::from_be_bytes([report[5], report[6]]);
+                            dev.replies.push_back(reply);
+                        }
+                    }
+                    _ => dev.replies.push_back(reply),
+                }
+            } else {
+                dev.replies.push_back(reply);
+            }
+            Ok(())
+        }
+
+        fn recv(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.0.lock().unwrap().replies.pop_front())
+        }
+
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    fn fake_sector() -> Vec<u8> {
+        let mut sector = vec![0u8; G304.sector_len];
+        sector[G304.report_rate_at] = 1;
+        sector[G304.default_index_at] = 0;
+        for (i, dpi) in [400u16, 800, 1600, 3200, 6400].into_iter().enumerate() {
+            let at = G304.dpi_at + i * 2;
+            sector[at..at + 2].copy_from_slice(&dpi.to_le_bytes());
+        }
+        for b in &mut sector[G304.dpi_at + 10..G304.sector_len - 2] {
+            *b = 0xFF;
+        }
+        stamp_crc(&mut sector);
+        sector
+    }
+
+    fn test_hidpp(io: FakeIo) -> Hidpp {
+        Hidpp {
+            io: Box::new(io),
+            dev_idx: 1,
+            name: "G304".into(),
+            f_name: None,
+            f_battery: None,
+            f_dpi: Some(3),
+            f_onboard: Some(7),
+            profile_sector: Some(1),
+            layout: Some(&G304),
+            limits: G304_LIMITS,
+            stages: vec![400, 800, 1600, 3200, 6400],
+            default_index: 0,
+            pending_default: None,
+            pending_restore: None,
+            polling_ms: 1,
+        }
+    }
+
+    /// 读不到实时 DPI 时不能提交扇区：否则运行态未知，提交后 DPI 可能被
+    /// 顶回旧档位，调用方却收到成功。
+    #[test]
+    fn live_dpi_read_failure_aborts_the_sector_write() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().dpi_read_timeout = true;
+        let mut dev = test_hidpp(io);
+        let err = dev
+            .update_profile(&G304, |data| {
+                data[G304.report_rate_at] = 4;
+                true
+            })
+            .unwrap_err();
+        assert!(err.contains("读取 DPI"), "{err}");
+        let s = state.lock().unwrap();
+        assert_eq!(s.sector_writes, 0, "读不到实时 DPI 时不能提交扇区");
+        assert!(
+            !s.sent.iter().any(|f| f[2] == 7 && f[3] >> 4 >= 6),
+            "不应发送扇区写命令"
+        );
+    }
+
+    /// 写成功但 DPI 恢复失败必须回报部分失败，并在下一次轮询补偿。
+    #[test]
+    fn dpi_restore_failure_is_partial_success_and_gets_compensated() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().dpi_set_fails = true;
+        let mut dev = test_hidpp(io);
+
+        let err = dev
+            .update_profile(&G304, |data| {
+                data[G304.report_rate_at] = 4;
+                true
+            })
+            .unwrap_err();
+        assert!(err.contains("配置已写入"), "{err}");
+        assert_eq!(dev.pending_restore, Some(800));
+
+        {
+            let mut s = state.lock().unwrap();
+            assert_eq!(s.sector_writes, 1);
+            assert_eq!(s.sector[G304.report_rate_at], 4);
+            assert_eq!(s.dpi, 400, "提交应按默认档位重载传感器");
+            s.dpi_set_fails = false;
+        }
+
+        dev.settle_pending_restore();
+        assert_eq!(dev.pending_restore, None);
+        assert_eq!(state.lock().unwrap().dpi, 800);
+    }
+
+    /// 用户切档必须覆盖上一次没恢复成功的 DPI 目标，否则下一轮轮询会把
+    /// 刚切到的档位改回去。
+    #[test]
+    fn activating_a_stage_supersedes_a_pending_restore() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().dpi_set_fails = true;
+        let mut dev = test_hidpp(io);
+
+        let _ = dev
+            .update_profile(&G304, |data| {
+                data[G304.report_rate_at] = 4;
+                true
+            })
+            .unwrap_err();
+        assert_eq!(dev.pending_restore, Some(800));
+
+        state.lock().unwrap().dpi_set_fails = false;
+        let mut snap = Snapshot {
+            dpi: vec![400, 800, 1600, 3200, 6400],
+            stage_count: 5,
+            ..Snapshot::default()
+        };
+        dev.apply(Cmd::Activate(2), &mut snap).unwrap();
+
+        assert_eq!(dev.pending_restore, None);
+        assert_eq!(state.lock().unwrap().dpi, 1600);
+        // 下一轮补偿不能再动传感器。
+        dev.settle_pending_restore();
+        assert_eq!(state.lock().unwrap().dpi, 1600);
+    }
+
+    /// 退出落盘要把待保存的档位写进扇区，同时保持传感器当前的 DPI。
+    #[test]
+    fn flush_commits_the_pending_stage_and_keeps_live_dpi() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        let mut dev = test_hidpp(io);
+        dev.pending_default = Some(2);
+        dev.flush().unwrap();
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.sector_writes, 1);
+        assert_eq!(s.sector[G304.default_index_at], 2);
+        assert_eq!(s.dpi, 800);
+    }
+
+    /// 落盘失败必须从 flush 返回错误，供退出路径记录，而不是静默成功。
+    #[test]
+    fn flush_reports_a_deferred_write_failure() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().fail_start_write = true;
+        let mut dev = test_hidpp(io);
+        dev.pending_default = Some(2);
+        let err = dev.flush().unwrap_err();
+        assert!(err.contains("开始写扇区失败"), "{err}");
+        assert_eq!(state.lock().unwrap().sector_writes, 0);
     }
 }

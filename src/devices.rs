@@ -132,6 +132,11 @@ pub struct DeviceState {
     pub editor: EditorState,
     pub synced: Option<Instant>,
     pub last_error: Option<String>,
+    /// 有一条写命令已发出、采集线程还没回报处理结果。
+    ///
+    /// 界面据此区分“写入中”和“已确认/失败”：结果消息带回 `consumed` 后
+    /// 清零，失败信息另由 `last_error` 承载。
+    pub writing: bool,
 }
 
 impl Default for DeviceState {
@@ -143,6 +148,7 @@ impl Default for DeviceState {
             editor: EditorState::default(),
             synced: None,
             last_error: None,
+            writing: false,
         }
     }
 }
@@ -295,6 +301,7 @@ fn start_worker(entry: &mut Entry, ctx: &egui::Context, read_mode: &Arc<AtomicU8
     entry.state.snap = None;
     entry.state.editor = EditorState::default();
     entry.state.link = Link::Connecting;
+    entry.state.writing = false;
 }
 
 /// 采集线程崩溃后的自愈：先把状态摊给用户，再重建一个（有限次）。
@@ -328,6 +335,7 @@ fn restart_worker(entry: &mut Entry, ctx: &egui::Context, read_mode: &Arc<Atomic
         entry.state.link =
             Link::Offline("设备读取线程反复异常退出，请重新扫描或重插设备".to_string());
         entry.state.snap = None;
+        entry.state.writing = false;
         return;
     }
     start_worker(entry, ctx, read_mode);
@@ -343,6 +351,28 @@ fn real_worker(
     read_mode: Arc<AtomicU8>,
     busy: Arc<AtomicBool>,
 ) {
+    run_worker(
+        move || driver::open(spec, &path),
+        rx,
+        tx,
+        ctx,
+        read_mode,
+        busy,
+    );
+}
+
+/// 采集线程主体。驱动由 `open` 提供，测试可以注入假实现验证超时、写入失败
+/// 和退出落盘，不必接真机。
+fn run_worker<F>(
+    mut open: F,
+    rx: Receiver<Cmd>,
+    tx: Sender<DeviceMsg>,
+    ctx: egui::Context,
+    read_mode: Arc<AtomicU8>,
+    busy: Arc<AtomicBool>,
+) where
+    F: FnMut() -> Result<Box<dyn Driver>, String>,
+{
     let mut dev: Option<Box<dyn Driver>> = None;
     let mut snap: Option<Snapshot> = None;
     let mut last_open = Instant::now();
@@ -362,7 +392,17 @@ fn real_worker(
         let first = match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(c) => Some(c),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // 队列已处理完且界面不会再发命令：退出前把延迟落盘的档位
+                // 提交掉，否则切档后立刻退出，下次上电仍是旧档位。
+                if let Some(d) = dev.as_mut() {
+                    let _busy = BusyGuard::new(&busy);
+                    if let Err(e) = d.flush() {
+                        crate::log::line("WARN", &format!("退出前保存设备配置失败：{e}"));
+                    }
+                }
+                break;
+            }
         };
         let mut cmds = drain_queue(&rx, first);
         consumed += cmds.len() as u64;
@@ -371,7 +411,7 @@ fn real_worker(
 
         if dev.is_none() && last_open.elapsed() >= RETRY_EVERY {
             last_open = Instant::now();
-            match driver::open(spec, &path) {
+            match open() {
                 Ok(d) => {
                     dev = Some(d);
                     last_full = ago(FULL_EVERY);
@@ -950,6 +990,11 @@ impl DeviceManager {
                     match rx.try_recv() {
                         Ok(msg) => {
                             changed = true;
+                            // 这一批命令（含刚发的写）已经被采集线程处理完，
+                            // 成功与否由 last_error 继续表达。
+                            if msg.consumed >= entry.sent {
+                                entry.state.writing = false;
+                            }
                             if let Some(b) = msg.battery {
                                 entry.state.battery = Some(b);
                             }
@@ -1033,6 +1078,10 @@ impl DeviceManager {
             // otherwise a dead channel would block snapshots for good.
             if tx.send(cmd).is_ok() {
                 entry.sent += 1;
+                // 刷新只是重新读配置，不冒充“写入中”。
+                if !matches!(cmd, Cmd::Refresh) {
+                    entry.state.writing = true;
+                }
             }
         }
     }
@@ -1221,6 +1270,7 @@ mod tests {
     fn found_device(id: &str, model: &str, connection: ConnectionType) -> hid::HidDevice {
         hid::HidDevice {
             id: id.to_string(),
+            physical: id.to_string(),
             path: vec![0x5c, 0, 0],
             vid: 0x258A,
             pid: 0x010C,
@@ -1349,5 +1399,113 @@ mod tests {
             manager.entries[0].info.connection,
             ConnectionType::Wireless24G
         );
+    }
+
+    /// 写命令发出到采集线程回报之间算“写入中”；结果回来就结束，失败由
+    /// `last_error` 表达，不继续挂着写入状态。
+    #[test]
+    fn writing_flag_tracks_the_worker_result() {
+        let mut manager = test_manager();
+        let mut entry = read_only_entry("c:abc", "G304", ConnectionType::Wireless24G);
+        entry.info.has_config = true;
+        entry.state.snap = Some(Arc::new(Snapshot::default()));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        entry.tx = Some(cmd_tx);
+        let (msg_tx, msg_rx) = mpsc::channel();
+        entry.rx = Some(msg_rx);
+        manager.entries.push(entry);
+
+        let id = DeviceId(Arc::from("c:abc"));
+        manager.send(&id, Cmd::Polling(2));
+        assert!(manager.list()[0].state.writing, "写命令发出后应为写入中");
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Polling(2))));
+
+        msg_tx
+            .send(DeviceMsg {
+                snap: None,
+                battery: None,
+                link: Link::Online,
+                error: None,
+                consumed: 1,
+            })
+            .unwrap();
+        manager.poll();
+        assert!(!manager.list()[0].state.writing, "结果回来应结束写入中");
+    }
+
+    struct FlushProbe {
+        flushed: Arc<AtomicBool>,
+        error: Option<&'static str>,
+    }
+
+    impl Driver for FlushProbe {
+        fn snapshot(&mut self) -> Result<Snapshot, String> {
+            Ok(Snapshot::default())
+        }
+
+        fn battery(&mut self) -> Result<Option<u8>, String> {
+            Ok(None)
+        }
+
+        fn apply(&mut self, _cmd: Cmd, _snap: &mut Snapshot) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), String> {
+            self.flushed.store(true, Ordering::SeqCst);
+            match self.error {
+                Some(e) => Err(e.to_string()),
+                None => Ok(()),
+            }
+        }
+
+        fn link_alive(&self) -> bool {
+            true
+        }
+    }
+
+    /// 起一个只跑一轮的采集线程：等它真正打开驱动并上报首帧快照，再关命令
+    /// 通道，让它走到“退出前 flush”这一支。
+    fn run_flush_probe(error: Option<&'static str>) -> Arc<AtomicBool> {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let flushed = Arc::new(AtomicBool::new(false));
+        let flag = flushed.clone();
+        let handle = std::thread::spawn(move || {
+            run_worker(
+                move || {
+                    Ok(Box::new(FlushProbe {
+                        flushed: flag.clone(),
+                        error,
+                    }) as Box<dyn Driver>)
+                },
+                cmd_rx,
+                msg_tx,
+                egui::Context::default(),
+                Arc::new(AtomicU8::new(ReadMode::Full as u8)),
+                Arc::new(AtomicBool::new(false)),
+            );
+        });
+        msg_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("采集线程应上报首帧快照");
+        drop(cmd_tx);
+        handle.join().expect("采集线程应正常退出");
+        flushed
+    }
+
+    /// 退出时采集线程必须先 flush 再结束：切档后立即退出，重新上电仍应是
+    /// 用户最后选的那一档。
+    #[test]
+    fn worker_flushes_deferred_writes_before_exit() {
+        let flushed = run_flush_probe(None);
+        assert!(flushed.load(Ordering::SeqCst), "退出前必须调用 flush");
+    }
+
+    /// flush 失败不能让退出流程 panic，也不能阻止线程结束。
+    #[test]
+    fn worker_exits_even_when_flush_fails() {
+        let flushed = run_flush_probe(Some("保存失败"));
+        assert!(flushed.load(Ordering::SeqCst));
     }
 }

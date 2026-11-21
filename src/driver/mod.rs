@@ -13,6 +13,7 @@
 
 pub mod hidpp;
 pub mod rapoo;
+mod transport;
 
 pub use hidpp::{Hidpp, HidppLayout};
 pub use rapoo::{Rapoo, RapooLayout};
@@ -159,6 +160,14 @@ pub trait Driver: Send {
     /// Writes one field and patches `snap` with the value the device reports
     /// back, so the caller never has to re-read the whole configuration.
     fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<(), String>;
+
+    /// 关闭驱动前调用：把攒着、还没落盘的持久化状态提交掉。
+    ///
+    /// 默认实现没有待写内容。返回错误让退出路径能记录“这次没保存成功”，
+    /// 而不是像周期落盘那样只写日志继续。
+    fn flush(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 
     /// 后台轮询失败后，判断 HID 句柄本身是否还有效（设备被拔掉时会失效）。
     /// 只查句柄，不向设备发命令，用来区分休眠超时与真正断连。

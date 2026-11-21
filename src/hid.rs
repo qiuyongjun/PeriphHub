@@ -52,6 +52,11 @@ impl ConnectionType {
 #[derive(Clone, Debug)]
 pub struct HidDevice {
     pub id: String,
+    /// 物理设备身份（父设备实例；取不到时退回接口分组键）。
+    ///
+    /// 同一台物理设备的接口可能被 Windows 分到不同 container，去重只能靠
+    /// 它，不能只比 VID/PID——否则另一台同型号设备会被一起过滤掉。
+    pub physical: String,
     pub path: Vec<u16>,
     pub vid: u16,
     pub pid: u16,
@@ -79,6 +84,8 @@ struct Interface {
     path: Vec<u16>,
     instance: String,
     group: String,
+    /// 接口所属物理设备的身份，用于把散落在不同 container 的接口折回一台。
+    physical: String,
     /// 挂在 ROOT/VHF/ACPI/SWD 等系统树下的接口，不是外部外设。
     system: bool,
     vid: u16,
@@ -411,6 +418,9 @@ fn collect_interfaces() -> Vec<Interface> {
             // 父设备树同时用来识别内置/虚拟 HID，即使它有 ContainerId。
             let parent = parent_id(&info);
             let system = parent.as_deref().is_some_and(is_system_hid_group);
+            // 父设备实例对所有接口都相同，container id 却可能按接口分家；
+            // 去重用的物理身份优先取父设备。
+            let physical = parent.clone().unwrap_or_else(|| group_key(&instance));
             let group = container_id(set, &info)
                 .or(parent)
                 .unwrap_or_else(|| group_key(&instance));
@@ -418,6 +428,7 @@ fn collect_interfaces() -> Vec<Interface> {
                 path,
                 instance,
                 group,
+                physical,
                 system,
                 vid,
                 pid,
@@ -505,6 +516,7 @@ pub fn enumerate() -> Vec<HidDevice> {
         };
         devices.push(HidDevice {
             id,
+            physical: group[0].physical.clone(),
             path: info.path.clone(),
             vid,
             pid,
@@ -519,13 +531,17 @@ pub fn enumerate() -> Vec<HidDevice> {
     }
 
     // Composite USB functions can land in different containers; fold the
-    // read-only leftovers into the matching configurable device.
-    let configs: Vec<(u16, u16, ConnectionType)> = devices
+    // read-only leftovers into the matching configurable device. Physical
+    // identity must be part of the key: VID/PID/connection alone also match a
+    // second unit of the same model and would delete that device's card.
+    let configs: Vec<(String, u16, u16, ConnectionType)> = devices
         .iter()
         .filter(|d| d.has_config())
-        .map(|d| (d.vid, d.pid, d.connection))
+        .map(|d| (d.physical.clone(), d.vid, d.pid, d.connection))
         .collect();
-    devices.retain(|d| d.has_config() || !configs.contains(&(d.vid, d.pid, d.connection)));
+    devices.retain(|d| {
+        d.has_config() || !configs.contains(&(d.physical.clone(), d.vid, d.pid, d.connection))
+    });
     // 排序键里有两个 String：用 cached_key，别在每次比较时重新分配。
     devices.sort_by_cached_key(|d| (!d.has_config(), d.model.to_ascii_lowercase(), d.id.clone()));
     devices

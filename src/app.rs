@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, vec2, Align, Align2, Color32, CornerRadius, Layout, Margin, RichText, Stroke, Ui,
-    UiBuilder, Vec2, ViewportCommand, WindowLevel,
+    self, vec2, Align, Color32, CornerRadius, Layout, Margin, RichText, Stroke, Ui, UiBuilder,
+    Vec2, ViewportCommand, WindowLevel,
 };
 
 use crate::autostart;
@@ -13,8 +13,8 @@ use crate::theme::{self, ThemeMode};
 use crate::tray::{self, Tray, TrayAction};
 use crate::ui::mini;
 use crate::ui::widgets::{
-    activated, chip, divider, focus_ring, section_heading, shadow_card, split_row, toggle_row,
-    CARD_RADIUS,
+    activated, card, chip, divider, focus_ring, section_heading, shadow_card, split_row,
+    toggle_row, CARD_RADIUS,
 };
 use crate::ui::{chrome, config_page, home};
 
@@ -38,10 +38,15 @@ const MAIN_MAX: f32 = 16384.0;
 /// Gap between the widget and the screen edge when it first appears.
 const MINI_MARGIN: f32 = 24.0;
 
-/// 设置弹层的内容宽度、内边距，以及顶端位置（让开标题栏）。
-const SETTINGS_W: f32 = 380.0;
-const SETTINGS_PAD: i8 = 22;
-const SETTINGS_TOP: f32 = mini::SHADOW_PAD + chrome::BAR_H + 8.0;
+/// 浮窗窗口比可见卡片四周多出 `SHADOW_PAD` 的透明投影边距；贴边时扣掉
+/// 这段，`MINI_MARGIN` 才是用户看到的留白。
+fn mini_edge_inset() -> f32 {
+    (MINI_MARGIN - mini::SHADOW_PAD).max(0.0)
+}
+
+/// 设置页左侧分组导航的宽度；与配置页的两栏断点保持一致。
+const SETTINGS_RAIL_W: f32 = 216.0;
+const SETTINGS_TWO_COL_MIN: f32 = 760.0;
 
 /// What the main window is showing. Configuration used to open a second
 /// viewport; keeping it as a route means one window, one titlebar, and a back
@@ -50,13 +55,52 @@ const SETTINGS_TOP: f32 = mini::SHADOW_PAD + chrome::BAR_H + 8.0;
 enum Route {
     Home,
     Config(DeviceId),
+    Settings,
+}
+
+/// 设置页的分组。系统指针改的是 Windows 全局，单独一组，避免和应用自身
+/// 的行为混在一起。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsSection {
+    #[default]
+    Appearance,
+    Behavior,
+    Devices,
+    System,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 4] = [
+        Self::Appearance,
+        Self::Behavior,
+        Self::Devices,
+        Self::System,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Appearance => "外观",
+            Self::Behavior => "应用行为",
+            Self::Devices => "设备检测",
+            Self::System => "系统指针",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Appearance => "主题与配色",
+            Self::Behavior => "自启动与桌面浮窗",
+            Self::Devices => "重新扫描外设",
+            Self::System => "Windows 指针与滚轮",
+        }
+    }
 }
 
 pub struct Panel {
     manager: DeviceManager,
     cfg: Config,
     applied_theme: Option<ThemeMode>,
-    settings_open: bool,
+    settings_section: SettingsSection,
     route: Route,
     /// When the current page was entered, so it can settle in instead of
     /// snapping into place.
@@ -80,11 +124,12 @@ pub struct Panel {
     mini_clamp: bool,
     /// 当前外壳的任务栏图标是否已隐藏；`None` 表示还没同步过。
     taskbar_hidden: Option<bool>,
-    /// 窗口当前所在显示器的矩形（点，虚拟桌面绝对坐标）。
+    /// 窗口所在显示器的**工作区**（点，虚拟桌面绝对坐标）。
     ///
-    /// egui 只给 `monitor_size`，没有原点；拿尺寸算居中等于假设主屏原点
-    /// 是 (0,0)。浮窗停在副屏时，主窗口会跳到主屏中央而不是留在副屏。
-    monitor_rect: Option<egui::Rect>,
+    /// 用工作区而不是整块显示器：任务栏占据的那几十像素不算可用空间。
+    /// 拿整块显示器算，主窗口会偏下，浮窗贴到底部时会压住任务栏。
+    /// egui 只给 `monitor_size`，没有原点；多屏时还得靠系统给的工作区原点。
+    work_area: Option<egui::Rect>,
 }
 
 impl Panel {
@@ -140,14 +185,12 @@ impl Panel {
 
         ctx.request_repaint();
         let applied_theme = Some(cfg.theme);
-        let monitor_rect = cc
-            .winit_window()
-            .and_then(|w| monitor_rect_of(w, ctx.pixels_per_point()));
+        let work_area = hwnd.and_then(|h| work_area_of(h, ctx.pixels_per_point()));
         let mut panel = Self {
             manager,
             cfg,
             applied_theme,
-            settings_open: false,
+            settings_section: SettingsSection::default(),
             route: Route::Home,
             page_entered: Instant::now(),
             tray,
@@ -161,7 +204,7 @@ impl Panel {
             mini_placed: false,
             mini_clamp: false,
             taskbar_hidden: None,
-            monitor_rect,
+            work_area,
         };
         // The viewport builder only knows the mode it was created with; this
         // puts the window into the shell the config actually asks for.
@@ -293,7 +336,6 @@ impl Panel {
         // Next time the big window comes back it should open on the workbench,
         // not on a page for a device that may have been unplugged meanwhile.
         self.route = Route::Home;
-        self.settings_open = false;
         self.cfg.mode = RunMode::Mini;
         self.mini_placed = false;
         self.save();
@@ -309,10 +351,10 @@ impl Panel {
     }
 
     /// Where the main window should sit: last time's spot if it is still on
-    /// screen, otherwise centred on the monitor the widget currently lives on.
-    /// Coming back from the widget the window is still parked in the corner
-    /// the widget was in, and growing it there would push most of it off the
-    /// desktop.
+    /// screen, otherwise centred in the work area of the monitor the widget
+    /// currently lives on. Coming back from the widget the window is still
+    /// parked in the corner the widget was in, and growing it there would push
+    /// most of it off the desktop.
     fn main_position(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
         let size = self
             .cfg
@@ -321,15 +363,22 @@ impl Panel {
             .unwrap_or(MAIN_SIZE);
         // 窗口坐标是跨显示器的绝对坐标，不能拿"当前显示器尺寸"去夹：一块
         // 1920 宽的副屏上的窗口在 x=2000，夹回 [0, 1800] 会把它拽回主屏。
-        // 只有整个窗口都跑出虚拟桌面（原来那块屏被拔掉了）才回到中央。
+        // 只有标题栏完全跑出所有屏幕（原来那块屏被拔掉了）才回到中央。
         //
-        // 居中必须带上显示器原点：副屏的原点可能是 (1920, 0) 甚至负数，
-        // 只按尺寸算会把窗口放到主屏中央。拿不到显示器矩形时退回旧算法。
-        let centered = match self.monitor_rect {
-            Some(r) => egui::pos2(
-                r.left() + (r.width() - size.x) / 2.0,
-                r.top() + (r.height() - size.y) / 2.0,
-            ),
+        // 居中必须带上工作区原点：副屏的原点可能是 (1920, 0) 甚至负数，
+        // 只按尺寸算会把窗口放到主屏中央。拿不到工作区时退回旧算法。
+        let centered = match self.work_area {
+            Some(r) => {
+                // 窗口可能比当前工作区还大（换了更小的屏幕）。纯居中会把
+                // 标题栏推到屏幕上沿之外，用户既抓不到也拖不回来；至少把
+                // 卡片顶部夹在工作区内，保证标题栏可达。
+                let min_y = r.top() - mini::SHADOW_PAD;
+                let max_y = (r.bottom() - mini::SHADOW_PAD - chrome::BAR_H).max(min_y);
+                egui::pos2(
+                    r.left() + (r.width() - size.x) / 2.0,
+                    (r.top() + (r.height() - size.y) / 2.0).clamp(min_y, max_y),
+                )
+            }
             None => {
                 let monitor = ctx.input(|i| i.viewport().monitor_size)?;
                 egui::pos2((monitor.x - size.x) / 2.0, (monitor.y - size.y) / 2.0)
@@ -464,32 +513,32 @@ impl Panel {
         self.taskbar_hidden = Some(hide);
     }
 
-    /// 记住窗口当前在哪块显示器上。`main_position` / `place_mini` 的居中与
-    /// 贴边都要用到显示器原点，而 egui 的 viewport 只给尺寸。
-    fn track_monitor(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
-        let Some(window) = frame.winit_window() else {
-            return;
-        };
-        if let Some(rect) = monitor_rect_of(window, ctx.pixels_per_point()) {
-            self.monitor_rect = Some(rect);
+    /// 记住窗口当前所在显示器的工作区。`main_position` / `place_mini` 的
+    /// 居中与贴边都要用到它，而 egui 的 viewport 只给尺寸。
+    fn track_work_area(&mut self, ctx: &egui::Context) {
+        if let Some(hwnd) = self.hwnd {
+            if let Some(rect) = work_area_of(hwnd, ctx.pixels_per_point()) {
+                self.work_area = Some(rect);
+            }
         }
     }
 
-    /// 浮窗按内容长高后，如果底边越过当前显示器就整体上移。
+    /// 浮窗按内容长高后，如果底边越过工作区就整体上移。
     ///
     /// 首次启动时设备列表由后台扫描补齐，卡片会在窗口已经摆好之后才长高；
-    /// 不夹一下，绑定在右下角的浮窗就会往屏幕外长出一截。
+    /// 不夹一下，绑定在右下角的浮窗就会压到任务栏上。
     fn keep_mini_on_screen(&self, ctx: &egui::Context, h: f32) {
-        let Some(area) = self.monitor_rect else {
+        let Some(area) = self.work_area else {
             return;
         };
         let Some(r) = ctx.input(|i| i.viewport().outer_rect) else {
             return;
         };
+        let edge = mini_edge_inset();
         let size = mini::window_size(mini::WIDTH, h);
-        let overflow = (r.top() + size.y) - (area.bottom() - 8.0);
+        let overflow = (r.top() + size.y) - (area.bottom() - edge);
         if overflow > 0.0 {
-            let y = (r.top() - overflow).max(area.top() + 8.0);
+            let y = (r.top() - overflow).max(area.top() + edge);
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(r.left(), y)));
         }
     }
@@ -505,16 +554,17 @@ impl Panel {
         ctx.request_repaint();
     }
 
-    /// First run with the widget: park it near the bottom-right corner of the
-    /// screen, where a status card does not cover anything the user is doing.
+    /// First run with the widget: park its visible card near the bottom-right
+    /// corner of the work area, where it does not cover anything the user is
+    /// doing and does not sit on top of the taskbar.
     fn place_mini(&mut self, ctx: &egui::Context) {
         if self.mini_placed || self.cfg.mini_pos.is_some() {
             self.mini_placed = true;
             return;
         }
-        // 和主窗口一样，锚点要带显示器原点：只在主屏右下角摆浮窗，在
+        // 和主窗口一样，锚点要带工作区原点：只在主屏右下角摆浮窗，在
         // 多屏机器上会把它放到离用户当前屏幕很远的地方。
-        let area = self.monitor_rect.or_else(|| {
+        let area = self.work_area.or_else(|| {
             ctx.input(|i| i.viewport().monitor_size)
                 .map(|m| egui::Rect::from_min_size(egui::Pos2::ZERO, m))
         });
@@ -522,9 +572,12 @@ impl Panel {
             return;
         };
         let h = mini::window_size(mini::WIDTH, self.mini_height());
+        // 贴边量按可见卡片算：窗口四周的透明投影不计入边距，否则卡片
+        // 看起来会比 MINI_MARGIN 更往里缩。
+        let edge = mini_edge_inset();
         let pos = egui::pos2(
-            (area.right() - h.x - MINI_MARGIN).max(area.left() + MINI_MARGIN),
-            (area.bottom() - h.y - MINI_MARGIN * 3.0).max(area.top() + MINI_MARGIN),
+            (area.right() - h.x - edge).max(area.left() + edge),
+            (area.bottom() - h.y - edge).max(area.top() + edge),
         );
         self.cfg.mini_pos = Some([pos.x, pos.y]);
         self.mini_placed = true;
@@ -545,6 +598,21 @@ impl Panel {
             self.cfg.mini_pos = Some(pos);
             self.save();
         }
+    }
+
+    /// 显示器布局变化后把窗口搬回当前屏幕：主界面居中，浮窗回到工作区右下角。
+    fn reset_window_position(&mut self, ctx: &egui::Context) {
+        self.cfg.main_pos = None;
+        self.cfg.mini_pos = None;
+        self.save();
+        match self.cfg.mode {
+            RunMode::Desktop => self.apply_shell(ctx),
+            RunMode::Mini => {
+                self.mini_placed = false;
+                self.place_mini(ctx);
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -590,11 +658,18 @@ impl Panel {
 
     fn open_config(&mut self, id: &DeviceId) {
         if self.manager.entry(id).is_some() {
-            self.settings_open = false;
             self.page_entered = Instant::now();
             // 换设备后旧设备的失败原因与新页面无关，直接不展示。
             self.err_toast = None;
             self.route = Route::Config(id.clone());
+        }
+    }
+
+    fn open_settings(&mut self) {
+        if !matches!(self.route, Route::Settings) {
+            self.page_entered = Instant::now();
+            self.err_toast = None;
+            self.route = Route::Settings;
         }
     }
 
@@ -698,177 +773,226 @@ impl Panel {
         }
     }
 
-    /// 设置弹层沿用共用色板与字重，应用行为保持原有处理入口。
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-        let p = theme::palette(self.cfg.theme);
-        let mut close = false;
-        let viewport_h = ctx.input(|i| i.viewport().inner_rect.map_or(720.0, |rect| rect.height()));
-        // 弹层必须一次给出确定高度：egui 的 Window 默认按 420 高起版，里面的
-        // ScrollArea 只在既有高度里滚动，面板就会永远停在 420，下方内容被裁掉
-        // 且滚不到头。这里按"标题栏以下到卡片底边"的空间定高，滚动区填满剩余。
-        let panel_h = (viewport_h - SETTINGS_TOP - mini::SHADOW_PAD - 12.0).clamp(340.0, 620.0);
-        egui::Window::new("设置")
-            // egui's own title bar paints a grey band that fights the card
-            // styling, so the popover gets a hand-drawn header instead.
-            .title_bar(false)
-            .resizable(false)
-            .collapsible(false)
-            .anchor(Align2::RIGHT_TOP, [-(mini::SHADOW_PAD + 8.0), SETTINGS_TOP])
-            .fixed_size(vec2(SETTINGS_W + 2.0 * SETTINGS_PAD as f32, panel_h))
-            .frame(
-                egui::Frame::new()
-                    .fill(p.card_top)
-                    .stroke(Stroke::new(1.0, theme::alpha(p.border, 170)))
-                    .corner_radius(CornerRadius::same(CARD_RADIUS))
-                    .inner_margin(Margin::same(SETTINGS_PAD))
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 6],
-                        blur: 20,
-                        spread: 0,
-                        color: Color32::from_black_alpha(if p.dark { 90 } else { 26 }),
-                    }),
-            )
-            .show(ctx, |ui| {
-                ui.set_width(SETTINGS_W);
-                split_row(
-                    ui,
+    /// 设置页：左分组导航、右内容，和配置页共用同一套两栏外壳。系统级
+    /// 设置单独成组，不再和应用自身的行为挤在同一列里。
+    fn settings_page(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &'static theme::Palette) {
+        // 页面身份由标题栏承担（见 desktop_ui 的 title/subtitle），内容区
+        // 不再重复同名标题。
+        let scanning = self.manager.is_scanning();
+        let device_count = self.manager.list().len();
+
+        if ui.available_width() >= SETTINGS_TWO_COL_MIN {
+            let body_h = ui.available_height();
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(SETTINGS_RAIL_W, body_h),
+                    Layout::top_down(Align::Min),
                     |ui| {
-                        if close_button(ui, p) {
-                            close = true;
-                        }
-                    },
-                    |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(theme::heading("设置", theme::text::SUBTITLE, p.text));
-                            ui.label(theme::meta("外观、应用行为与 Windows 指针", p.dim));
-                        });
+                        ui.set_width(SETTINGS_RAIL_W);
+                        self.settings_rail(ui, p);
                     },
                 );
-                ui.add_space(14.0);
-                divider(ui, p);
-                ui.add_space(12.0);
+                ui.add_space(18.0);
+                let right_w = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    Vec2::new(right_w, body_h),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(right_w);
+                        // 只有内容列滚动：分组导航与版本号始终留在原地。
+                        // 分组各记各的滚动位置，切换后不会停在上一个分组
+                        // 滚到一半的空白处。
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .id_salt(("settings-scroll", self.settings_section as u8))
+                            .show(ui, |ui| {
+                                self.settings_content(ui, ctx, p, scanning, device_count);
+                                ui.add_space(8.0);
+                            });
+                    },
+                );
+            });
+        } else {
+            // 窄窗口退回单列：分组变成一行胶囊，内容接在下面。
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .id_salt(("settings-scroll", self.settings_section as u8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for section in SettingsSection::ALL {
+                            if chip(ui, p, section.title(), self.settings_section == section)
+                                .clicked()
+                            {
+                                self.settings_section = section;
+                            }
+                        }
+                    });
+                    ui.add_space(14.0);
+                    self.settings_content(ui, ctx, p, scanning, device_count);
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new(concat!("PeriphHub ", env!("CARGO_PKG_VERSION")))
+                            .size(11.0)
+                            .color(p.subtle),
+                    );
+                });
+        }
+    }
 
-                // 标题、关闭按钮与外边距由固定尺寸的弹层让出，滚动区直接填满
-                // 剩余高度；auto_shrink 关掉纵向收缩，否则内容不足时会留白。
-                let scanning = self.manager.is_scanning();
-                let device_count = self.manager.list().len();
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        section_heading(ui, p, "外观", "选择更适合当前环境的界面主题");
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let dark = self.cfg.theme == ThemeMode::Dark;
-                            if chip(ui, p, "深色模式", dark).clicked() && !dark {
-                                self.toggle_theme(ctx);
+    fn settings_rail(&mut self, ui: &mut Ui, p: &theme::Palette) {
+        for section in SettingsSection::ALL {
+            let selected = self.settings_section == section;
+            if settings_nav(ui, p, section.title(), section.hint(), selected) {
+                self.settings_section = section;
+            }
+        }
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(concat!("版本 ", env!("CARGO_PKG_VERSION")))
+                    .size(11.0)
+                    .color(p.subtle),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("PeriphHub")
+                    .size(11.0)
+                    .strong()
+                    .color(p.subtle),
+            );
+        });
+    }
+
+    fn settings_content(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        p: &theme::Palette,
+        scanning: bool,
+        device_count: usize,
+    ) {
+        match self.settings_section {
+            SettingsSection::Appearance => {
+                card(ui, p, |ui| {
+                    section_heading(ui, p, "外观", "选择更适合当前环境的界面主题");
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let dark = self.cfg.theme == ThemeMode::Dark;
+                        if chip(ui, p, "深色模式", dark).clicked() && !dark {
+                            self.toggle_theme(ctx);
+                        }
+                        if chip(ui, p, "浅色模式", !dark).clicked() && dark {
+                            self.toggle_theme(ctx);
+                        }
+                    });
+                });
+            }
+            SettingsSection::Behavior => {
+                card(ui, p, |ui| {
+                    section_heading(ui, p, "应用行为", "管理启动方式和后台运行状态");
+                    ui.add_space(12.0);
+                    toggle_row(
+                        ui,
+                        p,
+                        "开机自启动",
+                        "登录 Windows 后自动启动，开机就能看到设备电量",
+                        "常驻开启",
+                        self.autostart,
+                        |v| {
+                            self.set_autostart(ctx, v);
+                        },
+                    );
+                    ui.add_space(10.0);
+                    divider(ui, p);
+                    ui.add_space(10.0);
+                    split_row(
+                        ui,
+                        |ui| {
+                            if chip(ui, p, "收起为浮窗", false).clicked() {
+                                self.go_mini(ctx);
                             }
-                            if chip(ui, p, "浅色模式", !dark).clicked() && dark {
-                                self.toggle_theme(ctx);
-                            }
-                        });
-                        ui.add_space(14.0);
-                        divider(ui, p);
-                        ui.add_space(12.0);
-                        section_heading(ui, p, "应用行为", "管理启动方式和后台运行状态");
-                        ui.add_space(8.0);
-                        let autostart = self.autostart;
-                        toggle_row(
-                            ui,
-                            p,
-                            "开机自启动",
-                            "登录 Windows 后自动启动，开机就能看到设备电量",
-                            "常驻开启",
-                            autostart,
-                            |v| {
-                                self.set_autostart(ctx, v);
-                            },
-                        );
-                        ui.add_space(10.0);
-                        split_row(
-                            ui,
-                            |ui| {
-                                if chip(ui, p, "收起为浮窗", false).clicked() {
-                                    self.go_mini(ctx);
-                                }
-                            },
-                            |ui| {
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 1.0;
-                                    ui.label(RichText::new("桌面浮窗").size(13.0).color(p.text));
-                                    ui.label(
-                                        RichText::new("变成小窗常驻桌面，关闭主界面也能看到状态")
-                                            .size(12.0)
-                                            .color(p.dim),
-                                    );
-                                });
-                            },
-                        );
-                        ui.add_space(14.0);
-                        divider(ui, p);
-                        ui.add_space(12.0);
-                        split_row(
-                            ui,
-                            |ui| {
-                                ui.add_enabled_ui(!scanning, |ui| {
-                                    if chip(
-                                        ui,
-                                        p,
-                                        if scanning {
-                                            "扫描中…"
-                                        } else {
-                                            "重新扫描"
-                                        },
-                                        false,
-                                    )
-                                    .on_hover_text("重新检测已连接的外设（F5 或 Ctrl+R）")
-                                    .clicked()
-                                    {
-                                        self.do_rescan(ctx);
-                                    }
-                                });
-                            },
-                            |ui| {
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 1.0;
-                                    ui.label(RichText::new("设备检测").size(13.0).color(p.text));
-                                    ui.label(
-                                        RichText::new(format!("当前已发现 {device_count} 台设备"))
-                                            .size(12.0)
-                                            .color(p.dim),
-                                    );
-                                });
-                            },
-                        );
-                        ui.add_space(14.0);
-                        config_page::system_card(ui, p);
-                        ui.add_space(14.0);
-                        divider(ui, p);
-                        ui.add_space(8.0);
-                        split_row(
-                            ui,
-                            |ui| {
+                        },
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(RichText::new("桌面浮窗").size(13.0).color(p.text));
                                 ui.label(
-                                    RichText::new(concat!("版本 ", env!("CARGO_PKG_VERSION")))
-                                        .size(11.0)
+                                    RichText::new("变成小窗常驻桌面，关闭主界面也能看到状态")
+                                        .size(12.0)
                                         .color(p.dim),
                                 );
-                            },
-                            |ui| {
+                            });
+                        },
+                    );
+                    ui.add_space(10.0);
+                    divider(ui, p);
+                    ui.add_space(10.0);
+                    split_row(
+                        ui,
+                        |ui| {
+                            if chip(ui, p, "重置位置", false)
+                                .on_hover_text("显示器布局变化后把窗口移回当前屏幕")
+                                .clicked()
+                            {
+                                self.reset_window_position(ctx);
+                            }
+                        },
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(RichText::new("窗口位置").size(13.0).color(p.text));
                                 ui.label(
-                                    RichText::new("PeriphHub").size(11.0).strong().color(p.dim),
+                                    RichText::new("主界面居中、浮窗回到右下角")
+                                        .size(12.0)
+                                        .color(p.dim),
                                 );
-                            },
-                        );
-                    });
-            });
-        if close {
-            self.settings_open = false;
+                            });
+                        },
+                    );
+                });
+            }
+            SettingsSection::Devices => {
+                card(ui, p, |ui| {
+                    section_heading(ui, p, "设备检测", "重新检测已连接的外设");
+                    ui.add_space(12.0);
+                    split_row(
+                        ui,
+                        |ui| {
+                            ui.add_enabled_ui(!scanning, |ui| {
+                                if chip(
+                                    ui,
+                                    p,
+                                    if scanning {
+                                        "扫描中…"
+                                    } else {
+                                        "重新扫描"
+                                    },
+                                    false,
+                                )
+                                .on_hover_text("重新检测已连接的外设（F5 或 Ctrl+R）")
+                                .clicked()
+                                {
+                                    self.do_rescan(ctx);
+                                }
+                            });
+                        },
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(RichText::new("当前已发现").size(13.0).color(p.text));
+                                ui.label(
+                                    RichText::new(format!("{device_count} 台设备"))
+                                        .size(12.0)
+                                        .color(p.dim),
+                                );
+                            });
+                        },
+                    );
+                });
+            }
+            // 系统指针改的是 Windows 全局设置，单独一组，语义上不与应用
+            // 自身的行为混排；卡片内已带“换台电脑不会跟着走”的说明。
+            SettingsSection::System => config_page::system_card(ui, p),
         }
     }
 
@@ -926,29 +1050,54 @@ impl Panel {
     }
 }
 
-/// Small round close affordance for the settings popover.
-fn close_button(ui: &mut Ui, p: &theme::Palette) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
-    let t = ui
-        .ctx()
-        .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
-    if t > 0.001 {
+/// 设置页左侧的分组入口：选中态用强调色底和左侧竖条，悬停只做轻微提亮。
+fn settings_nav(ui: &mut Ui, p: &theme::Palette, title: &str, hint: &str, selected: bool) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), egui::Sense::click());
+    let hover =
+        ui.ctx()
+            .animate_value_with_time(resp.id, if resp.hovered() { 1.0 } else { 0.0 }, 0.08);
+    if selected {
         ui.painter().rect_filled(
             rect,
-            CornerRadius::same(7),
-            theme::alpha(p.track, (t * 255.0) as u8),
+            CornerRadius::same(10),
+            theme::alpha(p.accent, if p.dark { 30 } else { 18 }),
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 7.0, rect.center().y - 9.0),
+                egui::vec2(3.0, 18.0),
+            ),
+            CornerRadius::same(2),
+            p.accent,
+        );
+    } else if hover > 0.001 {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(10),
+            theme::alpha(p.chip_bg, (hover * 255.0) as u8),
         );
     }
-    let c = rect.center();
-    let stroke = Stroke::new(1.3, p.dim.gamma_multiply(0.7 + t * 0.3));
-    for (a, b) in [
-        (egui::vec2(-3.4, -3.4), egui::vec2(3.4, 3.4)),
-        (egui::vec2(3.4, -3.4), egui::vec2(-3.4, 3.4)),
-    ] {
-        ui.painter().line_segment([c + a, c + b], stroke);
-    }
+    // 文字直接画在已分配的矩形里：若用子 Ui 放 Label，Label 的 hover 会
+    // 盖住整行响应，鼠标移到文字上时悬停底色反而消失。
+    let color = if selected { p.text } else { p.dim };
+    let title_gal =
+        ui.painter()
+            .layout_no_wrap(title.to_owned(), egui::FontId::proportional(13.0), color);
+    let hint_gal =
+        ui.painter()
+            .layout_no_wrap(hint.to_owned(), egui::FontId::proportional(11.0), p.subtle);
+    let x = rect.left() + 16.0;
+    let y = rect.center().y - (title_gal.size().y + 2.0 + hint_gal.size().y) / 2.0;
+    ui.painter()
+        .galley(egui::pos2(x, y), title_gal.clone(), color);
+    ui.painter().galley(
+        egui::pos2(x, y + title_gal.size().y + 2.0),
+        hint_gal,
+        p.subtle,
+    );
     if resp.has_focus() {
-        focus_ring(ui, rect, p, 7);
+        focus_ring(ui, rect, p, 10);
     }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -974,7 +1123,7 @@ impl eframe::App for Panel {
         }
         self.strip_window_frame();
         sync_hit_margin(ctx, self.cfg.mode);
-        self.track_monitor(frame, ctx);
+        self.track_work_area(ctx);
         self.drain_tray(ctx);
         self.sync_taskbar(frame);
         // 浮窗只读电量；主页摘要 20 秒一刷；配置页才需要 4 秒级全量读，
@@ -1006,20 +1155,40 @@ impl eframe::App for Panel {
                 self.mini_clamp = false;
                 self.keep_mini_on_screen(ctx, self.mini_height());
             }
+            let placed_now = !self.mini_placed;
             self.place_mini(ctx);
-            if ctx.input(|i| i.pointer.any_released()) {
-                self.remember_mini_pos(ctx);
-            }
             // The widget is exactly as tall as its content; a device dropping
             // off the bus should shrink it rather than leave a gap.
             let h = self.mini_height();
-            if (h - self.mini_h).abs() > 0.5 {
+            let resized = (h - self.mini_h).abs() > 0.5;
+            if resized {
                 let size = mini::window_size(mini::WIDTH, h);
+                // 浮窗默认待在屏幕下半区：保留底边，让卡片向上长。否则启动后
+                // 设备陆续上线，窗口会一路向下顶进任务栏，再被夹回来，看起来
+                // 就是位置自己跳了一下。
+                if !placed_now {
+                    if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                        let anchor_bottom =
+                            self.work_area.is_none_or(|a| r.center().y > a.center().y);
+                        if anchor_bottom {
+                            let old = mini::window_size(mini::WIDTH, self.mini_h);
+                            let y = r.top() + (old.y - size.y);
+                            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
+                                r.left(),
+                                y,
+                            )));
+                        }
+                    }
+                }
                 ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(size));
                 ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(size));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
                 self.mini_clamp = true;
                 self.mini_h = h;
+            } else if ctx.input(|i| i.pointer.any_released()) {
+                // 高度刚变过时窗口还在旧位置，这帧记录会把重排前的坐标
+                // 存进配置；跳过一帧，等稳定后再记。
+                self.remember_mini_pos(ctx);
             }
             if animating {
                 Duration::from_millis(140)
@@ -1071,6 +1240,9 @@ impl eframe::App for Panel {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save();
+        // 正常退出走 quit()，这里兜住系统关机等直接结束进程的路径：等采集
+        // 线程把待落盘的档位写完再走。已经收过尾时 entries 为空，立即返回。
+        self.manager.shutdown();
     }
 }
 
@@ -1094,7 +1266,7 @@ impl Panel {
         } else if action.open_settings {
             // 浮窗内直达设置：尤其覆盖默认启动即浮窗、没有设备可点配置页的场景。
             self.show_main(&ctx);
-            self.settings_open = true;
+            self.open_settings();
         } else if action.open_main {
             self.show_main(&ctx);
         } else if action.quit {
@@ -1105,14 +1277,9 @@ impl Panel {
     /// 统一主窗口留白和页面外壳，导航与浮窗切换沿用原有入口。
     fn desktop_ui(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &'static theme::Palette) {
         let ctx = ctx.clone();
-        // Escape unwinds one layer at a time: the settings popover first, then
-        // the configuration page.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.settings_open {
-                self.settings_open = false;
-            } else {
-                self.go_home();
-            }
+        // Escape 与返回箭头同义：设置页和配置页都在一个层级上，直接回工作台。
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !matches!(self.route, Route::Home) {
+            self.go_home();
         }
         // Alt+← and the mouse back button both mean "leave this page".
         let back_pressed = ctx.input(|i| {
@@ -1140,6 +1307,10 @@ impl Panel {
                     )
                 })
                 .unwrap_or_else(|| ("设备已移除".to_string(), "返回设备列表".to_string())),
+            Route::Settings => (
+                "设置".to_string(),
+                "外观、应用行为与 Windows 指针".to_string(),
+            ),
         };
 
         // 主界面外壳与浮窗同款：窗口四周留透明边距，圆角卡片 + 手绘多层
@@ -1186,7 +1357,11 @@ impl Panel {
             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         }
         if bar.settings {
-            self.settings_open = !self.settings_open;
+            if matches!(self.route, Route::Settings) {
+                self.go_home();
+            } else {
+                self.open_settings();
+            }
         }
         if bar.toggle_theme {
             self.toggle_theme(&ctx);
@@ -1242,11 +1417,11 @@ impl Panel {
                             });
                     }
                     Route::Config(id) => self.show_config_page(ui, id, p),
+                    Route::Settings => self.settings_page(ui, &ctx, p),
                 }
             });
 
         chrome::resize_handles(ui, card, !maximized);
-        self.settings_window(&ctx);
     }
 }
 
@@ -1256,68 +1431,130 @@ fn dpi_baseline_key(info: &DeviceInfo) -> String {
     format!("{}|{}", info.id.0, info.model)
 }
 
-/// 窗口当前所在显示器在 egui 坐标里的矩形（含原点）。
+/// 窗口所在显示器的工作区（已扣掉任务栏）在 egui 坐标里的矩形（含原点）。
 ///
-/// winit 给的是物理像素，egui 的窗口坐标是点：按当前缩放换算，和
-/// `virtual_screen` 保持同一套坐标，才能拿它算居中。
-fn monitor_rect_of(window: &winit::window::Window, scale: f32) -> Option<egui::Rect> {
-    let monitor = window.current_monitor()?;
-    let pos = monitor.position();
-    let size = monitor.size();
-    let scale = scale.max(0.1);
-    Some(egui::Rect::from_min_size(
-        egui::pos2(pos.x as f32 / scale, pos.y as f32 / scale),
-        vec2(size.width as f32 / scale, size.height as f32 / scale),
-    ))
-}
-
-/// 整个虚拟桌面（所有显示器合并后的区域），单位与 egui 的窗口坐标一致（点）。
-///
-/// egui 只暴露"窗口所在那块显示器"的尺寸，判断一个坐标是否还在屏幕上够用不了
-/// 多屏场景，所以直接问系统要虚拟桌面的物理范围再换算成点。
-fn virtual_screen(ctx: &egui::Context) -> Option<egui::Rect> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
+/// 不能用整块显示器矩形：任务栏占据的高度仍算在屏幕里，主窗口会偏下、
+/// 浮窗贴到底部时会压住任务栏。系统返回的是物理像素，egui 的窗口坐标是
+/// 点，按当前缩放换算后和 `monitor_work_areas` 保持同一套坐标。
+fn work_area_of(hwnd: isize, scale: f32) -> Option<egui::Rect> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
 
-    // SAFETY: 纯查询，无参数前置条件；返回值 <= 0 表示读不到。
-    let (x, y, w, h) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
-    };
-    if w <= 0 || h <= 0 {
+    if hwnd == 0 {
         return None;
     }
-    let scale = ctx.pixels_per_point().max(0.1);
-    // 混合 DPI 的多屏环境里各屏缩放不同，这里只有一个 scale（当前窗口所在
-    // 显示器的），换算出的虚拟桌面边界在其它屏上会有偏差。`is_reachable`
-    // 用它做的是"窗口是否还有一部分留在桌面上"的粗判并留了抓取余量，偏差
-    // 可容忍；宁可保守——误判为可达只是不搬窗口，误判为不可达会把还能用
-    // 的坐标强行拽回屏幕中央。
+    let empty = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        rcMonitor: empty,
+        rcWork: empty,
+        dwFlags: 0,
+    };
+    // SAFETY: hwnd 是本进程的窗口；GetMonitorInfoW 只写入调用方提供的
+    // MONITORINFO，cbSize 已按结构体实际大小填写。
+    let ok = unsafe {
+        GetMonitorInfoW(
+            MonitorFromWindow(hwnd as *mut core::ffi::c_void, MONITOR_DEFAULTTONEAREST),
+            &mut info,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let rc = info.rcWork;
+    let scale = scale.max(0.1);
     Some(egui::Rect::from_min_size(
-        egui::pos2(x as f32 / scale, y as f32 / scale),
-        vec2(w as f32 / scale, h as f32 / scale),
+        egui::pos2(rc.left as f32 / scale, rc.top as f32 / scale),
+        vec2(
+            (rc.right - rc.left) as f32 / scale,
+            (rc.bottom - rc.top) as f32 / scale,
+        ),
     ))
 }
 
-/// 窗口是否还有一部分留在屏幕上：至少留出一条能抓住标题栏的区域，否则用户
-/// 既拖不动也看不到。读不到屏幕信息时一律当作可见，宁可不搬别乱搬。
+/// 每块显示器的工作区（已扣掉任务栏），单位与 egui 的窗口坐标一致（点）。
+///
+/// 不能用虚拟桌面的外接矩形：多屏按 L 形/上下错位排布时，外接矩形里也有
+/// 不属于任何显示器的空白区域，窗口停在那里其实看不见也抓不到。
+fn monitor_work_areas(scale: f32) -> Vec<egui::Rect> {
+    use windows_sys::Win32::Foundation::{BOOL, RECT, TRUE};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _clip: *mut RECT,
+        data: isize,
+    ) -> BOOL {
+        let out = &mut *(data as *mut Vec<RECT>);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            out.push(info.rcWork);
+        }
+        TRUE
+    }
+
+    let mut physical: Vec<RECT> = Vec::new();
+    // SAFETY: 回调只把结果推进调用方提供的 Vec；枚举同步执行，Vec 活到
+    // EnumDisplayMonitors 返回之后。
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &mut physical as *mut _ as isize,
+        );
+    }
+    let scale = scale.max(0.1);
+    physical
+        .into_iter()
+        .map(|r| {
+            egui::Rect::from_min_max(
+                egui::pos2(r.left as f32 / scale, r.top as f32 / scale),
+                egui::pos2(r.right as f32 / scale, r.bottom as f32 / scale),
+            )
+        })
+        .collect()
+}
+
+/// 标题栏是否还有一段落在某块显示器的可用区域内。
+///
+/// 外框四周的 `SHADOW_PAD` 是透明投影区，真正可见、可拖动的标题栏从卡片
+/// 顶部才开始；拿外框判断会把“只剩阴影在屏内”当成可达，也会把贴着屏幕
+/// 顶部的可见标题栏误判成不可达。
 fn is_reachable(ctx: &egui::Context, pos: egui::Pos2, size: Vec2) -> bool {
     const GRAB_W: f32 = 120.0;
-    const GRAB_H: f32 = 80.0;
+    // 标题栏至少露出这么多高度才算抓得住；完全移出屏幕不算可达。
+    const GRAB_H: f32 = 8.0;
 
-    let Some(screen) = virtual_screen(ctx) else {
+    let areas = monitor_work_areas(ctx.pixels_per_point());
+    if areas.is_empty() {
         return true;
-    };
-    pos.x + size.x > screen.left() + GRAB_W
-        && pos.x < screen.right() - GRAB_W
-        && pos.y + size.y > screen.top()
-        && pos.y < screen.bottom() - GRAB_H
+    }
+    // 保存的位置只出现在非最大化形态，两种外壳都留了同一圈投影边距。
+    let pad = mini::SHADOW_PAD;
+    let card = egui::Rect::from_min_size(
+        pos + vec2(pad, pad),
+        vec2((size.x - 2.0 * pad).max(0.0), (size.y - 2.0 * pad).max(0.0)),
+    );
+    let bar = egui::Rect::from_min_max(
+        card.min,
+        egui::pos2(card.right(), card.top() + chrome::BAR_H.min(card.height())),
+    );
+    areas.iter().any(|area| {
+        let hit = bar.intersect(*area);
+        hit.width() >= GRAB_W && hit.height() >= GRAB_H
+    })
 }
 
 /// Best-effort compositor setup for the frameless window.

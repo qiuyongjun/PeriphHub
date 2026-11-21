@@ -6,7 +6,7 @@ use eframe::egui::{
 use crate::theme::{alpha, heading, Palette};
 use crate::ui::widgets::{activated, focus_ring, mix, CARD_RADIUS};
 
-/// 标题栏高度。设置弹层要靠它让开标题栏，两处共用一个值。
+/// 标题栏高度。
 pub const BAR_H: f32 = 50.0;
 
 pub struct Bar<'a> {

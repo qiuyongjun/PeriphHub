@@ -83,7 +83,7 @@ fn single_instance() -> bool {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOW,
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -110,7 +110,12 @@ fn single_instance() -> bool {
         let title = wide("PeriphHub");
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
         if !hwnd.is_null() {
-            ShowWindow(hwnd, SW_SHOW);
+            // 最小化时 SW_SHOW 只保持原状态，窗口不会回来；必须先还原。
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                ShowWindow(hwnd, SW_SHOW);
+            }
             SetForegroundWindow(hwnd);
         }
         false

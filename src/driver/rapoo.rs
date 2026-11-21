@@ -8,23 +8,14 @@
 //! verified on real hardware belong in `PROFILES`. See `docs/protocol.md`.
 
 use std::cell::Cell;
-use std::ffi::c_void;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HidD_GetAttributes, HidD_GetInputReport, HidD_SetOutputReport, HIDD_ATTRIBUTES,
-};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
-
+use super::transport::{BlockingHid, HidTransport};
 use super::{Caps, Cmd, Driver, Limits, Snapshot};
 
 const RID: u8 = 0xBA;
+const REPORT_LEN: usize = 32;
 
 /// 一个经过真机验证的 Rapoo 型号的 EEPROM 布局与能力。
 ///
@@ -206,7 +197,7 @@ fn aligned_blocks(addr: u32, len: usize) -> impl Iterator<Item = (u32, usize, us
 }
 
 pub struct Rapoo {
-    handle: HANDLE,
+    io: Box<dyn HidTransport>,
     layout: &'static RapooLayout,
     /// Last response the device handed us; its repeat is what a stale read
     /// returns after a command the device swallowed.
@@ -225,55 +216,29 @@ impl Rapoo {
         layout: &'static RapooLayout,
         limits: Limits,
     ) -> Result<Rapoo, String> {
-        let mut path = path.to_vec();
-        if path.last() != Some(&0) {
-            path.push(0);
+        let io = BlockingHid::open(path, RID, REPORT_LEN)?;
+        // 布局是按型号验证的。VID/PID 不在白名单里就拒绝打开，避免把
+        // VT1 Pro 的地址写到另一款鼠标的 EEPROM 上。这只能挡住"未验证的
+        // PID 复用了 VT1 布局"；同一个接收器换鼠标时协议还没有可靠的
+        // 型号名可查（0xB0 接收器信息未细究），那一层仍要靠真机确认。
+        let (vid, pid) = io.ids().ok_or_else(|| "读取设备标识失败".to_string())?;
+        if !layout.supports(vid, pid) {
+            return Err(format!(
+                "{} 的寄存器布局未覆盖该设备（{:04X}:{:04X}）",
+                layout.model, vid, pid
+            ));
         }
-        unsafe {
-            let h = CreateFileW(
-                path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            );
-            if h == INVALID_HANDLE_VALUE {
-                return Err(format!(
-                    "打开设备失败（错误码 {}）",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            // 布局是按型号验证的。VID/PID 不在白名单里就拒绝打开，避免把
-            // VT1 Pro 的地址写到另一款鼠标的 EEPROM 上。这只能挡住"未验证的
-            // PID 复用了 VT1 布局"；同一个接收器换鼠标时协议还没有可靠的
-            // 型号名可查（0xB0 接收器信息未细究），那一层仍要靠真机确认。
-            let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
-            attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
-            if HidD_GetAttributes(h, &mut attr) == 0 {
-                CloseHandle(h);
-                return Err("读取设备标识失败".into());
-            }
-            if !layout.supports(attr.VendorID, attr.ProductID) {
-                CloseHandle(h);
-                return Err(format!(
-                    "{} 的寄存器布局未覆盖该设备（{:04X}:{:04X}）",
-                    layout.model, attr.VendorID, attr.ProductID
-                ));
-            }
-            Ok(Rapoo {
-                handle: h,
-                layout,
-                last: Cell::new([0u8; 32]),
-                last_read: Cell::new(None),
-                bad_battery: Cell::new(None),
-                limits,
-            })
-        }
+        Ok(Rapoo {
+            io: Box::new(io),
+            layout,
+            last: Cell::new([0u8; 32]),
+            last_read: Cell::new(None),
+            bad_battery: Cell::new(None),
+            limits,
+        })
     }
 
-    fn xfer(&self, frame: &[u8; 32]) -> Result<[u8; 32], String> {
+    fn xfer(&mut self, frame: &[u8; 32]) -> Result<[u8; 32], String> {
         let read = frame[2] == 0xA4;
         let addr = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
         let len = frame[3] as usize;
@@ -281,11 +246,7 @@ impl Rapoo {
         // resent once.
         let budget = if read { 400 } else { 200 };
         for _ in 0..2 {
-            unsafe {
-                if HidD_SetOutputReport(self.handle, frame.as_ptr() as *const c_void, 32) == 0 {
-                    return Err("发送命令失败".into());
-                }
-            }
+            self.io.send(frame)?;
             let prev = self.last.get();
             // 上一次成功应答也是同地址同长度的读：此时"内容没变"是正常
             // 结果，不是过期回放。
@@ -296,11 +257,10 @@ impl Rapoo {
                 if elapsed > Duration::from_millis(budget) {
                     break;
                 }
-                let mut resp = [0u8; 32];
-                resp[0] = RID;
-                if unsafe { HidD_GetInputReport(self.handle, resp.as_mut_ptr() as *mut c_void, 32) }
-                    != 0
-                {
+                if let Ok(Some(resp)) = self.io.recv(Duration::ZERO) {
+                    let Ok(resp) = <[u8; 32]>::try_from(resp) else {
+                        continue;
+                    };
                     match resp[0] {
                         1 => {
                             let settled = elapsed >= Duration::from_millis(40);
@@ -326,24 +286,24 @@ impl Rapoo {
         Err("设备无响应（超时）".into())
     }
 
-    fn read(&self, addr: u32, len: usize) -> Result<Vec<u8>, String> {
+    fn read(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, String> {
         let f = read_frame(addr, len)?;
         let r = self.xfer(&f)?;
         Ok(r[4..4 + len].to_vec())
     }
 
-    fn write_raw(&self, addr: u32, data: &[u8]) -> Result<(), String> {
+    fn write_raw(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
         self.xfer(&write_frame(addr, data)?)?;
         Ok(())
     }
 
-    fn commit(&self) -> Result<(), String> {
+    fn commit(&mut self) -> Result<(), String> {
         self.xfer(&commit_frame())?;
         Ok(())
     }
 
     /// Read-modify-write an arbitrary byte range using aligned 4-byte blocks.
-    fn write_field(&self, addr: u32, data: &[u8]) -> Result<(), String> {
+    fn write_field(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
         let mut done = 0usize;
         for (block, off, n) in aligned_blocks(addr, data.len()) {
             let mut arr = [0u8; 4];
@@ -360,7 +320,7 @@ impl Rapoo {
         Ok(())
     }
 
-    fn write_commit(&self, addr: u32, data: &[u8]) -> Result<(), String> {
+    fn write_commit(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
         self.write_field(addr, data)?;
         self.commit()
     }
@@ -374,7 +334,7 @@ impl Rapoo {
     /// 快照的读应答）。所以这里不能只靠 `xfer` 的接受条件，还要对内容做一
     /// 次校验（`battery_reply`）：连接 flag 或百分比不对就不算数，等接收器
     /// 把真正的应答放进来再问一次。
-    fn battery_level(&self) -> Result<Option<u8>, String> {
+    fn battery_level(&mut self) -> Result<Option<u8>, String> {
         let f = battery_frame();
         let mut r = self.xfer(&f)?;
         if battery_reply(&r, self.layout).is_none() {
@@ -404,7 +364,7 @@ impl Rapoo {
         }
     }
 
-    fn set_flag(&self, bit: u8, disabled: bool) -> Result<(), String> {
+    fn set_flag(&mut self, bit: u8, disabled: bool) -> Result<(), String> {
         let addr = self.layout.debounce_addr;
         let idx = self.layout.flags_offset;
         let mut b = self.read(addr, 4)?;
@@ -418,7 +378,7 @@ impl Rapoo {
 
     /// One re-read per changed block after a burst, never a full snapshot:
     /// every extra round trip is time the user's next click waits for.
-    fn patch(&self, change: Change, s: &mut Snapshot) -> Result<(), String> {
+    fn patch(&mut self, change: Change, s: &mut Snapshot) -> Result<(), String> {
         match change {
             Change::Poll => {
                 let b = self.read(self.layout.poll_addr, 4)?;
@@ -457,18 +417,6 @@ impl Rapoo {
             }
         }
         Ok(())
-    }
-}
-
-// The raw HANDLE is only ever touched by the worker thread that owns this
-// driver, so moving it to that thread is sound.
-unsafe impl Send for Rapoo {}
-
-impl Drop for Rapoo {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.handle);
-        }
     }
 }
 
@@ -614,11 +562,7 @@ impl Driver for Rapoo {
     }
 
     fn link_alive(&self) -> bool {
-        unsafe {
-            let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
-            attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
-            HidD_GetAttributes(self.handle, &mut attr) != 0
-        }
+        self.io.alive()
     }
 }
 
