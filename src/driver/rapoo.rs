@@ -459,8 +459,10 @@ impl Rapoo {
         blocks.insert(self.layout.lod_addr, block(&lm));
         blocks.insert(self.layout.debounce_addr, block(&d));
         // X/Y 两段各 24 字节 = 6 个块；DPI 校验必须同时覆盖两个写入目标。
+        // `as_chunks` 而不是 `chunks_exact(4)`：后者的长度是运行期才知道的，
+        // 1.100 的 clippy 会要求用常量分块（`chunks_exact_to_as_chunks`）。
         for (base, raw) in [(self.layout.dpi_x_addr, &x), (self.layout.dpi_y_addr, &y)] {
-            for (i, chunk) in raw.chunks_exact(4).enumerate() {
+            for (i, chunk) in raw.as_chunks::<4>().0.iter().enumerate() {
                 blocks.insert(base + i as u32 * 4, block(chunk));
             }
         }
