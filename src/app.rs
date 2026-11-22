@@ -1133,7 +1133,11 @@ impl eframe::App for Panel {
             (RunMode::Desktop, Route::Config(_)) => ReadMode::Full,
             (RunMode::Desktop, _) => ReadMode::Summary,
         };
-        self.manager.set_read_mode(read_mode);
+        let focused = match &self.route {
+            Route::Config(id) => Some(id),
+            _ => None,
+        };
+        self.manager.set_read_mode(read_mode, focused);
         if self.manager.poll() {
             // 基线只可能在"刚读到新快照"时出现，跟着 poll 的结果做就够了；
             // 以前每帧都扫一遍设备列表、为每台设备拼一次 key，纯属空转。

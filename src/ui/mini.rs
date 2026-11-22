@@ -435,6 +435,8 @@ fn row(ui: &mut Ui, p: &Palette, entry: &Entry, action: &mut MiniAction) {
     let note = match &entry.state.link {
         Link::Offline(_) => "点击查看离线原因".to_string(),
         Link::Connecting => "正在建立连接".to_string(),
+        // 同步异常只是配置读取失败，连接仍然有效，设备行保留。
+        Link::Online if entry.state.sync.stale => "同步异常 · 显示上次读数".to_string(),
         Link::Online => format!(
             "{} · {}",
             entry.info.brand.to_uppercase(),

@@ -40,6 +40,8 @@ pub fn view(
     let mut action = ViewAction::default();
     let snap = state.snap.clone();
     let ed = state.editor;
+    // 同步异常时仍允许编辑：命令由采集线程排队、合并，等基准配置读回来
+    // 再执行；页面顶部的“同步异常”会说明当前显示的是上次成功的值。
     let writable = info.has_config && !matches!(state.link, Link::Offline(_)) && snap.is_some();
 
     split_row(
@@ -57,15 +59,20 @@ pub fn view(
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(heading("设备配置", text::HEADING, p.text));
                 ui.add_space(3.0);
-                ui.label(
-                    RichText::new(if state.writing {
-                        "正在写入设备…"
-                    } else {
-                        "更改即时写入设备，无需手动保存"
-                    })
-                    .size(12.0)
-                    .color(p.dim),
-                );
+                let status = if state.pending_confirm {
+                    "写入已提交，正在等待设备确认…"
+                } else if state.writing {
+                    "正在写入设备…"
+                } else if state.write_unconfirmed {
+                    "写入结果未确认；已重新读取设备实际配置"
+                } else if state.sync.stale {
+                    // 说过头会比不说更误导：同步异常期间用户可能已经改过值
+                    // （命令还在排队或已被放弃），显示的不一定是设备实际值。
+                    "同步异常；显示值可能不是设备当前配置"
+                } else {
+                    "更改即时写入设备，无需手动保存"
+                };
+                ui.label(RichText::new(status).size(12.0).color(p.dim));
             });
         },
     );
@@ -88,6 +95,21 @@ pub fn view(
         return action;
     }
 
+    if state.sync.stale {
+        notice(
+            ui,
+            p,
+            "同步异常",
+            state
+                .sync
+                .error
+                .as_deref()
+                .unwrap_or("设备暂时没有返回配置，仍会按较低频率重试。"),
+            p.warn,
+        );
+        ui.add_space(14.0);
+    }
+
     let Some(snap) = snap else {
         // A read-only device already got the "只读设备" notice above; a second
         // card saying it has no configuration would just repeat it.
@@ -98,6 +120,12 @@ pub fn view(
         }
         return action;
     };
+
+    // 周期落盘失败是持续状态：设置仍在运行态生效，但断电后会回到旧值。
+    // 放在文档流里而不是 toast，用户滚到哪一行都能看到它还没保存。
+    if let Some(err) = &snap.save_error {
+        notice(ui, p, "尚未保存到设备", err, p.warn);
+    }
 
     if ui.available_width() >= TWO_COL_MIN {
         let body_h = ui.available_height();

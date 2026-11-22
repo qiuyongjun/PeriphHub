@@ -53,6 +53,7 @@ fn snapshot(
         sleep_min,
         line_corr,
         wave_corr,
+        save_error: None,
     }
 }
 

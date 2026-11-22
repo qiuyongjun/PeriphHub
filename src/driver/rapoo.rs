@@ -8,14 +8,17 @@
 //! verified on real hardware belong in `PROFILES`. See `docs/protocol.md`.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use super::transport::{BlockingHid, HidTransport};
-use super::{Caps, Cmd, Driver, Limits, Snapshot};
+use super::{Caps, Cmd, ConfirmResult, Driver, Limits, Snapshot, WriteError, WriteOutcome};
 
 const RID: u8 = 0xBA;
 const REPORT_LEN: usize = 32;
+/// 提交后设备需要的时间。回读、下一条写、全量读和电量查询都要等过它。
+const COMMIT_GUARD: Duration = Duration::from_millis(150);
 
 /// 一个经过真机验证的 Rapoo 型号的 EEPROM 布局与能力。
 ///
@@ -47,6 +50,12 @@ pub struct RapooLayout {
     pub max_stages: u8,
     /// `0xAA` 电量应答里已知的连接 flag。
     pub battery_link_flags: &'static [u8],
+    /// 写应答 `[1]` 的期望值。接收器吞命令时会回放上一条应答，形状对不上就
+    /// 不能算成功；不同型号的这一字节实测过不一样，所以放进布局而不是写死在
+    /// 协议层——否则换型号后所有写入都会静默超时。
+    pub write_ack: u8,
+    /// 提交应答 `[1]` 的期望值（VT1 Pro 实测 `0x7d`）。
+    pub commit_ack: u8,
     pub debounce_press_at: usize,
     pub debounce_release_at: usize,
     pub sleep_at: usize,
@@ -80,6 +89,8 @@ pub const VT1_PRO: RapooLayout = RapooLayout {
     dpi_read_len: 24,
     max_stages: 7,
     battery_link_flags: &[1, 2],
+    write_ack: 0x00,
+    commit_ack: 0x7D,
     debounce_press_at: 0,
     debounce_release_at: 1,
     sleep_at: 2,
@@ -164,6 +175,33 @@ fn battery_frame() -> [u8; 32] {
     frame(0xAA)
 }
 
+/// 期望的应答种类。非读请求不能只看“来了一帧 status=1”：接收器被吞命令
+/// 时会回放上一条应答，统一放行会让提交假成功。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reply {
+    Read,
+    Write,
+    Commit,
+    Battery,
+}
+
+impl Reply {
+    fn accepts(self, resp: &[u8; 32], layout: &RapooLayout) -> bool {
+        match self {
+            // 读的新旧由 `is_fresh` 判定，这里不再加内容约束。
+            Reply::Read => true,
+            // 实测写应答 `01 00 00 00`。读应答的数据从 [4] 开始，[1] 同样
+            // 是 0，所以这条只能挡住形状明显不对的帧，挡不住「回放上一条
+            // 读应答」；真正判定写入有没有落盘的是 confirm() 的整块回读。
+            Reply::Write => resp[1] == layout.write_ack,
+            // 实测提交应答 `01 7d`；回放的读/写应答不会长这样。
+            Reply::Commit => resp[1] == layout.commit_ack,
+            // 电量帧没有可判定新旧的字段，交给 `battery_reply` 校验内容。
+            Reply::Battery => true,
+        }
+    }
+}
+
 /// 判断一条读应答是否算新应答：内容与上一条不同，或请求本身是上一次
 /// 同一地址、同一长度的读取。后者是必要的：寄存器没变时合法应答与
 /// 过期回放逐字节相同，只能靠请求区分（见 docs/protocol.md §3.2）。
@@ -207,6 +245,10 @@ pub struct Rapoo {
     last_read: Cell<Option<(u32, usize)>>,
     /// 上一次记进日志的异常电量字节，用来把重复的 WARN 压成一条。
     bad_battery: Cell<Option<u8>>,
+    /// 提交后的通信保护期限，见 [`COMMIT_GUARD`]。
+    guard_until: Option<Instant>,
+    /// 已提交、等待只读确认的寄存器块（地址与写入值）。
+    pending: Vec<(u32, [u8; 4])>,
     limits: Limits,
 }
 
@@ -234,12 +276,14 @@ impl Rapoo {
             last: Cell::new([0u8; 32]),
             last_read: Cell::new(None),
             bad_battery: Cell::new(None),
+            guard_until: None,
+            pending: Vec::new(),
             limits,
         })
     }
 
-    fn xfer(&mut self, frame: &[u8; 32]) -> Result<[u8; 32], String> {
-        let read = frame[2] == 0xA4;
+    fn xfer(&mut self, frame: &[u8; 32], reply: Reply) -> Result<[u8; 32], String> {
+        let read = reply == Reply::Read;
         let addr = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
         let len = frame[3] as usize;
         // The dongle occasionally drops a command, so unanswered commands are
@@ -268,7 +312,9 @@ impl Rapoo {
                             // for byte. 主判据仍是"与上次不同"；同一地址的
                             // 重复读取允许内容不变，见 `is_fresh`。
                             let fresh = is_fresh(read, &resp, &prev, repeated_read);
-                            if settled && fresh {
+                            // 非读请求还要看应答形状：被吞的提交可能收到
+                            // 上一条读/写应答，不能算成功。
+                            if settled && fresh && reply.accepts(&resp, self.layout) {
                                 self.last.set(resp);
                                 // 写应答也会进 last，它不能作为读的基线。
                                 self.last_read.set(read.then_some((addr, len)));
@@ -288,41 +334,18 @@ impl Rapoo {
 
     fn read(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, String> {
         let f = read_frame(addr, len)?;
-        let r = self.xfer(&f)?;
+        let r = self.xfer(&f, Reply::Read)?;
         Ok(r[4..4 + len].to_vec())
     }
 
     fn write_raw(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
-        self.xfer(&write_frame(addr, data)?)?;
+        self.xfer(&write_frame(addr, data)?, Reply::Write)?;
         Ok(())
     }
 
     fn commit(&mut self) -> Result<(), String> {
-        self.xfer(&commit_frame())?;
+        self.xfer(&commit_frame(), Reply::Commit)?;
         Ok(())
-    }
-
-    /// Read-modify-write an arbitrary byte range using aligned 4-byte blocks.
-    fn write_field(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
-        let mut done = 0usize;
-        for (block, off, n) in aligned_blocks(addr, data.len()) {
-            let mut arr = [0u8; 4];
-            if off == 0 && n == 4 {
-                arr.copy_from_slice(&data[done..done + 4]);
-            } else {
-                let cur = self.read(block, 4)?;
-                arr.copy_from_slice(&cur[..4]);
-                arr[off..off + n].copy_from_slice(&data[done..done + n]);
-            }
-            self.write_raw(block, &arr)?;
-            done += n;
-        }
-        Ok(())
-    }
-
-    fn write_commit(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
-        self.write_field(addr, data)?;
-        self.commit()
     }
 
     /// 电量查询。返回 `None` 表示这一轮拿到的不是有效百分比，调用方保留上
@@ -336,10 +359,10 @@ impl Rapoo {
     /// 把真正的应答放进来再问一次。
     fn battery_level(&mut self) -> Result<Option<u8>, String> {
         let f = battery_frame();
-        let mut r = self.xfer(&f)?;
+        let mut r = self.xfer(&f, Reply::Battery)?;
         if battery_reply(&r, self.layout).is_none() {
             sleep(Duration::from_millis(200));
-            r = self.xfer(&f)?;
+            r = self.xfer(&f, Reply::Battery)?;
         }
         match battery_reply(&r, self.layout) {
             Some(p) => {
@@ -364,74 +387,40 @@ impl Rapoo {
         }
     }
 
-    fn set_flag(&mut self, bit: u8, disabled: bool) -> Result<(), String> {
-        let addr = self.layout.debounce_addr;
-        let idx = self.layout.flags_offset;
-        let mut b = self.read(addr, 4)?;
-        if disabled {
-            b[idx] |= bit;
-        } else {
-            b[idx] &= !bit;
-        }
-        self.write_commit(addr, &b)
-    }
-
-    /// One re-read per changed block after a burst, never a full snapshot:
-    /// every extra round trip is time the user's next click waits for.
-    fn patch(&mut self, change: Change, s: &mut Snapshot) -> Result<(), String> {
-        match change {
-            Change::Poll => {
-                let b = self.read(self.layout.poll_addr, 4)?;
-                s.polling_ms = b[0];
-            }
-            Change::Lm => {
-                let b = self.read(self.layout.lod_addr, 4)?;
-                s.lod = b[0];
-                s.motion = b[1] != 0;
-            }
-            Change::Deb => {
-                // 与 snapshot 一样读 4 字节：同一地址的读取长度必须固定，
-                // 否则内容不变的合法应答会被判成过期（见 `is_fresh`）。
-                let b = self.read(self.layout.debounce_addr, 4)?;
-                s.debounce_press = b[self.layout.debounce_press_at];
-                s.debounce_release = b[self.layout.debounce_release_at];
-                s.sleep_min = b[self.layout.sleep_at];
-                let flags = b[self.layout.flags_offset];
-                s.line_corr = flags & self.layout.line_flag == 0;
-                s.wave_corr = flags & self.layout.wave_flag == 0;
-            }
-            Change::Active => {
-                let b = self.read(self.layout.active_stage_addr, 4)?;
-                s.stage_active = b[0].min(s.stage_count.saturating_sub(1));
-            }
-            Change::Dpi(i) => {
-                // 读整块而不是 2 字节：`write_field` 的读-改-写也读这个块，
-                // 同址同长（4）重复读取才能被 `is_fresh` 当成合法应答。
-                let addr = self.layout.dpi_x_addr + i as u32 * 2;
-                let block = addr & !3;
-                let off = (addr - block) as usize;
-                let b = self.read(block, 4)?;
-                if let Some(d) = s.dpi.get_mut(i as usize) {
-                    *d = u16::from_le_bytes([b[off], b[off + 1]]);
-                }
+    /// 读一个 4 字节对齐块；同一轮合批里只读一次。
+    fn load_block<'a>(
+        &mut self,
+        blocks: &'a mut BTreeMap<u32, ([u8; 4], bool)>,
+        addr: u32,
+    ) -> Result<&'a mut ([u8; 4], bool), String> {
+        use std::collections::btree_map::Entry;
+        match blocks.entry(addr) {
+            Entry::Occupied(slot) => Ok(slot.into_mut()),
+            Entry::Vacant(slot) => {
+                let b = self.read(addr, 4)?;
+                Ok(slot.insert(([b[0], b[1], b[2], b[3]], false)))
             }
         }
-        Ok(())
     }
-}
 
-/// Which block needs re-reading after a command, so we avoid a full snapshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Change {
-    Poll,
-    Lm,
-    Deb,
-    Active,
-    Dpi(u8),
-}
+    /// 把一段连续读取切成 4 字节块。DPI 表按整表读、整表回读，避免相邻块
+    /// 内容相同时被 `is_fresh` 误判成过期回放。
+    fn read_blocks(&mut self, base: u32, len: usize) -> Result<Vec<(u32, [u8; 4])>, String> {
+        let data = self.read(base, len)?;
+        let mut out = Vec::new();
+        for (i, chunk) in data.chunks(4).enumerate() {
+            let mut arr = [0u8; 4];
+            arr[..chunk.len()].copy_from_slice(chunk);
+            out.push((base + i as u32 * 4, arr));
+        }
+        Ok(out)
+    }
 
-impl Driver for Rapoo {
-    fn snapshot(&mut self) -> Result<Snapshot, String> {
+    /// 只读地读一遍完整配置，并返回按 4 字节块索引的原始字节。
+    ///
+    /// `snapshot()` 与 `confirm()` 共用它：确认路径必须只读，不能触发任何
+    /// 补偿写入或落盘。
+    fn read_config(&mut self) -> Result<(Snapshot, BTreeMap<u32, [u8; 4]>), String> {
         let p = self.read(self.layout.poll_addr, 4)?;
         let lm = self.read(self.layout.lod_addr, 4)?;
         let d = self.read(self.layout.debounce_addr, 4)?;
@@ -453,23 +442,45 @@ impl Driver for Rapoo {
             }
         }
 
-        Ok(Snapshot {
-            model: String::new(),
-            caps: self.layout.caps,
-            polling_ms: p[0],
-            lod: lm[0],
-            motion: lm[1] != 0,
-            stage_count,
-            stage_active: x[self.layout.active_stage_at].min(stage_count.saturating_sub(1)),
-            dpi,
-            dpi_min: self.limits.dpi.0,
-            dpi_max: self.limits.dpi.1,
-            debounce_press: d[self.layout.debounce_press_at],
-            debounce_release: d[self.layout.debounce_release_at],
-            sleep_min: d[self.layout.sleep_at],
-            line_corr: d[self.layout.flags_offset] & self.layout.line_flag == 0,
-            wave_corr: d[self.layout.flags_offset] & self.layout.wave_flag == 0,
-        })
+        let block = |b: &[u8]| [b[0], b[1], b[2], b[3]];
+        let mut blocks = BTreeMap::new();
+        blocks.insert(self.layout.poll_addr, block(&p));
+        blocks.insert(self.layout.lod_addr, block(&lm));
+        blocks.insert(self.layout.debounce_addr, block(&d));
+        // X/Y 两段各 24 字节 = 6 个块；DPI 校验必须同时覆盖两个写入目标。
+        for (base, raw) in [(self.layout.dpi_x_addr, &x), (self.layout.dpi_y_addr, &y)] {
+            for (i, chunk) in raw.chunks_exact(4).enumerate() {
+                blocks.insert(base + i as u32 * 4, block(chunk));
+            }
+        }
+
+        Ok((
+            Snapshot {
+                model: String::new(),
+                caps: self.layout.caps,
+                polling_ms: p[0],
+                lod: lm[0],
+                motion: lm[1] != 0,
+                stage_count,
+                stage_active: x[self.layout.active_stage_at].min(stage_count.saturating_sub(1)),
+                dpi,
+                dpi_min: self.limits.dpi.0,
+                dpi_max: self.limits.dpi.1,
+                debounce_press: d[self.layout.debounce_press_at],
+                debounce_release: d[self.layout.debounce_release_at],
+                sleep_min: d[self.layout.sleep_at],
+                line_corr: d[self.layout.flags_offset] & self.layout.line_flag == 0,
+                wave_corr: d[self.layout.flags_offset] & self.layout.wave_flag == 0,
+                save_error: None,
+            },
+            blocks,
+        ))
+    }
+}
+
+impl Driver for Rapoo {
+    fn snapshot(&mut self) -> Result<Snapshot, String> {
+        self.read_config().map(|(snapshot, _)| snapshot)
     }
 
     fn battery(&mut self) -> Result<Option<u8>, String> {
@@ -479,91 +490,257 @@ impl Driver for Rapoo {
         self.battery_level()
     }
 
-    fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<(), String> {
-        if !self.layout.caps.supports(cmd) {
-            return Err("该设备不支持这个设置".into());
+    fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<WriteOutcome, WriteError> {
+        self.apply_batch(&[cmd], snap)
+    }
+
+    /// 一轮输入里把同一 4 字节块的读-改-写合并，最后统一提交一次。
+    ///
+    /// 这里只到“提交”为止：回读要等 150 ms 通信保护间隔，由采集线程在
+    /// 等待期间继续接收命令，然后调用 [`Self::confirm`]。DPI 的 X/Y 仍
+    /// 成对写入；任何一条命令非法都不会留下半批写入。
+    fn apply_batch(
+        &mut self,
+        cmds: &[Cmd],
+        snap: &mut Snapshot,
+    ) -> Result<WriteOutcome, WriteError> {
+        let mut blocks: BTreeMap<u32, ([u8; 4], bool)> = BTreeMap::new();
+        let mut dpi_loaded = false;
+
+        for cmd in cmds {
+            if !self.layout.caps.supports(*cmd) {
+                return Err(WriteError::Rejected("该设备不支持这个设置".into()));
+            }
+            match *cmd {
+                Cmd::Refresh => {}
+                Cmd::Polling(ms) => {
+                    if !self.limits.polling.contains(&ms) {
+                        return Err(WriteError::Rejected(format!("不支持的回报率档位：{ms} ms")));
+                    }
+                    let e = self
+                        .load_block(&mut blocks, self.layout.poll_addr)
+                        .map_err(WriteError::Rejected)?;
+                    if e.0[0] != ms {
+                        e.0[0] = ms;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Motion(on) => {
+                    let v = on as u8;
+                    let e = self
+                        .load_block(&mut blocks, self.layout.lod_addr)
+                        .map_err(WriteError::Rejected)?;
+                    if e.0[1] != v {
+                        e.0[1] = v;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Lod(v) => {
+                    let v = v.clamp(self.limits.lod.0, self.limits.lod.1);
+                    let e = self
+                        .load_block(&mut blocks, self.layout.lod_addr)
+                        .map_err(WriteError::Rejected)?;
+                    if e.0[0] != v {
+                        e.0[0] = v;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Line(on) => {
+                    let idx = self.layout.flags_offset;
+                    let bit = self.layout.line_flag;
+                    let e = self
+                        .load_block(&mut blocks, self.layout.debounce_addr)
+                        .map_err(WriteError::Rejected)?;
+                    let v = if on { e.0[idx] & !bit } else { e.0[idx] | bit };
+                    if e.0[idx] != v {
+                        e.0[idx] = v;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Wave(on) => {
+                    let idx = self.layout.flags_offset;
+                    let bit = self.layout.wave_flag;
+                    let e = self
+                        .load_block(&mut blocks, self.layout.debounce_addr)
+                        .map_err(WriteError::Rejected)?;
+                    let v = if on { e.0[idx] & !bit } else { e.0[idx] | bit };
+                    if e.0[idx] != v {
+                        e.0[idx] = v;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Debounce(v, press) => {
+                    let v = v.clamp(self.limits.debounce.0, self.limits.debounce.1);
+                    let idx = if press {
+                        self.layout.debounce_press_at
+                    } else {
+                        self.layout.debounce_release_at
+                    };
+                    let e = self
+                        .load_block(&mut blocks, self.layout.debounce_addr)
+                        .map_err(WriteError::Rejected)?;
+                    if e.0[idx] != v {
+                        e.0[idx] = v;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Sleep(m) => {
+                    let m = m.clamp(self.limits.sleep.0, self.limits.sleep.1);
+                    let idx = self.layout.sleep_at;
+                    let e = self
+                        .load_block(&mut blocks, self.layout.debounce_addr)
+                        .map_err(WriteError::Rejected)?;
+                    if e.0[idx] != m {
+                        e.0[idx] = m;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Activate(i) => {
+                    let i = i.min(snap.stage_count.saturating_sub(1));
+                    let e = self
+                        .load_block(&mut blocks, self.layout.active_stage_addr)
+                        .map_err(WriteError::Rejected)?;
+                    if e.0[0] != i {
+                        e.0[0] = i;
+                        e.1 = true;
+                    }
+                }
+                Cmd::Dpi(stage, value) => {
+                    // `stage` selects a fixed 2-byte EEPROM slot; an out-of-range
+                    // index would read-modify-write unrelated cells. Reject it
+                    // here at the protocol boundary rather than trusting the
+                    // caller to pass a stage the device actually has.
+                    let count = snap.stage_count.clamp(1, self.layout.max_stages) as u32;
+                    if stage as u32 >= count {
+                        return Err(WriteError::Rejected(format!(
+                            "dpi stage {stage} out of range (0..{count})"
+                        )));
+                    }
+                    let value = value.clamp(self.limits.dpi.0, self.limits.dpi.1);
+                    let bytes = value.to_le_bytes();
+                    // DPI 表按整表读：相邻 4 字节块可能装着相同的 DPI，
+                    // 逐块读会被“与上一条应答不同”的判据误杀。
+                    if !dpi_loaded {
+                        dpi_loaded = true;
+                        for base in [self.layout.dpi_x_addr, self.layout.dpi_y_addr] {
+                            let len = self.layout.dpi_read_len;
+                            for (addr, arr) in
+                                self.read_blocks(base, len).map_err(WriteError::Rejected)?
+                            {
+                                blocks.entry(addr).or_insert((arr, false));
+                            }
+                        }
+                    }
+                    // X/Y 两个块都要写，避免拆轴型号只改了一半。
+                    for base in [self.layout.dpi_x_addr, self.layout.dpi_y_addr] {
+                        let addr = base + stage as u32 * 2;
+                        let mut done = 0usize;
+                        for (block, off, n) in aligned_blocks(addr, 2) {
+                            let e = self
+                                .load_block(&mut blocks, block)
+                                .map_err(WriteError::Rejected)?;
+                            if e.0[off..off + n] != bytes[done..done + n] {
+                                e.0[off..off + n].copy_from_slice(&bytes[done..done + n]);
+                                e.1 = true;
+                            }
+                            done += n;
+                        }
+                    }
+                }
+            }
         }
-        let change = match cmd {
-            Cmd::Refresh => return Ok(()),
-            Cmd::Polling(ms) => {
-                if !self.limits.polling.contains(&ms) {
-                    return Err(format!("不支持的回报率档位：{ms} ms"));
+
+        let dirty_blocks: Vec<(u32, [u8; 4])> = blocks
+            .iter()
+            .filter(|(_, (_, dirty))| *dirty)
+            .map(|(&addr, (bytes, _))| (addr, *bytes))
+            .collect();
+        if dirty_blocks.is_empty() {
+            return Ok(WriteOutcome::Unchanged);
+        }
+
+        let started = Instant::now();
+        for (addr, bytes) in &dirty_blocks {
+            if let Err(e) = self.write_raw(*addr, bytes) {
+                // 已经写了一部分：结果不可假定，交给采集线程标记未确认并
+                // 重读实际配置，而不是自动重放整个事务。
+                self.guard_until = Some(Instant::now() + COMMIT_GUARD);
+                self.pending.clear();
+                crate::log::line(
+                    "WARN",
+                    &format!(
+                        "{} 写入 0x{addr:04X} 失败（{e}），提交结果未确认",
+                        self.layout.model
+                    ),
+                );
+                return Err(WriteError::Unconfirmed(e));
+            }
+        }
+        if let Err(e) = self.commit() {
+            self.guard_until = Some(Instant::now() + COMMIT_GUARD);
+            self.pending.clear();
+            crate::log::line(
+                "WARN",
+                &format!(
+                    "{} 提交应答超时（{e}），已等待 {} ms，结果未确认",
+                    self.layout.model,
+                    started.elapsed().as_millis()
+                ),
+            );
+            return Err(WriteError::Unconfirmed(e));
+        }
+
+        self.pending = dirty_blocks;
+        self.guard_until = Some(Instant::now() + COMMIT_GUARD);
+        Ok(WriteOutcome::Committed)
+    }
+
+    /// 提交后的只读校验。读回完整配置，和本次提交的每个目标块逐一比对。
+    ///
+    /// 读取失败时保留目标块，采集线程可以只重试读取；一旦读成功，即使值
+    /// 不一致也不再保留目标——设备实际值已经知道，不能靠重放写入去“修复”。
+    fn confirm(&mut self, snap: &mut Snapshot) -> Result<ConfirmResult, String> {
+        let (fresh, blocks) = self.read_config()?;
+        let pending = std::mem::take(&mut self.pending);
+
+        let mut mismatch = None;
+        for (addr, expected) in &pending {
+            match blocks.get(addr) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    mismatch = Some(format!(
+                        "0x{addr:04X} 回读 {} != 写入 {}",
+                        hex(actual),
+                        hex(expected)
+                    ));
                 }
-                let mut b = self.read(self.layout.poll_addr, 4)?;
-                b[0] = ms;
-                self.write_commit(self.layout.poll_addr, &b)?;
-                Change::Poll
+                None => mismatch = Some(format!("0x{addr:04X} 不在本次读取范围")),
             }
-            Cmd::Motion(on) => {
-                let mut b = self.read(self.layout.lod_addr, 4)?;
-                b[1] = on as u8;
-                self.write_commit(self.layout.lod_addr, &b)?;
-                Change::Lm
+        }
+
+        *snap = fresh;
+        match mismatch {
+            Some(m) => {
+                crate::log::line("WARN", &format!("{} 写入确认失败：{m}", self.layout.model));
+                Ok(ConfirmResult::Mismatch(m))
             }
-            Cmd::Lod(v) => {
-                let v = v.clamp(self.limits.lod.0, self.limits.lod.1);
-                let mut b = self.read(self.layout.lod_addr, 4)?;
-                b[0] = v;
-                self.write_commit(self.layout.lod_addr, &b)?;
-                Change::Lm
-            }
-            Cmd::Line(on) => {
-                self.set_flag(self.layout.line_flag, !on)?;
-                Change::Deb
-            }
-            Cmd::Wave(on) => {
-                self.set_flag(self.layout.wave_flag, !on)?;
-                Change::Deb
-            }
-            Cmd::Debounce(v, press) => {
-                let v = v.clamp(self.limits.debounce.0, self.limits.debounce.1);
-                let idx = if press {
-                    self.layout.debounce_press_at
-                } else {
-                    self.layout.debounce_release_at
-                };
-                let mut b = self.read(self.layout.debounce_addr, 4)?;
-                b[idx] = v;
-                self.write_commit(self.layout.debounce_addr, &b)?;
-                Change::Deb
-            }
-            Cmd::Sleep(m) => {
-                let m = m.clamp(self.limits.sleep.0, self.limits.sleep.1);
-                let mut b = self.read(self.layout.debounce_addr, 4)?;
-                b[self.layout.sleep_at] = m;
-                self.write_commit(self.layout.debounce_addr, &b)?;
-                Change::Deb
-            }
-            Cmd::Activate(i) => {
-                let i = i.min(snap.stage_count.saturating_sub(1));
-                let mut b = self.read(self.layout.active_stage_addr, 4)?;
-                b[0] = i;
-                self.write_commit(self.layout.active_stage_addr, &b)?;
-                Change::Active
-            }
-            Cmd::Dpi(stage, value) => {
-                // `stage` selects a fixed 2-byte EEPROM slot; an out-of-range
-                // index would read-modify-write unrelated cells. Reject it
-                // here at the protocol boundary rather than trusting the
-                // caller to pass a stage the device actually has.
-                let count = snap.stage_count.clamp(1, self.layout.max_stages) as u32;
-                if stage as u32 >= count {
-                    return Err(format!("dpi stage {stage} out of range (0..{count})"));
-                }
-                let value = value.clamp(self.limits.dpi.0, self.limits.dpi.1);
-                let bytes = value.to_le_bytes();
-                self.write_field(self.layout.dpi_x_addr + stage as u32 * 2, &bytes)?;
-                self.write_field(self.layout.dpi_y_addr + stage as u32 * 2, &bytes)?;
-                self.commit()?;
-                Change::Dpi(stage)
-            }
-        };
-        self.patch(change, snap)
+            None if pending.is_empty() => Ok(ConfirmResult::ReadOnly),
+            None => Ok(ConfirmResult::Verified),
+        }
+    }
+
+    fn next_io_at(&self) -> Option<Instant> {
+        self.guard_until
     }
 
     fn link_alive(&self) -> bool {
         self.io.alive()
     }
+}
+
+/// 4 字节块的可读十六进制形式，只用于确认失败的日志/错误信息。
+fn hex(b: &[u8; 4]) -> String {
+    b.iter().map(|v| format!("{v:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -703,5 +880,220 @@ mod tests {
             at += n as u32;
         }
         assert_eq!(at, addr + len as u32);
+    }
+
+    /// 提交必须认实测的 `01 7d`；回放的读/写应答不能被当成提交成功。
+    #[test]
+    fn commit_reply_must_be_the_measured_confirmation() {
+        let mut r = [0u8; 32];
+        r[0] = 1;
+        r[1] = 0x7D;
+        assert!(Reply::Commit.accepts(&r, &VT1_PRO));
+        r[1] = 0x00;
+        assert!(
+            !Reply::Commit.accepts(&r, &VT1_PRO),
+            "写/读应答不能冒充提交"
+        );
+        assert!(Reply::Write.accepts(&r, &VT1_PRO));
+        r[1] = 0x02;
+        assert!(!Reply::Write.accepts(&r, &VT1_PRO));
+    }
+
+    // ---- 合批与写入校验的假设备 -------------------------------------------
+
+    use crate::driver::VT1_PRO_LIMITS;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeState {
+        mem: BTreeMap<u32, [u8; 4]>,
+        /// 真机应答缓冲区会一直重复上一条应答，直到下一条命令覆盖它。
+        reply: Vec<u8>,
+        commits: usize,
+        writes: usize,
+        /// 写命令仍回 OK，但不落到寄存器：模拟接收器吞命令。
+        drop_writes: bool,
+    }
+
+    #[derive(Clone)]
+    struct FakeIo(Arc<Mutex<FakeState>>);
+
+    impl FakeIo {
+        fn new() -> (Self, Arc<Mutex<FakeState>>) {
+            let mut mem = BTreeMap::new();
+            for (addr, bytes) in [
+                (VT1_PRO.poll_addr, [1u8, 0, 1, 0xFF]),
+                (VT1_PRO.lod_addr, [2, 1, 1, 0]),
+                (VT1_PRO.debounce_addr, [8, 8, 10, 0]),
+                (VT1_PRO.active_stage_addr, [0, 0, 0, 0]),
+            ] {
+                mem.insert(addr, bytes);
+            }
+            for addr in 0..4u32 {
+                mem.insert(VT1_PRO.dpi_x_addr + addr * 4, [0x90, 0x01, 0x20, 0x03]);
+                // Y 表尾部与 X 不同，模拟真机上那几字节是档位/档数而非 DPI，
+                // 避免整表回读跟 X 逐字节相同被当成过期应答。
+                let y = if addr == 3 {
+                    [0x90, 0x01, 0x00, 0x00]
+                } else {
+                    [0x90, 0x01, 0x20, 0x03]
+                };
+                mem.insert(VT1_PRO.dpi_y_addr + addr * 4, y);
+            }
+            let state = Arc::new(Mutex::new(FakeState {
+                mem,
+                reply: Vec::new(),
+                commits: 0,
+                writes: 0,
+                drop_writes: false,
+            }));
+            (Self(state.clone()), state)
+        }
+    }
+
+    impl HidTransport for FakeIo {
+        fn send(&mut self, report: &[u8]) -> Result<(), String> {
+            let mut s = self.0.lock().unwrap();
+            let addr = u32::from_le_bytes([report[4], report[5], report[6], report[7]]);
+            let len = report[3] as usize;
+            let mut reply = vec![0u8; REPORT_LEN];
+            reply[0] = 1;
+            match report[2] {
+                0xA4 => {
+                    for i in 0..len {
+                        let a = addr + i as u32;
+                        let block = a & !3;
+                        let off = (a - block) as usize;
+                        let bytes = s.mem.get(&block).copied().unwrap_or([0; 4]);
+                        reply[4 + i] = bytes[off];
+                    }
+                }
+                0xA5 => {
+                    if !s.drop_writes {
+                        let block = addr & !3;
+                        let off = (addr - block) as usize;
+                        let mut bytes = s.mem.get(&block).copied().unwrap_or([0; 4]);
+                        bytes[off..off + len].copy_from_slice(&report[8..8 + len]);
+                        s.mem.insert(block, bytes);
+                    }
+                    s.writes += 1;
+                }
+                0xA3 => {
+                    s.commits += 1;
+                    reply[1] = 0x7D;
+                }
+                0xAA => {
+                    reply[1] = 1;
+                    reply[2] = 50;
+                }
+                _ => {}
+            }
+            s.reply = reply;
+            Ok(())
+        }
+
+        fn recv(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, String> {
+            let s = self.0.lock().unwrap();
+            Ok((!s.reply.is_empty()).then(|| s.reply.clone()))
+        }
+
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    fn test_rapoo(io: FakeIo) -> Rapoo {
+        Rapoo {
+            io: Box::new(io),
+            layout: &VT1_PRO,
+            last: Cell::new([0u8; 32]),
+            last_read: Cell::new(None),
+            bad_battery: Cell::new(None),
+            guard_until: None,
+            pending: Vec::new(),
+            limits: VT1_PRO_LIMITS,
+        }
+    }
+
+    fn seven_stages() -> Snapshot {
+        Snapshot {
+            stage_count: 7,
+            dpi: vec![400, 800, 1600, 3200, 6400, 26000, 1000],
+            ..Snapshot::default()
+        }
+    }
+
+    /// 同一 4 字节块里的两个字段只读一次、写一次、提交一次。
+    #[test]
+    fn batch_merges_fields_in_the_same_block() {
+        let (io, state) = FakeIo::new();
+        let mut dev = test_rapoo(io);
+        let mut snap = seven_stages();
+        let outcome = dev
+            .apply_batch(&[Cmd::Motion(true), Cmd::Lod(3)], &mut snap)
+            .unwrap();
+        assert_eq!(outcome, WriteOutcome::Committed, "提交后等只读确认");
+        assert_eq!(
+            dev.confirm(&mut snap).unwrap(),
+            ConfirmResult::Verified,
+            "回读一致才算确认"
+        );
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.writes, 1, "Motion/Lod 共用同一块");
+        assert_eq!(s.commits, 1, "整批只提交一次");
+        assert_eq!(s.mem[&VT1_PRO.lod_addr], [3, 1, 1, 0]);
+        assert_eq!(snap.lod, 3);
+        assert!(snap.motion);
+    }
+
+    /// 一次改两个档位：X/Y 仍成对写入，但只提交一次。
+    #[test]
+    fn batch_writes_all_dpi_blocks_with_one_commit() {
+        let (io, state) = FakeIo::new();
+        let mut dev = test_rapoo(io);
+        let mut snap = seven_stages();
+        let outcome = dev
+            .apply_batch(&[Cmd::Dpi(1, 1200), Cmd::Dpi(2, 2400)], &mut snap)
+            .unwrap();
+        assert_eq!(outcome, WriteOutcome::Committed);
+        assert_eq!(
+            dev.confirm(&mut snap).unwrap(),
+            ConfirmResult::Verified,
+            "X/Y 两个写入目标都要校验"
+        );
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.writes, 4, "两档 × X/Y 各一个块");
+        assert_eq!(s.commits, 1);
+        // 第 1 档的 2 字节从 0x088A 开始，落在 0x0888 块内偏移 2。
+        let x1 = s.mem[&VT1_PRO.dpi_x_addr];
+        assert_eq!(u16::from_le_bytes([x1[2], x1[3]]), 1200);
+        let y2 = s.mem[&(VT1_PRO.dpi_y_addr + 4)];
+        assert_eq!(u16::from_le_bytes([y2[0], y2[1]]), 2400);
+        assert_eq!(snap.dpi[1], 1200);
+        assert_eq!(snap.dpi[2], 2400);
+    }
+
+    /// 写命令回 OK 但没落盘时，提交后的只读确认必须把这次写入判为失败；
+    /// 确认只读，不会自动重放写入。
+    #[test]
+    fn swallowed_write_is_caught_by_read_back() {
+        let (io, state) = FakeIo::new();
+        state.lock().unwrap().drop_writes = true;
+        let mut dev = test_rapoo(io);
+        let mut snap = seven_stages();
+        let outcome = dev.apply(Cmd::Polling(2), &mut snap).unwrap();
+        assert_eq!(outcome, WriteOutcome::Committed);
+        let writes_after_apply = state.lock().unwrap().writes;
+
+        match dev.confirm(&mut snap).unwrap() {
+            ConfirmResult::Mismatch(m) => assert!(m.contains("回读"), "{m}"),
+            other => panic!("未落盘必须判为 Mismatch，实际 {other:?}"),
+        }
+        assert_eq!(
+            state.lock().unwrap().writes,
+            writes_after_apply,
+            "确认失败不能重放写入"
+        );
     }
 }

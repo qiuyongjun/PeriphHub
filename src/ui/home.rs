@@ -426,6 +426,8 @@ fn device_card(ui: &mut Ui, p: &Palette, entry: &Entry) -> bool {
                     let (text, status_color) = match &entry.state.link {
                         Link::Offline(_) => ("设备离线", p.danger),
                         Link::Connecting => ("正在连接", p.warn),
+                        Link::Online if entry.state.sync.stale => ("同步异常", p.warn),
+                        Link::Online if entry.state.pending_confirm => ("等待设备确认", p.warn),
                         Link::Online => match entry.state.synced {
                             Some(t) if t.elapsed().as_secs() < 2 => ("刚刚同步", p.ok),
                             Some(_) => ("设备在线", p.ok),

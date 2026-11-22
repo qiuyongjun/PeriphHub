@@ -15,8 +15,52 @@ pub mod hidpp;
 pub mod rapoo;
 mod transport;
 
+use std::time::Instant;
+
 pub use hidpp::{Hidpp, HidppLayout};
 pub use rapoo::{Rapoo, RapooLayout};
+
+/// 写入在协议层的阶段结果。调用方据此决定是否还要做只读确认。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// 设备已经是目标值，一个字节都没写。
+    Unchanged,
+    /// 驱动已完成本批写入并更新 `snap`；协议允许时已做回读校验。
+    ///
+    /// 若驱动还有异步落盘的部分（例如 HID++ 攒着默认档位一起写扇区），
+    /// 落盘结果由 `Snapshot::save_error` 单独表达，不在这里假装已经持久化；
+    /// 代价是不会再走 `confirm`。这类驱动必须让 `confirm` 返回 `ReadOnly`。
+    Confirmed,
+    /// 写入与提交已完成，但按协议要等通信保护间隔后再只读确认。
+    Committed,
+}
+
+/// 写入失败的结构化原因。调用方不能把所有失败都当成"重试一次写入"：
+/// 已经可能落盘的失败重放会多写一次 EEPROM，而未开始的失败又必须纠正界面。
+///
+/// “提交已确认、回读暂时失败”不在这里：那是 [`WriteOutcome::Committed`]
+/// 之后的异步确认路径，由采集线程只重试读取。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// 尚未开始写入：参数/能力校验失败，或准备阶段的读取失败。设备状态未变。
+    Rejected(String),
+    /// 写入或提交途中失败/应答超时，是否落盘未知。
+    Unconfirmed(String),
+}
+
+/// 只读确认的结果。`snap` 不论哪种成功结果都应按设备实际值更新。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmResult {
+    /// 回读值与本次写入目标一致。
+    Verified,
+    /// 回读成功，但设备值不等于写入目标（设备没有持久化）。
+    Mismatch(String),
+    /// 没有待确认的写入目标，只刷新了设备实际配置。
+    ///
+    /// 驱动若不做提交后比对（写入路径已自校验，或落盘是异步的），必须返回
+    /// 这个值而不是 `Verified`：采集线程据此不会把本批命令标成已确认。
+    ReadOnly,
+}
 
 /// Which **mouse** blocks a device really has. The UI hides everything that is
 /// `false` instead of rendering switches that would do nothing on this model.
@@ -106,6 +150,9 @@ pub struct Snapshot {
     pub sleep_min: u8,
     pub line_corr: bool,
     pub wave_corr: bool,
+    /// 周期落盘失败的原因。成功后清空；界面据此提示“设置仍在运行态生效，
+    /// 但断电后会回到旧值”，而不是把失败只写进日志。
+    pub save_error: Option<String>,
 }
 
 /// 鼠标配置命令。每条命令都携带绝对值，所以连续微调只需要每字段的最后一条。
@@ -157,9 +204,63 @@ pub trait Driver: Send {
     /// Battery percentage, or `None` when the device does not report one.
     fn battery(&mut self) -> Result<Option<u8>, String>;
 
-    /// Writes one field and patches `snap` with the value the device reports
-    /// back, so the caller never has to re-read the whole configuration.
-    fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<(), String>;
+    /// 写入一个字段，并按协议能做到的程度更新 `snap`。
+    ///
+    /// 返回 [`WriteOutcome::Committed`] 表示已经提交、但还需要在
+    /// [`Self::next_io_at`] 之后调用 [`Self::confirm`] 做只读校验。
+    fn apply(&mut self, cmd: Cmd, snap: &mut Snapshot) -> Result<WriteOutcome, WriteError>;
+
+    /// 执行一次合批。默认逐条执行，协议允许时由驱动覆盖成“读一次、写一次、
+    /// 提交一次”，减少一轮输入里对同一寄存器块/扇区的重复读写。
+    ///
+    /// 默认实现必须保留 [`WriteOutcome::Committed`]：只实现 `apply` 的驱动
+    /// 若返回 `Committed`，合批后仍需采集线程调用 `confirm`。遇到第一个错误
+    /// 立刻停止——`Unconfirmed` 之后继续写可能重复擦写 EEPROM。
+    ///
+    /// 注意默认实现无法预校验：它逐条调用 `apply`，所以**可能已经写入前几条**
+    /// 才返回 [`WriteError::Rejected`]。这不会让设备状态错乱（调用方收到
+    /// `Rejected` 会重新读取实际配置），但与 `Rejected`“设备状态未变”的字面
+    /// 约定不符。要保住这条约定，驱动得像 `hidpp`/`rapoo` 那样先把整批校验
+    /// 完再动手。
+    fn apply_batch(
+        &mut self,
+        cmds: &[Cmd],
+        snap: &mut Snapshot,
+    ) -> Result<WriteOutcome, WriteError> {
+        let mut committed = false;
+        let mut written = false;
+        for cmd in cmds {
+            match self.apply(*cmd, snap)? {
+                WriteOutcome::Committed => {
+                    committed = true;
+                    written = true;
+                }
+                WriteOutcome::Confirmed => written = true,
+                WriteOutcome::Unchanged => {}
+            }
+        }
+        Ok(if committed {
+            WriteOutcome::Committed
+        } else if written {
+            WriteOutcome::Confirmed
+        } else {
+            WriteOutcome::Unchanged
+        })
+    }
+
+    /// 只读确认：读回设备当前配置，更新 `snap`，并比对上一次提交的目标值。
+    ///
+    /// 这条路径**不得**写入、补偿或落盘，否则一次后台恢复就可能改掉用户
+    /// 没有编辑过的设置。HID++ 的 `snapshot()`/`battery()` 会补写待落档位，
+    /// 因而不能拿来当确认。
+    fn confirm(&mut self, snap: &mut Snapshot) -> Result<ConfirmResult, String>;
+
+    /// 驱动要求的下一次可通信时刻（提交后的保护间隔）。
+    ///
+    /// 采集线程在等待期间继续接收、合并命令，而不是把 HID 调用卡在驱动里。
+    fn next_io_at(&self) -> Option<Instant> {
+        None
+    }
 
     /// 关闭驱动前调用：把攒着、还没落盘的持久化状态提交掉。
     ///
