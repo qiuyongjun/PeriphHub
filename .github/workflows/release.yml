@@ -43,6 +43,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = (Get-ChildItem dist -Filter *.zip).FullName
+          $name = "PeriphHub-${{ github.ref_name }}-win-x64"
+          $zip = (Resolve-Path "dist/$name.zip").Path
           $sum = (Resolve-Path 'dist/SHA256SUMS.txt').Path
-          gh release create "${{ github.ref_name }}" $zip $sum --title "PeriphHub ${{ github.ref_name }}" --generate-notes
+          $setup = "dist/$name-setup.exe"
+          # 安装包要和校验和一起发：package.ps1 只在检测到 Inno Setup 6.5+
+          # 时才编译它，并同时把哈希写进 SHA256SUMS。按本次 tag 精确匹配，
+          # 避免把 dist 里残留的旧版本产物传上去。
+          $files = @($zip, $sum)
+          if (Test-Path $setup) { $files += (Resolve-Path $setup).Path }
+          if (-not (Test-Path $setup) -and
+              (Select-String -Path $sum -Pattern '-setup\.exe' -Quiet)) {
+              throw 'SHA256SUMS.txt 列了安装包，但 dist 里没有对应文件'
+          }
+          $ghArgs = @('release', 'create', "${{ github.ref_name }}") + $files + @(
+              '--title', "PeriphHub ${{ github.ref_name }}",
+              '--generate-notes'
+          )
+          gh @ghArgs
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create 失败' }
