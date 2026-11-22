@@ -22,8 +22,9 @@ use crate::ui::widgets::{
 /// Widget card width. The native window is this plus `SHADOW_PAD` on each side.
 pub const WIDTH: f32 = 320.0;
 /// 卡片四周的透明边距：egui 只能在窗口矩形内作画，系统级阴影在 Win10 上
-/// 又拿不到（DWM 缝线无法隐藏），所以投影由自己在卡片后面画，这段边距
-/// 就是阴影的落脚处。
+/// 又拿不到（DWM 缝线无法隐藏），所以投影由自己画在卡片后面，这段边距
+/// 就是阴影的落脚处。它由 `crate::shadow` 的独立分层窗口绘制——主窗口会被
+/// 裁成卡片形状，边距上的点击才能穿透到桌面与其他应用（见那边的模块注释）。
 ///
 /// 取 16 而不是更宽：σ=8 那瓣**看得见**的环（alpha ≥ 2/255）到 12px 就没了，
 /// 加上 3px 下移正好 15px；再往外只剩 1/255 的尾巴，被窗口边缘裁掉也看不出
@@ -181,15 +182,23 @@ pub fn view(ui: &mut Ui, p: &Palette, manager: &DeviceManager, pinned: bool) -> 
     action
 }
 
-/// Card over the window. Inset from the window edge so the shadow (painted on
-/// the same transparent surface) has room to spread; the shadow itself is what
-/// separates the card from the desktop, so the card carries no stroke — a hard
-/// 1px outline read as a stray line at the top of the widget.
+/// Card over the window. Inset from the window edge so the shadow has room to
+/// spread; the shadow itself is what separates the card from the desktop, so the
+/// card carries no stroke — a hard 1px outline read as a stray line at the top
+/// of the widget.
+///
+/// 投影平时画在卡片外面那个独立的分层窗口里（`crate::shadow`）：主窗口被裁成
+/// 卡片形状，边距上的点击才能穿透到桌面与其他应用，而裁剪同样会裁掉绘制。
+/// 只有那个窗口建不起来时才退回在这里自绘。
 fn paint_card(ui: &Ui, p: &Palette, card: Rect) {
-    let focused = ui.ctx().input(|i| i.focused);
-    shadow_card(ui.painter(), card, p.card, CARD_RADIUS, p.dark, focused);
+    if !crate::shadow::attached() {
+        let focused = ui.ctx().input(|i| i.focused);
+        shadow_card(ui.painter(), card, p.card, CARD_RADIUS, p.dark, focused);
+        return;
+    }
+    // 卡片要铺满整块：留出半像素缝会从窗口区域的边缘透出桌面。
     ui.painter()
-        .rect_filled(card.shrink(0.5), CornerRadius::same(CARD_RADIUS), p.card);
+        .rect_filled(card, CornerRadius::same(CARD_RADIUS), p.card);
 }
 
 /// 标题与状态词分成两行，避免状态文字覆盖右侧工具按钮。

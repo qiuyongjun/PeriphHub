@@ -558,7 +558,18 @@ impl Hidpp {
             None => None,
         };
         stamp_crc(&mut data);
-        self.write_sector(layout, fi, sector, &data)?;
+        // 提交的应答可能就丢在这一步：扇区也许已经写进去了，固件也按扇区里的
+        // 默认档位重载了传感器。这个提前返回既不能假装成功，也不能把恢复目标
+        // 一起丢掉——否则设备停在默认档位的 DPI 上，界面却还显示用户刚选的
+        // 那一档，后面的轮询也没有可补偿的目标。
+        if let Err(e) = self.write_sector(layout, fi, sector, &data) {
+            if let Some(live) = live {
+                if let Err(restore) = self.defer_live_dpi(live) {
+                    return Err(format!("{e}；恢复实时 DPI 失败：{restore}"));
+                }
+            }
+            return Err(e);
+        }
         // 每一步都拿到应答只说明命令到了接收器，不说明扇区真被改写：被吞掉
         // 的 commit 会收到上一条应答（`zeroed_reply_swid` 的固件连应答归属都
         // 分不清）。这里回读改动块，用设备自己的数据判定落盘。
@@ -575,10 +586,10 @@ impl Hidpp {
         // 默认档位重载过，放着不管会把用户当前的档位顶掉。
         let mut error = readback.err();
         if let Some(live) = live {
-            if let Err(e) = self.restore_live_dpi(live) {
-                // 扇区已经写进去了，不能回报“完全成功”；留下目标值交给
-                // 下一次轮询补偿，同时把部分成功告诉调用方纠正界面。
-                self.pending_restore = Some(live);
+            if let Err(e) = self.defer_live_dpi(live) {
+                // 扇区已经写进去了，不能回报“完全成功”；目标值留在
+                // `pending_restore` 里交给下一次轮询补偿，同时把部分成功
+                // 告诉调用方纠正界面。
                 error.get_or_insert(format!("配置已写入，但恢复 DPI 失败：{e}"));
             }
         }
@@ -676,13 +687,40 @@ impl Hidpp {
             // 上次其实恢复成功了，只是回读失败。
             Ok(now) if now == target => self.pending_restore = None,
             Ok(_) => {
-                if self.set_current_dpi(target).is_ok() && self.read_dpi(fi).ok() == Some(target) {
+                // `set_current_dpi` 自己会回读比对，成功就等于已经恢复到位。
+                if self.set_current_dpi(target).is_ok() {
                     self.pending_restore = None;
                 }
             }
             // 设备暂不可达：保留目标，下一次轮询再试。
             Err(_) => {}
         }
+    }
+
+    /// 记下恢复目标并当场尽力恢复。
+    ///
+    /// 目标先落进 `pending_restore` 再动手：提交已经发生、设备可能已经换了
+    /// 档位，这一步失败也不能把"该恢复成多少"忘掉，否则只能等用户自己发现。
+    /// 当场恢复成功才清掉它。
+    fn defer_live_dpi(&mut self, live: u16) -> Result<(), String> {
+        self.pending_restore = Some(live);
+        match self.restore_live_dpi(live) {
+            Ok(()) => {
+                self.pending_restore = None;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 用户明确下的一条实时 DPI 指令。
+    ///
+    /// 旧补偿目标先作废再写：写成功自不必说；写成功但回读超时（结果未知）
+    /// 时更不能留——那条旧目标会在下一次轮询把设备改回去，等于吞掉刚发出、
+    /// 很可能已经生效的指令。真实值交给只读确认去读。
+    fn set_dpi_from_user(&mut self, value: u16) -> Result<(), String> {
+        self.pending_restore = None;
+        self.set_current_dpi(value)
     }
 
     /// 提交扇区后把传感器放回提交前的实时值，并回读确认。
@@ -693,12 +731,7 @@ impl Hidpp {
         if self.read_dpi(fi)? == live {
             return Ok(());
         }
-        self.set_current_dpi(live)?;
-        let now = self.read_dpi(fi)?;
-        if now != live {
-            return Err(format!("回读 DPI 为 {now}，期望 {live}"));
-        }
-        Ok(())
+        self.set_current_dpi(live)
     }
 
     /// 把用户最后选中的档位写回设备扇区。
@@ -795,6 +828,13 @@ impl Hidpp {
         // 会留下一个设备其实没有的值，用户再点下一步就是基于假值算的。
         self.call(fi, 3, &[0, b[0], b[1], b[0], b[1]])?
             .ok_or_else(|| "设置 DPI 无应答".to_string())?;
+        // 有应答也只说明命令到了接收器：接收器会吞掉写命令、照样回上一条
+        // 应答。传感器到底改没改只有回读能答，否则界面显示 1600、设备还是
+        // 800，下一次点档位就是基于假值算的。
+        let now = self.read_dpi(fi)?;
+        if now != value {
+            return Err(format!("回读 DPI 为 {now}，期望 {value}"));
+        }
         Ok(())
     }
 }
@@ -1034,7 +1074,7 @@ impl Driver for Hidpp {
             for cmd in cmds {
                 if let Cmd::Dpi(_, v) = *cmd {
                     let v = v.clamp(self.limits.dpi.0, self.limits.dpi.1);
-                    self.set_current_dpi(v).map_err(WriteError::Unconfirmed)?;
+                    self.set_dpi_from_user(v).map_err(WriteError::Unconfirmed)?;
                     applied = Some(v);
                 }
             }
@@ -1114,10 +1154,9 @@ impl Driver for Hidpp {
                         continue;
                     };
                     // 切档只动传感器，默认档位攒着一起落盘（见 flush_default_stage）。
-                    self.set_current_dpi(v).map_err(WriteError::Unconfirmed)?;
-                    // 用户明确切档后，新的传感器值优先：上一次没恢复成功的旧
-                    // DPI 目标若还留着，下一轮轮询会把它改回去，等于吞掉这次选择。
-                    self.pending_restore = None;
+                    // 这是一条新的用户指令：上一次没恢复成功的旧 DPI 目标必须
+                    // 先作废，否则下一轮轮询会把它改回去，等于吞掉这次选择。
+                    self.set_dpi_from_user(v).map_err(WriteError::Unconfirmed)?;
                     self.pending_default = Some(idx as u8);
                     active = idx as u8;
                     // 后面的提交会以这个实时值为基准恢复；除非还有更晚的
@@ -1163,7 +1202,7 @@ impl Driver for Hidpp {
             self.polling_ms = ms;
         }
         if let Some(v) = post_commit_dpi {
-            self.set_current_dpi(v).map_err(WriteError::Unconfirmed)?;
+            self.set_dpi_from_user(v).map_err(WriteError::Unconfirmed)?;
         }
         // 设备侧到这里全部成功：现在才让快照反映新值。
         snap.dpi = dpi;
@@ -1450,6 +1489,10 @@ mod tests {
         feature_timeout: bool,
         /// 模拟接收器吞掉 commit：每一步都回 OK，但扇区一个字节都没改。
         swallow_commit: bool,
+        /// 模拟 commit 已经生效、只是应答丢了。
+        lose_commit_reply: bool,
+        /// 模拟 setDpi 被吞：照样回应答，传感器值不变。
+        swallow_dpi_set: bool,
         write_buf: Vec<u8>,
         sector_writes: usize,
         sent: Vec<Vec<u8>>,
@@ -1474,6 +1517,8 @@ mod tests {
                 zero_swid: false,
                 feature_timeout: false,
                 swallow_commit: false,
+                lose_commit_reply: false,
+                swallow_dpi_set: false,
                 write_buf: Vec::new(),
                 sector_writes: 0,
                 sent: Vec::new(),
@@ -1541,7 +1586,10 @@ mod tests {
                             let at = G304.dpi_at + idx * 2;
                             dev.dpi = u16::from_le_bytes([dev.sector[at], dev.sector[at + 1]]);
                         }
-                        dev.replies.push_back(reply);
+                        // 扇区已经改完、传感器也重载了，只是这一帧应答丢了。
+                        if !dev.lose_commit_reply {
+                            dev.replies.push_back(reply);
+                        }
                     }
                     _ => dev.replies.push_back(reply),
                 }
@@ -1557,7 +1605,9 @@ mod tests {
                     3 => {
                         if !dev.dpi_set_fails {
                             // 参数布局是 [axis, hi, lo, hi, lo]。
-                            dev.dpi = u16::from_be_bytes([report[5], report[6]]);
+                            if !dev.swallow_dpi_set {
+                                dev.dpi = u16::from_be_bytes([report[5], report[6]]);
+                            }
                             dev.replies.push_back(reply);
                         }
                     }
@@ -1784,6 +1834,131 @@ mod tests {
         dev.settle_pending_restore();
         assert_eq!(dev.pending_restore, None);
         assert_eq!(state.lock().unwrap().dpi, 800);
+    }
+
+    /// 提交已经生效、应答却丢在半路：错误照报，但传感器必须放回提交前的
+    /// 值。以前这里的 `?` 直接返回，DPI 停在扇区默认档位上，连补偿目标都
+    /// 没留下，后面的轮询再也恢复不了。
+    #[test]
+    fn a_lost_commit_reply_still_restores_the_live_dpi() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().lose_commit_reply = true;
+        let mut dev = test_hidpp(io);
+
+        let err = dev
+            .update_profile(&G304, |data| {
+                data[G304.report_rate_at] = 4;
+                true
+            })
+            .unwrap_err();
+        assert!(err.contains("提交配置扇区失败"), "{err}");
+
+        assert_eq!(dev.pending_restore, None, "当场恢复成功就不该留尾巴");
+        let s = state.lock().unwrap();
+        assert_eq!(s.sector_writes, 1, "提交确实送到了设备");
+        assert_eq!(s.sector[G304.report_rate_at], 4, "扇区已经落盘");
+        assert_eq!(s.dpi, 800, "传感器要回到提交前的值，而不是扇区默认档位");
+    }
+
+    /// 同上，但当场恢复也失败：错误要说清楚恢复失败，目标值留下来等轮询。
+    #[test]
+    fn a_lost_commit_reply_keeps_the_restore_target() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        {
+            let mut s = state.lock().unwrap();
+            s.lose_commit_reply = true;
+            s.dpi_set_fails = true;
+        }
+        let mut dev = test_hidpp(io);
+
+        let err = dev
+            .update_profile(&G304, |data| {
+                data[G304.report_rate_at] = 4;
+                true
+            })
+            .unwrap_err();
+        assert!(err.contains("恢复实时 DPI 失败"), "{err}");
+        assert_eq!(dev.pending_restore, Some(800));
+
+        state.lock().unwrap().dpi_set_fails = false;
+        dev.settle_pending_restore();
+        assert_eq!(dev.pending_restore, None);
+        assert_eq!(state.lock().unwrap().dpi, 800);
+    }
+
+    /// 接收器吞掉 DPI 写、却照样回应答：只有回读能识破，写成功必须由
+    /// 传感器值证明。
+    #[test]
+    fn an_acknowledged_but_swallowed_dpi_write_is_not_confirmed() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().swallow_dpi_set = true;
+        let mut dev = test_hidpp(io);
+
+        let err = dev.set_current_dpi(1600).unwrap_err();
+        assert!(err.contains("1600"), "{err}");
+        assert_eq!(state.lock().unwrap().dpi, 800);
+    }
+
+    /// 切档同样不能被假应答骗过去：未确认时快照保持上一份可信值。
+    #[test]
+    fn activating_a_stage_needs_the_sensor_to_agree() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        state.lock().unwrap().swallow_dpi_set = true;
+        let mut dev = test_hidpp(io);
+        let mut snap = Snapshot {
+            dpi: vec![400, 800, 1600, 3200, 6400],
+            stage_count: 5,
+            stage_active: 1,
+            ..Snapshot::default()
+        };
+
+        let err = dev.apply(Cmd::Activate(2), &mut snap).unwrap_err();
+        match err {
+            WriteError::Unconfirmed(m) => assert!(m.contains("1600"), "{m}"),
+            other => panic!("吞掉的 DPI 写必须报未确认，实际 {other:?}"),
+        }
+        assert_eq!(snap.stage_active, 1, "未确认时快照不能改");
+        assert_eq!(dev.pending_default, None, "没写成功就不该记待落盘档位");
+    }
+
+    /// 新切档已经写进去、只是回读超时（结果未知）时，不能留着上一条旧补偿
+    /// 目标：下一轮轮询会拿它把设备改回去，把刚生效的指令吞掉。
+    #[test]
+    fn an_unconfirmed_new_stage_does_not_reinstate_the_old_restore() {
+        let (io, state) = FakeIo::new(fake_sector(), 800);
+        // 先制造一个旧的补偿目标（提交后恢复失败会留下它）。
+        state.lock().unwrap().dpi_set_fails = true;
+        let mut dev = test_hidpp(io);
+        let _ = dev
+            .update_profile(&G304, |data| {
+                data[G304.report_rate_at] = 4;
+                true
+            })
+            .unwrap_err();
+        assert_eq!(dev.pending_restore, Some(800));
+
+        // 用户改切到 1600：设备收到并生效，但这次回读超时。
+        {
+            let mut s = state.lock().unwrap();
+            s.dpi_set_fails = false;
+            s.dpi_read_timeout = true;
+        }
+        let mut snap = Snapshot {
+            dpi: vec![400, 800, 1600, 3200, 6400],
+            stage_count: 5,
+            stage_active: 0,
+            ..Snapshot::default()
+        };
+        match dev.apply(Cmd::Activate(2), &mut snap).unwrap_err() {
+            WriteError::Unconfirmed(m) => assert!(m.contains("超时"), "{m}"),
+            other => panic!("回读超时必须是未确认，实际 {other:?}"),
+        }
+        assert_eq!(dev.pending_restore, None, "旧目标不能跨过新指令");
+
+        // 之后只读确认成功，轮询也不能再把传感器拽回 800。
+        state.lock().unwrap().dpi_read_timeout = false;
+        dev.settle_pending_restore();
+        assert_eq!(state.lock().unwrap().dpi, 1600);
     }
 
     /// 用户切档必须覆盖上一次没恢复成功的 DPI 目标，否则下一轮轮询会把

@@ -188,13 +188,26 @@ cargo test
    程序每次启动时若发现自启动已开，会重写一次该值，这样 exe 改名或挪目录后路径不会失效。
 
 > 注意：浮窗与主界面都是**透明无边框窗口**，卡片四周留 `mini::SHADOW_PAD`（16pt）透明边距：
-> 窗口矩形比可见卡片大一圈，这圈边距是自绘投影（`ui::widgets::shadow_card`，σ=8 的两瓣高斯，
+> 窗口矩形比可见卡片大一圈，这圈边距是投影（`ui::widgets::shadow_card`，σ=8 的两瓣高斯，
 > 看得见的部分到 12px 就结束，加下移 15px）的落脚处。圆角（`CARD_RADIUS` = 12）同样是手绘的，
 > 窗口本身没有圆角。
-> 这圈边距的代价与对应补丁：透明像素靠 `app::install_hit_test` 在 `WM_NCHITTEST` 里返回
-> `HTTRANSPARENT`，否则浮窗置顶时是一圈"隐形挡板"；边缘缩放的命中区按可见卡片 + 圆角判定
-> （`ui::chrome::resize_handles`）；贴边、Alt-Tab、任务栏缩略图仍按窗口矩形算，所以卡片实际
-> 离屏幕边会比设定值多出 16pt。
+>
+> 这圈边距的代价与对应补丁：窗口是矩形的，边距上的点击本来会被本窗口吃掉。以前靠在
+> `WM_NCHITTEST` 里返回 `HTTRANSPARENT`，但按 Win32 文档它只在**同线程**窗口之间继续查找
+> （[wm-nchittest](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nchittest)），
+> 对桌面和其他应用无效——浮窗置顶时仍是一圈"隐形挡板"。现在的做法是：
+>
+> 1. `app::apply_card_region` 用 `SetWindowRgn` 把主窗口裁成卡片形状。区域之外的像素不属于
+>    这个窗口，点击直接落到下面的桌面或其他应用，跨进程也成立。
+> 2. 区域同样会裁掉绘制，投影因此搬到 `src/shadow.rs` 的独立分层窗口：`WS_EX_LAYERED` 给逐像素
+>    alpha，`WS_EX_TRANSPARENT` 让它完全不参与命中测试，`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`
+>    不让它抢焦点、不进 Alt+Tab。它永远贴在主窗口正下方，像素由同一组高斯环算出，和
+>    `shadow_card` 逐环一致；那个窗口建不起来时退回主窗口自绘，这时也不裁区域。
+> 3. 拖动/缩放走的是系统模态循环，界面那侧不再有帧，所以几何同步挂在窗口过程里
+>    （`app::window_hook` 处理 `WM_WINDOWPOSCHANGED` / `WM_MOVE` / `WM_SIZE`）。
+>
+> 边缘缩放的命中区仍按可见卡片 + 圆角判定（`ui::chrome::resize_handles`）；贴边、Alt-Tab、
+> 任务栏缩略图仍按窗口矩形算，所以卡片实际离屏幕边会比设定值多出 16pt。
 >
 > **窗口顶部那条 1px 深线的来由（已修）**：winit 对无边框窗口保留 `WS_CAPTION` / `WS_SIZEBOX`
 > 样式，靠改写非客户区（`WM_NCCALCSIZE`）把标题栏藏起来；为了让 DWM 仍画一层投影，它会故意把
@@ -406,7 +419,7 @@ docs/
 assets/
   periphhub.ico     exe 与窗口图标源文件（由 make-ico.py 生成，勿手改）
   periphhub-master.ico  图标母版：256 母版 + 16–48 手绘条目，只读
-scripts/make-ico.py 从母版重新生成 periphhub.ico（补齐 Windows 各 DPI 档位）
+scripts/make-ico.py 从母版重新生成 periphhub.ico（16–32 保留原生字形，40px 及以上重采样抗锯齿）
 build.rs            把图标、版本信息和产品名嵌入 exe
 scripts/package.ps1 本地打包脚本（GitHub Actions 复用）
 .github/workflows/release.yml  推送 v* tag 时自动发布

@@ -200,6 +200,15 @@ impl Reply {
             Reply::Battery => true,
         }
     }
+
+    /// 超时后能不能原样重发。
+    ///
+    /// 只有读取可以：设备吞掉一条读命令，重发只是再读一次，没有副作用。
+    /// 写入和提交不行——它们可能已经生效，只是应答丢了；重发就是再写一次
+    /// 寄存器、再提交一次 EEPROM，把一个"结果未知"变成"写过两遍"。
+    fn retriable(self) -> bool {
+        matches!(self, Reply::Read | Reply::Battery)
+    }
 }
 
 /// 判断一条读应答是否算新应答：内容与上一条不同，或请求本身是上一次
@@ -286,10 +295,12 @@ impl Rapoo {
         let read = reply == Reply::Read;
         let addr = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
         let len = frame[3] as usize;
-        // The dongle occasionally drops a command, so unanswered commands are
-        // resent once.
-        let budget = if read { 400 } else { 200 };
-        for _ in 0..2 {
+        // 只重试读取：写入/提交可能已经生效，只是应答丢了，重发会把一次
+        // 结果未知的写入变成两次。所以非读命令只发一次，但把原来两次 200ms
+        // 尝试的时间预算并进这一次（共 400ms），免得"慢一点的提交"被误判。
+        let attempts = if reply.retriable() { 2 } else { 1 };
+        let budget = 400;
+        for _ in 0..attempts {
             self.io.send(frame)?;
             let prev = self.last.get();
             // 上一次成功应答也是同地址同长度的读：此时"内容没变"是正常
@@ -910,8 +921,13 @@ mod tests {
         reply: Vec<u8>,
         commits: usize,
         writes: usize,
+        reads: usize,
         /// 写命令仍回 OK，但不落到寄存器：模拟接收器吞命令。
         drop_writes: bool,
+        /// 提交已经生效、只是应答丢了：缓冲区保持上一条应答。
+        lose_commit_reply: bool,
+        /// 只吞掉下一条读命令的应答，用来确认读仍在自动重试。
+        drop_read_once: bool,
     }
 
     #[derive(Clone)]
@@ -944,7 +960,10 @@ mod tests {
                 reply: Vec::new(),
                 commits: 0,
                 writes: 0,
+                reads: 0,
                 drop_writes: false,
+                lose_commit_reply: false,
+                drop_read_once: false,
             }));
             (Self(state.clone()), state)
         }
@@ -957,8 +976,15 @@ mod tests {
             let len = report[3] as usize;
             let mut reply = vec![0u8; REPORT_LEN];
             reply[0] = 1;
+            // 应答丢失：缓冲区里仍是上一条应答，接收器什么都不回。
+            let mut keep_stale = false;
             match report[2] {
                 0xA4 => {
+                    s.reads += 1;
+                    if s.drop_read_once {
+                        s.drop_read_once = false;
+                        keep_stale = true;
+                    }
                     for i in 0..len {
                         let a = addr + i as u32;
                         let block = a & !3;
@@ -979,6 +1005,9 @@ mod tests {
                 }
                 0xA3 => {
                     s.commits += 1;
+                    if s.lose_commit_reply {
+                        keep_stale = true;
+                    }
                     reply[1] = 0x7D;
                 }
                 0xAA => {
@@ -987,7 +1016,9 @@ mod tests {
                 }
                 _ => {}
             }
-            s.reply = reply;
+            if !keep_stale {
+                s.reply = reply;
+            }
             Ok(())
         }
 
@@ -1095,5 +1126,39 @@ mod tests {
             writes_after_apply,
             "确认失败不能重放写入"
         );
+    }
+
+    /// 提交已经生效、应答却在半路丢了：结果未知，但**不能**再提交一次。
+    /// 重发会把一个"不知道有没有写进去"变成"EEPROM 被擦写两遍"。
+    #[test]
+    fn a_lost_commit_reply_is_not_resent() {
+        let (io, state) = FakeIo::new();
+        state.lock().unwrap().lose_commit_reply = true;
+        let mut dev = test_rapoo(io);
+        let mut snap = seven_stages();
+
+        match dev.apply(Cmd::Lod(3), &mut snap).unwrap_err() {
+            WriteError::Unconfirmed(m) => assert!(m.contains("超时"), "{m}"),
+            other => panic!("提交结果未知必须报未确认，实际 {other:?}"),
+        }
+        assert_eq!(
+            state.lock().unwrap().commits,
+            1,
+            "提交结果未知时不能再提交一次"
+        );
+        assert!(dev.pending.is_empty(), "未确认时不保留待校验目标");
+    }
+
+    /// 读超时仍是自动重发一次：读取没有副作用，重发只是再读一遍。
+    #[test]
+    fn a_dropped_read_is_still_retried() {
+        let (io, state) = FakeIo::new();
+        state.lock().unwrap().drop_read_once = true;
+        let mut dev = test_rapoo(io);
+        let mut snap = seven_stages();
+
+        let outcome = dev.apply(Cmd::Lod(3), &mut snap).unwrap();
+        assert_eq!(outcome, WriteOutcome::Committed);
+        assert_eq!(state.lock().unwrap().reads, 2, "读超时后应重发一次");
     }
 }

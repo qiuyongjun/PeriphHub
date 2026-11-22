@@ -2,15 +2,16 @@
 """从 256px 母版重新生成 assets/periphhub.ico。
 
 为什么需要它（而不是让设计工具直接导出）：
-  1. Windows 只会用 ICO 里**恰好存在**的尺寸，缺一档就自己缩放。100/125/150/
+  1. 提供常见 DPI 对应的尺寸，减少 Windows 再次缩放。100/125/150/
      175/200% 缩放下桌面「中图标」分别是 48/60/72/84/96，「大图标」是
-     96/120/144/168/192——这些尺寸一个都不能少，否则缩放出来的边一定发毛。
+     96/120/144/168/192。
   2. 母版最外圈是 12px、16% 不透明的**白色**描边。缩小时这圈白会顺着 alpha
      混进轮廓内侧，就是肉眼看到的白边/锯齿。这里先把描边去掉，只保留
      黑色圆角方块的轮廓（当作超采样源），再向下采样。
   3. 采样必须在**预乘 alpha** 空间做，否则半透明像素的颜色会污染邻居。
 
-16–48 这几档保留手工重绘的原始条目（原生尺寸逐像素绘制，比缩小更锐利）。
+16–32 保留像素对齐的原生字形，确保小图标可读；40px 及以上统一从母版重采样，
+让桌面图标的字形曲线与圆角都有连续的抗锯齿过渡。
 
 母版与产物必须分开存：`--src` 是 assets/periphhub-master.ico（只含 256 母版
 和 16–48 的手绘条目），`--out` 是发布用的 assets/periphhub.ico。母版一旦被
@@ -37,8 +38,8 @@ from pathlib import Path
 # 96/120/144/168/192 = 大图标；256 = 超大图标。
 SIZES = [16, 20, 24, 28, 32, 40, 48, 56, 60, 64, 72, 84, 96, 120, 128, 144, 168, 192, 256]
 
-# 这几档是原生绘制的，原样保留。
-KEEP = {16, 20, 24, 32, 40, 48}
+# 最小尺寸保留像素对齐的字形；桌面尺寸必须经过重采样以平滑曲线。
+KEEP = {16, 20, 24, 32}
 
 # 母版外圈白色描边的 alpha 平台值（实测 40）。低于它的像素只属于描边。
 RIM_ALPHA = 40
@@ -234,6 +235,7 @@ def dib_entry(w: int, h: int, px: list[tuple[int, int, int, int]]) -> bytes:
 
 
 def png_entry(w: int, h: int, px: list[tuple[int, int, int, int]]) -> bytes:
+    """编码 RGBA PNG，供大尺寸 ICO 条目使用。"""
     raw = bytearray()
     for y in range(h):
         raw.append(0)  # filter: none
@@ -242,6 +244,7 @@ def png_entry(w: int, h: int, px: list[tuple[int, int, int, int]]) -> bytes:
             raw += bytes((r, g, b, a))
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
+        """生成带 CRC 校验的 PNG 数据块。"""
         return (
             struct.pack(">I", len(payload))
             + tag
@@ -259,6 +262,7 @@ def png_entry(w: int, h: int, px: list[tuple[int, int, int, int]]) -> bytes:
 
 
 def main() -> int:
+    """校验只读母版并生成各 DPI 所需的图标条目。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="assets/periphhub-master.ico", help="母版（只读，含 256 与手绘小尺寸）")
     ap.add_argument("--out", default="assets/periphhub.ico", help="生成的图标")
@@ -317,12 +321,13 @@ def main() -> int:
     silhouette: list[tuple[int, int, int, int]] = []
     for r, g, b, a in master:
         if a > RIM_ALPHA * 2:  # 属于方块本体（内部或边缘过渡像素）
-            silhouette.append((r, g, b, 255))
+            # 半透明母版像素混有白描边；字形位于不透明主体内，只保留它的原色。
+            color = (r, g, b) if a == 255 else BODY
+            silhouette.append((*color, 255))
         else:  # 只剩描边或完全透明
             silhouette.append((*BODY, 0))
 
-    # 1b) 裁到主体外框。母版四周留了 4.7% 透明边，而 16–48 的原生绘制是贴边
-    #     填满的；不裁的话从 48px 切到 60px 时图标会突然"缩水"一圈。
+    # 裁掉母版的透明边，让重采样尺寸与原生小图标保持一致的主体大小。
     xs = [i % 256 for i, p in enumerate(silhouette) if p[3]]
     ys = [i // 256 for i, p in enumerate(silhouette) if p[3]]
     x0, x1 = min(xs), max(xs) + 1

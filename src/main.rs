@@ -15,6 +15,7 @@ mod devices;
 mod driver;
 mod hid;
 mod log;
+mod shadow;
 mod sysinput;
 mod theme;
 mod tray;

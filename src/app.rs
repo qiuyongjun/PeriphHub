@@ -24,10 +24,15 @@ use crate::ui::{chrome, config_page, home};
 const ERR_TOAST_HOLD: Duration = Duration::from_secs(5);
 const ERR_TOAST_FADE: Duration = Duration::from_secs(1);
 
-/// 配置页浮层提示的状态：展示哪条设备错误、从何时开始计时。
+/// 配置页浮层提示的状态：展示哪条设备错误、从何时开始计时、是否已经走完
+/// 整个展示周期。
 struct ErrToast {
     msg: String,
     at: Instant,
+    /// 这一次展示已经跑完。`last_error` 会一直留到下一条成功消息，如果同一条
+    /// 错误每帧都重新起算，提示就永远停在满不透明度上——过期判断永远不成立。
+    /// 所以同一条错误只展示一轮：换一条错误、或用户重新操作时才重新开始。
+    done: bool,
 }
 
 const MAIN_SIZE: Vec2 = Vec2::new(1024.0, 720.0);
@@ -498,6 +503,44 @@ impl Panel {
         }
     }
 
+    /// 把卡片形状和投影同步给窗口层：区域决定命中测试，投影由独立的分层
+    /// 窗口画（见 `crate::shadow`）。
+    ///
+    /// 投影只在非最大化时存在；最大化时整窗都是卡片，不裁区域、也不画影子。
+    /// 投影窗口建不起来时退回"主窗口自绘投影"的老路径：这时更不能裁区域，
+    /// 否则那圈影子会被自己的裁剪框切掉。
+    fn sync_shell_shape(&self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let (pad, radius) = match (self.cfg.mode, maximized) {
+            (RunMode::Desktop, true) => (0.0, 0.0),
+            _ => (mini::SHADOW_PAD, CARD_RADIUS as f32),
+        };
+        let scale = ctx.pixels_per_point();
+        let pad_px = pad * scale;
+        let radius_px = radius * scale;
+
+        CARD_INSET.store(pad_px.to_bits(), Ordering::Relaxed);
+        CARD_RADIUS_PX.store(radius_px.to_bits(), Ordering::Relaxed);
+        let hwnd = hwnd as *mut core::ffi::c_void;
+        apply_card_region(hwnd);
+        if !crate::shadow::attached() {
+            return;
+        }
+        crate::shadow::follow(
+            hwnd,
+            pad_px,
+            radius_px,
+            scale,
+            theme::palette(self.cfg.theme).dark,
+            ctx.input(|i| i.focused),
+        );
+    }
+
     /// 浮窗只留托盘图标，主界面恢复任务栏按钮。winit 的运行时接口走
     /// ITaskbarList，不会去碰窗口样式，因此和 `strip_window_frame` 不冲突。
     fn sync_taskbar(&mut self, frame: &eframe::Frame) {
@@ -721,36 +764,34 @@ impl Panel {
                 toast = Some(("设备已断开", err.clone(), 1.0));
             } else {
                 if let Some(err) = &state.last_error {
-                    // 同一条错误还在展示期内时不重置计时，否则持续存在的
-                    // 错误会把提示钉死在满不透明度上，永远走不完淡出。
-                    let fresh = match &self.err_toast {
-                        Some(t) if t.msg == *err && t.at.elapsed() < ERR_TOAST_HOLD => t.at,
-                        _ => Instant::now(),
-                    };
-                    self.err_toast = Some(ErrToast {
-                        msg: err.clone(),
-                        at: fresh,
-                    });
-                }
-                let expired = self
-                    .err_toast
-                    .as_ref()
-                    .is_some_and(|t| t.at.elapsed() >= ERR_TOAST_HOLD + ERR_TOAST_FADE);
-                if expired {
-                    self.err_toast = None;
-                }
-                if let Some(t) = &self.err_toast {
-                    let elapsed = t.at.elapsed();
-                    let alpha = if elapsed < ERR_TOAST_HOLD {
-                        1.0
-                    } else {
-                        1.0 - (elapsed - ERR_TOAST_HOLD).as_secs_f32()
-                            / ERR_TOAST_FADE.as_secs_f32()
-                    };
-                    if alpha < 1.0 {
-                        ui.ctx().request_repaint_after(Duration::from_millis(50));
+                    // 只有换了一条错误才重新起算。同一条错误还在
+                    // `last_error` 里挂着时保持原计时，否则每帧刷新一次
+                    // `at`，提示永远走不完淡出（见 `ErrToast::done`）。
+                    if self.err_toast.as_ref().is_none_or(|t| t.msg != *err) {
+                        self.err_toast = Some(ErrToast {
+                            msg: err.clone(),
+                            at: Instant::now(),
+                            done: false,
+                        });
                     }
-                    toast = Some(("操作失败", t.msg.clone(), alpha));
+                    if let Some(t) = &mut self.err_toast {
+                        if !t.done && t.at.elapsed() >= ERR_TOAST_HOLD + ERR_TOAST_FADE {
+                            t.done = true;
+                        }
+                    }
+                    if let Some(t) = self.err_toast.as_ref().filter(|t| !t.done) {
+                        let elapsed = t.at.elapsed();
+                        let alpha = if elapsed < ERR_TOAST_HOLD {
+                            1.0
+                        } else {
+                            1.0 - (elapsed - ERR_TOAST_HOLD).as_secs_f32()
+                                / ERR_TOAST_FADE.as_secs_f32()
+                        };
+                        if alpha < 1.0 {
+                            ui.ctx().request_repaint_after(Duration::from_millis(50));
+                        }
+                        toast = Some(("操作失败", t.msg.clone(), alpha));
+                    }
                 }
             }
         }
@@ -767,6 +808,10 @@ impl Panel {
         }
         if back {
             self.go_home();
+        }
+        if !cmds.is_empty() {
+            // 用户又动了一次手：同一条错误允许再提示一遍（见 `ErrToast::done`）。
+            self.err_toast = None;
         }
         for cmd in cmds {
             self.manager.send(id, cmd);
@@ -1122,7 +1167,7 @@ impl eframe::App for Panel {
             self.go_mini(ctx);
         }
         self.strip_window_frame();
-        sync_hit_margin(ctx, self.cfg.mode);
+        self.sync_shell_shape(ctx);
         self.track_work_area(ctx);
         self.drain_tray(ctx);
         self.sync_taskbar(frame);
@@ -1317,15 +1362,20 @@ impl Panel {
             ),
         };
 
-        // 主界面外壳与浮窗同款：窗口四周留透明边距，圆角卡片 + 手绘多层
-        // 投影画在窗口内（Win10 拿不到无边框的系统阴影，见 widgets::shadow_card）。
-        // 最大化时铺满工作区、去圆角去投影，与系统窗口行为一致。
+        // 主界面外壳与浮窗同款：窗口四周留透明边距，圆角卡片画在这里，投影
+        // 由 `crate::shadow` 的独立窗口画在卡片外面（主窗口被裁成卡片形状，
+        // 边距上的点击才穿得过去，而裁剪也会裁掉绘制）。最大化时铺满工作区、
+        // 去圆角去投影，与系统窗口行为一致。
         let window = ui.max_rect();
         let pad = if maximized { 0.0 } else { mini::SHADOW_PAD };
         let card = window.shrink(pad);
         if maximized {
             ui.painter().rect_filled(card, 0.0, p.bg);
+        } else if crate::shadow::attached() {
+            ui.painter()
+                .rect_filled(card, CornerRadius::same(CARD_RADIUS), p.bg);
         } else {
+            // 投影窗口建不起来：退回自绘，这时窗口也不裁区域。
             shadow_card(
                 ui.painter(),
                 card,
@@ -1563,15 +1613,17 @@ fn is_reachable(ctx: &egui::Context, pos: egui::Pos2, size: Vec2) -> bool {
 
 /// Best-effort compositor setup for the frameless window.
 ///
-/// 系统阴影一律不用，投影全部由 UI 自绘（见 `ui::widgets::shadow_card`）：
+/// 系统阴影一律不用，投影由 `crate::shadow` 的独立分层窗口画：
 /// - winit 的无边框阴影靠在窗口顶部留 1px 非客户区换 DWM 投影，那 1px 会被
 ///   DWM 画成一条改不掉的缝线（Win10 没有 `DWMWA_BORDER_COLOR`）；
 /// - 而且它投的是"整块窗口矩形"，这个窗口比卡片大一圈 `SHADOW_PAD`，
 ///   叠上自绘阴影就成了两圈错位的影子。
+/// - 更要紧的是：主窗口必须被 `SetWindowRgn` 裁成卡片形状，边距上的点击才能
+///   落到桌面/其他应用；裁剪同时裁掉绘制，所以影子只能换个窗口画。
 ///
-/// 所以这里只做三件事：关掉 winit 的阴影；在 Win11 上把 DWM 给透明窗口补的
+/// 所以这里做三件事：关掉 winit 的阴影；在 Win11 上把 DWM 给透明窗口补的
 /// 那圈 1px 边框色关掉（Win10 没有该属性，调用会被静默拒绝）；接管窗口过程，
-/// 让卡片外的透明边距不参与命中测试（见 `install_hit_test`）。
+/// 几何一变就同步卡片区域与投影窗口（见 `install_window_hooks`）。
 ///
 /// 最大化时 `strip_window_frame` 继续兜底 caption/border 样式缝线。
 fn window_shell(cc: &eframe::CreationContext<'_>) -> Option<isize> {
@@ -1613,24 +1665,27 @@ fn window_shell(cc: &eframe::CreationContext<'_>) -> Option<isize> {
             windows_sys::Win32::Graphics::Dwm::DWMWA_COLOR_NONE,
         );
     }
-    install_hit_test(hwnd);
+    install_window_hooks(hwnd);
+    // 投影没法画在主窗口里：窗口会被裁成卡片形状才能让边距上的点击穿透到
+    // 桌面和其他应用（见 `crate::shadow` 的模块注释），裁剪同样裁掉绘制。
+    crate::shadow::attach(hwnd);
     Some(win.hwnd.get())
 }
 
-// ---- 透明投影边距的点击穿透 -------------------------------------------------
+// ---- 卡片形状：区域决定命中测试，影子另开一个窗口 -----------------------------
 
 /// 原窗口过程：`SetWindowLongPtrW` 换下来后，其余消息原样转发给它。
 static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-/// 可见卡片到窗口边缘的距离（物理像素，f32 位模式）。0 表示不做穿透。
-static HIT_INSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// 卡片圆角（物理像素，f32 位模式）；角上的投影像素同样放行。
-static HIT_RADIUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 可见卡片到窗口边缘的距离（物理像素，f32 位模式）。0 表示不裁区域。
+static CARD_INSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 卡片圆角（物理像素，f32 位模式）。
+static CARD_RADIUS_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// 接管窗口过程，把卡片外的透明投影边距从命中测试里摘出去。
+/// 接管窗口过程，只为在几何变化时立刻同步"卡片区域 + 投影窗口"。
 ///
-/// 窗口为了画阴影比卡片大一圈，这圈透明像素在系统看来仍是客户区：不处理
-/// 的话，点它不会落到下面的窗口/桌面，浮窗置顶时就是一圈"隐形挡板"。
-fn install_hit_test(hwnd: windows_sys::Win32::Foundation::HWND) {
+/// 拖动和缩放走的是系统模态循环，界面那侧不会再有帧：区域的裁剪框和投影
+/// 窗口的位置只能在这里跟。其余消息原样转发给 winit 的过程。
+fn install_window_hooks(hwnd: windows_sys::Win32::Foundation::HWND) {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC,
@@ -1652,92 +1707,133 @@ fn install_hit_test(hwnd: windows_sys::Win32::Foundation::HWND) {
             u32,
             windows_sys::Win32::Foundation::WPARAM,
             windows_sys::Win32::Foundation::LPARAM,
-        ) -> windows_sys::Win32::Foundation::LRESULT = hit_test_proc;
+        ) -> windows_sys::Win32::Foundation::LRESULT = window_hook;
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize);
     }
 }
 
-/// 卡片外的点返回 `HTTRANSPARENT`，让系统继续寻找下面的窗口。
-unsafe extern "system" fn hit_test_proc(
+/// 几何一变（移动、缩放、改 z 序）就重新对齐区域与投影。
+unsafe extern "system" fn window_hook(
     hwnd: windows_sys::Win32::Foundation::HWND,
     msg: u32,
     wparam: windows_sys::Win32::Foundation::WPARAM,
     lparam: windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT {
-    use std::sync::atomic::Ordering;
-    use windows_sys::Win32::Foundation::{POINT, RECT};
-    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, GetClientRect, HTTRANSPARENT, WM_NCHITTEST, WNDPROC,
+        CallWindowProcW, WM_MOVE, WM_SIZE, WM_WINDOWPOSCHANGED, WNDPROC,
     };
 
-    if msg == WM_NCHITTEST {
-        let inset = f32::from_bits(HIT_INSET.load(Ordering::Relaxed));
-        if inset > 0.0 {
-            // WM_NCHITTEST 的 lparam 是高/低 16 位屏幕坐标（物理像素，可负）。
-            let lp = lparam as u32;
-            let mut pt = POINT {
-                x: (lp as u16) as i16 as i32,
-                y: (lp >> 16) as u16 as i16 as i32,
-            };
-            let mut rc = RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            // SAFETY: 两个都是本窗口的纯查询，pt/rc 在栈上。
-            if ScreenToClient(hwnd, &mut pt) != 0 && GetClientRect(hwnd, &mut rc) != 0 {
-                let radius = f32::from_bits(HIT_RADIUS.load(Ordering::Relaxed));
-                if !inside_card(rc, inset, radius, pt.x as f32, pt.y as f32) {
-                    return HTTRANSPARENT as isize;
-                }
-            }
-        }
+    // 这些消息本身就是"矩形/尺寸/z 序变了"，处理完再转发，winit 那边拿到的
+    // 仍是同一条消息（这里只读状态，不改参数）。
+    if matches!(msg, WM_WINDOWPOSCHANGED | WM_MOVE | WM_SIZE) {
+        crate::shadow::follow_geometry(hwnd);
+        apply_card_region(hwnd);
     }
-    let old = ORIGINAL_WNDPROC.load(Ordering::Relaxed);
+
+    let old = ORIGINAL_WNDPROC.load(std::sync::atomic::Ordering::Relaxed);
     if old == 0 {
         return 0;
     }
-    // SAFETY: old 是 SetWindowLongPtrW 换下来的原过程，参数原样转发。
     let old_proc: WNDPROC = std::mem::transmute(old);
     CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
 }
 
-/// 客户区坐标（物理像素）是否落在可见卡片的圆角矩形内。
-fn inside_card(
-    rc: windows_sys::Win32::Foundation::RECT,
-    inset: f32,
-    radius: f32,
-    x: f32,
-    y: f32,
-) -> bool {
-    let right = rc.right as f32 - inset;
-    let bottom = rc.bottom as f32 - inset;
-    if x < inset || y < inset || x > right || y > bottom {
-        return false;
-    }
-    let half = ((right - inset) * 0.5).min((bottom - inset) * 0.5).max(0.0);
-    let r = radius.min(half);
-    let cx = x.clamp(inset + r, right - r);
-    let cy = y.clamp(inset + r, bottom - r);
-    (x - cx).hypot(y - cy) <= r
-}
-
-/// 把当前卡片相对窗口的边距写进命中测试钩子（物理像素）。
+/// 把主窗口裁成卡片形状：区域之外的像素不属于这个窗口，点击直接落到下面的
+/// 桌面或其他应用。
 ///
-/// 投影只在非最大化时存在；最大化时整窗都是卡片，不做穿透。
-fn sync_hit_margin(ctx: &egui::Context, mode: RunMode) {
-    use std::sync::atomic::Ordering;
+/// 以前这里是在 `WM_NCHITTEST` 里返回 `HTTRANSPARENT`，但按 Win32 文档它只在
+/// **同线程**窗口之间继续查找，对桌面和别的进程无效——那圈 16px 边距依旧是
+/// 一块"隐形挡板"。区域没有这个限制，代价是它同样裁掉绘制，于是投影搬到了
+/// `crate::shadow` 的独立窗口里。
+///
+/// 每帧调用是有意的：调用方只在参数变化时才真正设区域。
+fn apply_card_region(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, CreateRoundRectRgn, SetWindowRgn};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
 
-    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-    let (pad, radius) = match (mode, maximized) {
-        (RunMode::Desktop, true) => (0.0, 0.0),
-        _ => (mini::SHADOW_PAD, CARD_RADIUS as f32),
+    /// 上一次设过的区域参数。
+    type RegionKey = (i32, i32, i32, i32, i32, i32);
+    static LAST: Mutex<Option<RegionKey>> = Mutex::new(None);
+    /// 是否已经设过区域。复位只需要发一次，每帧都发会一直触发重绘。
+    static CLIPPED: AtomicBool = AtomicBool::new(false);
+
+    let inset = f32::from_bits(CARD_INSET.load(Ordering::Relaxed)).round() as i32;
+    let radius = f32::from_bits(CARD_RADIUS_PX.load(Ordering::Relaxed)).round() as i32;
+    // 投影窗口建不起来时不要裁：区域会把主窗口自绘的那圈影子一起裁掉。
+    let inset = if crate::shadow::attached() { inset } else { 0 };
+
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
     };
-    let scale = ctx.pixels_per_point();
-    HIT_INSET.store((pad * scale).to_bits(), Ordering::Relaxed);
-    HIT_RADIUS.store((radius * scale).to_bits(), Ordering::Relaxed);
+    // SAFETY: 三个都是本窗口的纯查询，结构体在栈上。
+    unsafe {
+        if GetClientRect(hwnd, &mut client) == 0 {
+            return;
+        }
+    }
+    let (cw, ch) = (client.right, client.bottom);
+    if cw <= 0 || ch <= 0 {
+        return;
+    }
+    // 区域用的是**窗口**坐标，客户区可能不在 (0,0)（最大化时尤其如此）。
+    let mut origin = POINT { x: 0, y: 0 };
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        if ClientToScreen(hwnd, &mut origin) == 0 || GetWindowRect(hwnd, &mut frame) == 0 {
+            return;
+        }
+    }
+    let (dx, dy) = (origin.x - frame.left, origin.y - frame.top);
+    let key = (cw, ch, inset, radius, dx, dy);
+
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if *last == Some(key) {
+        return;
+    }
+    *last = Some(key);
+    drop(last);
+
+    // SAFETY: 区域归系统所有（成功设置后由系统释放），不在这里删。
+    unsafe {
+        if inset <= 0 {
+            if CLIPPED.swap(false, Ordering::Relaxed) {
+                SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+            }
+            return;
+        }
+        // 区域是客户区往里收 `inset` 后的圆角矩形（卡片本体）；右下角是开
+        // 区间，所以 +1。
+        let rgn = CreateRoundRectRgn(
+            dx + inset,
+            dy + inset,
+            dx + cw - inset + 1,
+            dy + ch - inset + 1,
+            radius * 2,
+            radius * 2,
+        );
+        if rgn.is_null() {
+            return;
+        }
+        // 设置失败时区域仍归调用方，删掉以免泄漏。
+        if SetWindowRgn(hwnd, rgn, 1) == 0 {
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(rgn);
+        } else {
+            CLIPPED.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// CurrentBuildNumber >= 22000 即 Win11；读不到时按 Win11 处理——那些

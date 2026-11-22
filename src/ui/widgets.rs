@@ -46,15 +46,7 @@ pub fn shadow_card(
     dark: bool,
     focused: bool,
 ) {
-    // (sigma, 下移, 峰值不透明度)：紧阴影贴着边，环境阴影铺得远而淡。
-    let lobes: [(f32, f32, f32); 2] = if dark {
-        [(2.4, 1.0, 0.16), (8.0, 3.0, 0.20)]
-    } else {
-        [(2.4, 1.0, 0.07), (8.0, 3.0, 0.08)]
-    };
-    let lift = if focused { 1.0 } else { 0.78 };
-    let lobes = lobes.map(|(sigma, dy, peak)| (sigma, dy, peak * lift));
-    for (sigma, dy, peak) in lobes {
+    for (sigma, dy, peak) in shadow_lobes(dark, focused) {
         paint_shadow_lobe(
             painter,
             rect.translate(egui::vec2(0.0, dy)),
@@ -66,11 +58,29 @@ pub fn shadow_card(
     painter.rect_filled(rect, CornerRadius::same(radius), fill);
 }
 
+/// 投影的两瓣高斯：`(σ, 下移, 峰值不透明度)`。紧阴影贴着边，环境阴影铺得
+/// 远而淡；失焦时整体收淡一档，和系统窗口"不活动时影子更浅"的行为对齐，
+/// 否则切到别的应用后这块卡片会显得浮在桌面上面，比前台窗口还重。
+///
+/// 浮窗的投影现在由 `shadow` 模块画在一个独立的分层窗口里（见那边的模块
+/// 注释：主窗口要裁成卡片形状，投影不能再画在它里面），两边必须用同一组
+/// 参数，否则切主题或失焦时会看到影子换了个形状。
+pub(crate) fn shadow_lobes(dark: bool, focused: bool) -> [(f32, f32, f32); 2] {
+    let lobes: [(f32, f32, f32); 2] = if dark {
+        [(2.4, 1.0, 0.16), (8.0, 3.0, 0.20)]
+    } else {
+        [(2.4, 1.0, 0.07), (8.0, 3.0, 0.08)]
+    };
+    let lift = if focused { 1.0 } else { 0.78 };
+    lobes.map(|(sigma, dy, peak)| (sigma, dy, peak * lift))
+}
+
 /// 环 `r`（距卡片边缘的像素数）那一圈要叠的 alpha，0 表示这一环画了也看不见。
 ///
 /// 抽成纯函数是为了让"透明边距够不够"能被离线验证：只要有一环落在窗口外，
-/// 卡片边缘就会留下一条被裁断的硬边。见 `shadow_stays_inside_the_padding`。
-fn ring_alpha(sigma: f32, peak: f32, r: i32) -> u8 {
+/// 卡片边缘就会留下一条被裁断的硬边。见 `visible_shadow_stays_inside_the_padding`。
+/// `shadow` 模块画分层窗口时也用它，两条绘制路径必须逐环一致。
+pub(crate) fn ring_alpha(sigma: f32, peak: f32, r: i32) -> u8 {
     let density = |r: i32| {
         if r <= 0 {
             peak
@@ -1183,8 +1193,8 @@ mod tests {
     #[test]
     fn visible_shadow_stays_inside_the_padding() {
         let pad = crate::ui::mini::SHADOW_PAD;
-        // 与 `shadow_card` 里的 lobes 同源：取两瓣中最亮的一档（深色 + 聚焦）。
-        let lobes = [(2.4, 1.0, 0.16), (8.0, 3.0, 0.20)];
+        // 取两瓣中最亮的一档（深色 + 聚焦）。
+        let lobes = shadow_lobes(true, true);
         for (sigma, dy, peak) in lobes {
             let furthest = (1..=40)
                 .filter(|&r| ring_alpha(sigma, peak, r) >= 2)
